@@ -1,0 +1,10 @@
+{
+  "id": "homebound-webdav",
+  "name": "Homebound WebDAV",
+  "version": "0.1.0",
+  "minAppVersion": "1.11.4",
+  "description": "Sync encrypted notes and attachments to one WebDAV vault at home or through your own remote access gateway.",
+  "author": "aurastywear3-netizen",
+  "isDesktopOnly": false,
+  "authorUrl": "https://github.com/aurastywear3-netizen"
+}

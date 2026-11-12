@@ -1,0 +1,16 @@
+[Unit]
+Description=Reverse SSH tunnel to the Homebound WebDAV gateway
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=homebound
+EnvironmentFile=/etc/homebound/tunnel.env
+ExecStart=/usr/bin/ssh -F /dev/null -NT -i /etc/homebound/id_ed25519 -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/etc/homebound/known_hosts -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -R 127.0.0.1:30443:${DAV_HOST}:${DAV_PORT} ${SSH_TARGET}
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

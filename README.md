@@ -43,4 +43,12 @@ node --test tests/sync.test.cjs
 node build.mjs
 ```
 
-For an initial community submission, publish only this project's source in a public GitHub repository. Commit the root manifest, README and license. The included GitHub Actions workflow tests the code, verifies the bundle, and publishes the three installation files under the tag matching the manifest. For a manual release, tag `0.1.0` and attach the files individually. Sign in to the Obsidian Community directory, link the repository owner's GitHub account, and submit the repository for review. [Official submission guide](https://docs.obsidian.md/Plugins/Releasing/Submit%20your%20plugin)
+The GitHub Actions release workflow tests the code, rebuilds the plugin, and signs build provenance for `main.js`, `manifest.json`, and `styles.css`. It verifies all three against the release commit before publishing the files under the version in the manifest.
+
+To verify a downloaded file with GitHub CLI, run the following command in the download directory. Replace `main.js` with `manifest.json` or `styles.css` to check the other files.
+
+```sh
+gh attestation verify main.js --repo aurastywear3-netizen/homebound-webdav
+```
+
+For an initial community submission, publish this project in a public repository with its root manifest, README and license. Sign in to the Obsidian Community directory, link the repository owner's GitHub account, and submit the repository. [Official submission guide](https://docs.obsidian.md/Plugins/Releasing/Submit%20your%20plugin)

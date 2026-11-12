@@ -182,13 +182,13 @@ class HomeboundSettings extends PluginSettingTab {
         el.addClass("homebound-settings");
         const draft = { ...p.config };
         let password = "", passphrase = "";
-        const field = (label, key, hint, placeholder) => new Setting(el).setName(label).setDesc(hint)
+        const field = (label, key, hint, placeholder) => new Setting(el).setClass("homebound-field").setName(label).setDesc(hint)
             .addText(t => t.setValue(draft[key] || "").setPlaceholder(placeholder).onChange(v => { draft[key] = v; }));
         field(tr("LAN WebDAV address", "局域网 WebDAV 地址"), "home", tr("Use the server’s HTTPS address.", "填写服务器的 HTTPS 地址。"), "https://nas.example.net/dav");
         field(tr("Away WebDAV address", "外网 WebDAV 地址"), "away", tr("Optional HTTPS gateway to the same server.", "可选。填写转发到同一台服务器的 HTTPS 地址。"), "https://dav.example.net/dav");
         field(tr("Remote folder", "远端目录"), "folder", tr("Type the folder name as written, including spaces or Chinese characters.", "可直接输入中文、空格和多级目录。"), "笔记/我的知识库");
         field(tr("WebDAV username", "WebDAV 用户名"), "username", "", "");
-        const secret = (label, cb) => new Setting(el).setName(label)
+        const secret = (label, cb) => new Setting(el).setClass("homebound-field").setName(label)
             .setDesc(p.config.id ? tr("Leave empty to use the saved secret.", "留空可沿用已保存的密码。") : "")
             .addText(t => { t.inputEl.type = "password"; t.inputEl.autocomplete = "off"; t.onChange(cb); });
         secret(tr("WebDAV password", "WebDAV 密码"), value => { password = value; });

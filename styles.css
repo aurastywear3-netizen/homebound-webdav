@@ -1,16 +1,15 @@
-.homebound-settings .setting-item:has(input[type="text"]),
-.homebound-settings .setting-item:has(input[type="password"]) {
+.homebound-settings .homebound-field {
     display: flex;
     flex-direction: column;
     align-items: stretch;
     gap: var(--size-4-2);
 }
-.homebound-settings .setting-item-control:has(input) {
+.homebound-settings .homebound-field .setting-item-control {
     flex: 1 1 auto;
     min-width: 0;
     width: 100%;
 }
-.homebound-settings .setting-item-control input:is([type="text"], [type="password"]) {
+.homebound-settings .homebound-field input {
     width: 100%;
     max-width: none;
     min-width: 0;
@@ -21,12 +20,10 @@
     flex-wrap: wrap;
 }
 @media (max-width: 600px) {
-    .homebound-settings.vertical-tab-content {
-        padding-inline: var(--size-4-3);
+    .mod-settings .vertical-tab-content-container > .homebound-settings.vertical-tab-content {
+        padding-inline: var(--size-4-1);
     }
-    body:not(.is-mobile) .vertical-tabs-container:has(.homebound-settings) > .vertical-tab-header {
-        width: min(30vw, 9rem);
-        min-width: 0;
-        flex: 0 0 min(30vw, 9rem);
+    .homebound-settings .homebound-field {
+        padding-inline: 0;
     }
 }

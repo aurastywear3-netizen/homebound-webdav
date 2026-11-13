@@ -6,6 +6,7 @@ const tr = (en, zh) => getLanguage().startsWith("zh") ? zh : en;
 const namespace = "homebound-v1";
 const { Dav, VaultFiles, credentials } = require("./adapter.cjs");
 const PqcMode = require("./pqc-mode.cjs");
+const {ChunkTransfer, TransferCache, blockSize} = require("./transfer.cjs");
 const modeKey = "homebound-webdav-mode";
 
 async function probe(dav, milliseconds) {
@@ -17,7 +18,7 @@ async function probe(dav, milliseconds) {
     } finally { clearTimeout(timer); }
 }
 
-async function connect(config, password, passphrase) {
+async function connect(config, password, passphrase, transfer) {
     const auth = credentials(config.username, password);
     const addresses = [[config.home, "LAN"]];
     if (config.away && config.away !== config.home) addresses.push([config.away, "VPS/VPN"]);
@@ -30,7 +31,7 @@ async function connect(config, password, passphrase) {
             throw error;
         }
         const key = await core.unlock(header, passphrase, config.id);
-        return { store: new core.Store(dav, header.id, key), route };
+        return { store: new core.Store(dav, header.id, key, transfer), route };
     }
 }
 
@@ -63,6 +64,12 @@ class HomeboundSettings extends PluginSettingTab {
                     try { p.selectMode(mode); } catch (e) { new Notice(e.message); }
                     this.display();
                 }));
+        new Setting(el).setName(tr("Resumable large attachments", "大附件分块续传"))
+            .setDesc(tr("Enable after updating every device in this remote vault to 0.2.1-rc.2 or later. Earlier versions cannot read chunked files.", "请先将此远端库的所有设备升级至 0.2.1-rc.2 或更高版本。旧版无法读取分块附件。"))
+            .addToggle(t => t.setValue(p.transfer.enabled).onChange(value => {
+                p.transfer.enabled = value;
+                p.app.saveLocalStorage("homebound-chunk-upload",value);
+            }));
         if (p.mode === "pqc") {
             p.pqc.display(el, () => this.display());
             return;
@@ -109,10 +116,14 @@ module.exports = class HomeboundPlugin extends Plugin {
         this.config = { home: "", away: "", folder: this.app.vault.getName(), username: "", id: "", auto: false,
             ...await this.loadData() };
         if (this.manifest.id !== "homebound-webdav") throw Error("Install this candidate as Homebound WebDAV.");
+        this.transfer = new ChunkTransfer(new TransferCache(this.app.appId), {
+            enabled: this.app.loadLocalStorage("homebound-chunk-upload") === true,
+            active: () => !this.closed, progress: event => this.showTransfer(event)
+        });
         const savedMode = this.app.loadLocalStorage(modeKey);
         if (savedMode != null && savedMode !== "legacy" && savedMode !== "pqc") throw Error("Unknown Homebound sync mode.");
         this.mode = savedMode || "legacy";
-        if (this.mode === "pqc") this.pqc = new PqcMode(this.app);
+        if (this.mode === "pqc") this.pqc = new PqcMode(this.app,this.transfer);
         this.settingsTab = new HomeboundSettings(this.app, this);
         this.addSettingTab(this.settingsTab);
         this.addCommand({ id: "sync", name: tr("Sync now", "立即同步"), callback: () => this.run() });
@@ -146,13 +157,27 @@ module.exports = class HomeboundPlugin extends Plugin {
         if (mode !== "legacy" && mode !== "pqc") throw Error("Unknown sync mode.");
         if (this.mode === mode) return;
         if (this.closed || this.busy || this.pqc?.busy) throw Error(tr("Finish the current sync first.", "请等当前操作完成后再切换。"));
-        const next = mode === "pqc" ? new PqcMode(this.app) : null;
+        const next = mode === "pqc" ? new PqcMode(this.app,this.transfer) : null;
         this.app.saveLocalStorage(modeKey, mode);
         if (this.pqc) this.pqc.closed = true;
         this.pqc = next;
         this.mode = mode;
     }
-    onunload() { this.closed = true; if (this.pqc) this.pqc.closed = true; }
+    showTransfer(event) {
+        if (!event) {
+            this.transferNotice?.hide();
+            this.transferNotice = null;
+            return;
+        }
+        const action = event.direction === "upload" ? tr("Uploading","上传") : tr("Downloading","下载");
+        const complete = Math.min(event.size,event.done * blockSize);
+        let message = action + " " + event.path + "\n" + event.done + "/" + event.total + tr(" blocks"," 块") +
+            " · " + Math.floor(100 * complete / event.size) + "%";
+        if (event.retry) message += tr(" · retry "," · 重试 ") + event.retry + "/3";
+        if (!this.transferNotice) this.transferNotice = new Notice(message,0);
+        else this.transferNotice.setMessage(message);
+    }
+    onunload() { this.showTransfer(null); this.closed = true; if (this.pqc) this.pqc.closed = true; }
     secret(kind, config = this.config) {
         return config.secretId ? this.app.secretStorage.getSecret("homebound-" + config.secretId + "-" + kind) || "" : "";
     }
@@ -198,7 +223,7 @@ module.exports = class HomeboundPlugin extends Plugin {
         try {
             const c = this.config;
             if (!c.id) throw Error(tr("Connect a vault in settings first.", "请先到设置中连接笔记库。"));
-            const { store, route } = await connect(c, c.username ? this.secret("dav") : "", this.secret("vault"));
+            const { store, route } = await connect(c, c.username ? this.secret("dav") : "", this.secret("vault"),this.transfer);
             const key = "homebound-webdav-baseline-" + c.id;
             const baseline = new Map(this.app.loadLocalStorage(key) || []);
             const result = await core.synchronize({ store, local: new VaultFiles(this.app), cache: this.cache, baseline, resolve,
@@ -213,6 +238,6 @@ module.exports = class HomeboundPlugin extends Plugin {
         } catch (e) {
             this.last = tr("Sync stopped: ", "同步已停止：") + e.message;
             if (!quiet) new Notice(this.last, 10000);
-        } finally { this.busy = false; }
+        } finally { this.busy = false; this.showTransfer(null); }
     }
 };

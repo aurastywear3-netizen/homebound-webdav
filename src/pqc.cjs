@@ -155,7 +155,7 @@ function validateGraph(revisions){
     }
     return seen;
 }
-async function storeFor(ledger,dav,s,device){
+async function storeFor(ledger,dav,s,device,transfer){
     const {p,digest}=latest(s);
     const envelopeKeys=await openRing(device,p.boxes[device.id],[p.anchor,p.n,device.id]);
     let ring=envelopeKeys;
@@ -192,29 +192,42 @@ async function storeFor(ledger,dav,s,device){
         revisions.push(rev);previousEpoch=r.epoch;
     }
     const history=validateGraph(revisions);
+    const scope="pqc/"+p.anchor;
     return {
         async history(){return new Map(history);},
-        async readBody(rev){
+        async readBody(rev,options){
+            if(rev.parts){
+                if(!transfer)throw Error("此附件需要支持分块的客户端。");
+                return transfer.download(bodies,scope,rev,options);
+            }
             const body=await decrypt(un64(rev.key),[suite,p.anchor,rev.id,"body"],await bodies.read(rev.id));
             check(await sha(body)===rev.hash,"正文校验失败。");return body;
         },
         async publish(path,parents,bytes){
-            const id=randomId(),contentKey=bytes===null?null:random(32);
-            const rev={id,path,parents,hash:bytes===null?null:await sha(bytes),key:contentKey?b64(contentKey):null};
+            const hash=bytes===null?null:await sha(bytes);
+            const staged=transfer?.shouldSplit(bytes) ? await transfer.upload({
+                objects:bodies,scope,epoch:digest,wrapKey:await aes(un64(ring[p.n])),path,parents,hash,bytes
+            }) : null;
+            const id=staged?.id || randomId();
+            const contentKey=bytes===null || staged ? null : random(32);
+            const rev={id,path,parents,hash,key:staged?.key ?? (contentKey?b64(contentKey):null)};
+            if(staged)rev.parts=staged.parts;
             validateGraph([...history.values(),rev]);
             if(contentKey)await bodies.put(id,(await encrypt(contentKey,[suite,p.anchor,id,"body"],bytes)).buffer);
             const r={anchor:p.anchor,head:digest,epoch:p.n,id,from:device.id,
                 payload:b64(await encrypt(un64(ring[p.n]),[suite,p.anchor,p.n,id,"manifest"],jsonBytes(rev)))};
             const row=JSON.stringify({record:r,sig:signed("revision",[r],device.sign)});
             const receipt=await ledger("commit",{head:digest,row},device.token);
-            check(receipt.digest===await digestOf(row),"写入回执无效。");history.set(id,rev);return rev;
+            check(receipt.digest===await digestOf(row),"写入回执无效。");history.set(id,rev);
+            if(staged)await transfer.uploaded(scope,path);
+            return rev;
         }
     };
 }
 async function auditData(store){
     const history=await store.history(),faults=[];
     for(const rev of history.values())if(rev.hash!==null){
-        try{await store.readBody(rev);}catch{faults.push({id:rev.id,path:rev.path});}
+        try{await store.readBody(rev,{audit:true});}catch{faults.push({id:rev.id,path:rev.path});}
     }
     return {checked:history.size,faults};
 }

@@ -203,7 +203,8 @@ var require_core = __commonJS({
       return key;
     }
     var Store = class {
-      constructor(dav, id2, key) {
+      constructor(dav, id2, key, transfer) {
+        this.transfer = transfer;
         this.dav = dav;
         this.id = id2;
         this.key = key;
@@ -215,15 +216,35 @@ var require_core = __commonJS({
         await this.dav.put("objects/" + name, await seal(this.key, this.id + "/" + name, bytes));
       }
       async publish(path, parents, bytes) {
-        const id2 = randomId();
         const hash = bytes === null ? null : await sha(bytes);
-        if (bytes !== null) await this.writeObject("b-" + id2, bytes);
+        const scope = "legacy/" + this.id;
+        const staged = this.transfer?.shouldSplit(bytes) ? await this.transfer.upload({
+          objects: this.chunkObjects(),
+          scope,
+          epoch: "passphrase",
+          wrapKey: this.key,
+          path,
+          parents,
+          hash,
+          bytes
+        }) : null;
+        const id2 = staged?.id || randomId();
+        if (bytes !== null && !staged) await this.writeObject("b-" + id2, bytes);
         const rev = { id: id2, path, parents, hash };
+        if (staged) Object.assign(rev, { parts: staged.parts, key: staged.key });
         await this.writeObject("r-" + id2, jsonBytes(rev));
         await this.dav.mkdir("commits/" + id2);
+        if (staged) await this.transfer.uploaded(scope, path);
         return rev;
       }
-      async readBody(rev) {
+      chunkObjects() {
+        return { read: (id2) => this.dav.read("objects/b-" + id2), put: (id2, data) => this.dav.put("objects/b-" + id2, data) };
+      }
+      async readBody(rev, options) {
+        if (rev.parts) {
+          if (!this.transfer) throw Error("\u6B64\u9644\u4EF6\u9700\u8981\u652F\u6301\u5206\u5757\u7684\u5BA2\u6237\u7AEF\u3002");
+          return this.transfer.download(this.chunkObjects(), "legacy/" + this.id, rev, options);
+        }
         const bytes = await this.readObject("b-" + rev.id);
         if (await sha(bytes) !== rev.hash) throw Error("File integrity check failed: " + rev.path);
         return bytes;
@@ -416,7 +437,9 @@ var require_core = __commonJS({
       randomId,
       sha,
       jsonBytes,
-      parseBytes
+      parseBytes,
+      seal,
+      unseal
     };
   }
 });
@@ -2693,7 +2716,7 @@ var require_pqc = __commonJS({
       }
       return seen;
     }
-    async function storeFor(ledger, dav, s, device) {
+    async function storeFor(ledger, dav, s, device, transfer) {
       const { p, digest } = latest(s);
       const envelopeKeys = await openRing(device, p.boxes[device.id], [p.anchor, p.n, device.id]);
       let ring = envelopeKeys;
@@ -2729,18 +2752,36 @@ var require_pqc = __commonJS({
         previousEpoch = r.epoch;
       }
       const history = validateGraph(revisions);
+      const scope = "pqc/" + p.anchor;
       return {
         async history() {
           return new Map(history);
         },
-        async readBody(rev) {
+        async readBody(rev, options) {
+          if (rev.parts) {
+            if (!transfer) throw Error("\u6B64\u9644\u4EF6\u9700\u8981\u652F\u6301\u5206\u5757\u7684\u5BA2\u6237\u7AEF\u3002");
+            return transfer.download(bodies, scope, rev, options);
+          }
           const body = await decrypt(un64(rev.key), [suite, p.anchor, rev.id, "body"], await bodies.read(rev.id));
           check(await sha(body) === rev.hash, "\u6B63\u6587\u6821\u9A8C\u5931\u8D25\u3002");
           return body;
         },
         async publish(path, parents, bytes) {
-          const id2 = randomId(), contentKey = bytes === null ? null : random(32);
-          const rev = { id: id2, path, parents, hash: bytes === null ? null : await sha(bytes), key: contentKey ? b64(contentKey) : null };
+          const hash = bytes === null ? null : await sha(bytes);
+          const staged = transfer?.shouldSplit(bytes) ? await transfer.upload({
+            objects: bodies,
+            scope,
+            epoch: digest,
+            wrapKey: await aes(un64(ring[p.n])),
+            path,
+            parents,
+            hash,
+            bytes
+          }) : null;
+          const id2 = staged?.id || randomId();
+          const contentKey = bytes === null || staged ? null : random(32);
+          const rev = { id: id2, path, parents, hash, key: staged?.key ?? (contentKey ? b64(contentKey) : null) };
+          if (staged) rev.parts = staged.parts;
           validateGraph([...history.values(), rev]);
           if (contentKey) await bodies.put(id2, (await encrypt(contentKey, [suite, p.anchor, id2, "body"], bytes)).buffer);
           const r = {
@@ -2755,6 +2796,7 @@ var require_pqc = __commonJS({
           const receipt = await ledger("commit", { head: digest, row }, device.token);
           check(receipt.digest === await digestOf(row), "\u5199\u5165\u56DE\u6267\u65E0\u6548\u3002");
           history.set(id2, rev);
+          if (staged) await transfer.uploaded(scope, path);
           return rev;
         }
       };
@@ -2763,7 +2805,7 @@ var require_pqc = __commonJS({
       const history = await store.history(), faults = [];
       for (const rev of history.values()) if (rev.hash !== null) {
         try {
-          await store.readBody(rev);
+          await store.readBody(rev, { audit: true });
         } catch {
           faults.push({ id: rev.id, path: rev.path });
         }
@@ -2972,7 +3014,8 @@ var require_pqc_mode = __commonJS({
       });
     }
     var PqcMode2 = class {
-      constructor(app) {
+      constructor(app, transfer) {
+        this.transfer = transfer;
         this.app = app;
         this.conflicts = [];
         const saved = app.loadLocalStorage("homebound-webdav-pqc-config");
@@ -2997,6 +3040,7 @@ var require_pqc_mode = __commonJS({
           return await fn();
         } finally {
           this.busy = false;
+          this.transfer?.progress(null);
         }
       }
       secret(k, v) {
@@ -3175,7 +3219,7 @@ var require_pqc_mode = __commonJS({
         let report;
         try {
           const { s, dav, device } = await this.context();
-          const store = await pq.storeFor(this.ledger.bind(this), dav, s, device);
+          const store = await pq.storeFor(this.ledger.bind(this), dav, s, device, this.transfer);
           report = await pq.auditData(store);
           this.config.integrity = report.faults.length ? "\u5DF2\u63A5\u7BA1\uFF0C\u6570\u636E\u4E0D\u5B8C\u6574\uFF1A" + report.faults.map((f) => f.path + " [" + f.id + "]").join("\uFF0C") : "\u5DF2\u6821\u9A8C " + report.checked + " \u6761\u5386\u53F2\u4FEE\u8BA2\u53CA\u5BF9\u5E94\u6B63\u6587\u3002";
         } catch (e) {
@@ -3228,7 +3272,7 @@ var require_pqc_mode = __commonJS({
           await this.refresh(s);
           throw Error("\u6B64\u8BBE\u5907\u672A\u83B7\u6388\u6743\uFF0C\u6216\u5DF2\u88AB\u64A4\u9500\u3002\u8BF7\u5728\u8BBE\u7F6E\u4E2D\u91CD\u65B0\u7533\u8BF7\u914D\u5BF9\u3002");
         }
-        const store = await pq.storeFor(this.ledger.bind(this), dav, s, device);
+        const store = await pq.storeFor(this.ledger.bind(this), dav, s, device, this.transfer);
         this.config.pin = { n: last.p.n, digest: last.digest };
         delete this.config.request;
         await this.saveData(this.config);
@@ -3254,6 +3298,220 @@ var require_pqc_mode = __commonJS({
   }
 });
 
+// src/transfer.cjs
+var require_transfer = __commonJS({
+  "src/transfer.cjs"(exports2, module2) {
+    "use strict";
+    var core2 = require_core();
+    var blockSize2 = 512 * 1024;
+    var threshold = 4 * 1024 * 1024;
+    var retention = 7 * 24 * 60 * 60 * 1e3;
+    var encoder = new TextEncoder();
+    var base64 = (bytes) => btoa(String.fromCharCode(...bytes));
+    var from64 = (text) => Uint8Array.from(atob(text), (c) => c.charCodeAt(0));
+    var aes = (bytes) => crypto.subtle.importKey("raw", bytes, "AES-GCM", false, ["encrypt", "decrypt"]);
+    var TransferCache2 = class {
+      constructor(localId) {
+        this.localId = localId;
+      }
+      async database() {
+        if (!this.opening) {
+          this.opening = new Promise((resolve, reject) => {
+            const req = indexedDB.open("homebound-transfer-" + this.localId, 1);
+            req.onupgradeneeded = () => req.result.createObjectStore("parts").createIndex("updated", "updated");
+            req.onerror = () => {
+              this.opening = null;
+              reject(req.error);
+            };
+            req.onsuccess = () => {
+              const db = req.result;
+              db.onversionchange = () => {
+                db.close();
+                this.opening = null;
+              };
+              const tx = db.transaction("parts", "readwrite");
+              const old = tx.objectStore("parts").index("updated").openCursor(IDBKeyRange.upperBound(Date.now() - retention));
+              old.onsuccess = () => {
+                const c = old.result;
+                if (c) {
+                  c.delete();
+                  c.continue();
+                }
+              };
+              tx.oncomplete = () => resolve(db);
+              tx.onabort = () => {
+                db.close();
+                this.opening = null;
+                reject(tx.error);
+              };
+            };
+          });
+        }
+        return this.opening;
+      }
+      async run(mode, operation) {
+        const db = await this.database();
+        return new Promise((resolve, reject) => {
+          const tx = db.transaction("parts", mode);
+          const req = operation(tx.objectStore("parts"));
+          tx.oncomplete = () => resolve(req.result);
+          tx.onabort = () => reject(tx.error || Error("\u65E0\u6CD5\u4FDD\u5B58\u5206\u5757\u4F20\u8F93\u8FDB\u5EA6\u3002"));
+        });
+      }
+      async get(key) {
+        return (await this.run("readonly", (store) => store.get(key)))?.value;
+      }
+      put(key, value) {
+        return this.run("readwrite", (store) => store.put({ value, updated: Date.now() }, key));
+      }
+      remove(key) {
+        return this.run("readwrite", (store) => store.delete(key));
+      }
+      clearDownload(scope, id2) {
+        return this.remove(IDBKeyRange.bound([scope, "get", id2, 0], [scope, "get", id2, Number.MAX_SAFE_INTEGER]));
+      }
+    };
+    function validParts(parts) {
+      return parts?.v === 1 && Number.isSafeInteger(parts.size) && parts.size >= threshold && parts.size <= 4294967295 && /^[a-f0-9]{32}$/.test(parts.seed);
+    }
+    function transient(e) {
+      return e.offline || [408, 425, 429, 500, 502, 503, 504].includes(e.status);
+    }
+    function chunkName(parts, i) {
+      return core2.sha(encoder.encode("homebound-chunk-1/" + parts.seed + "/" + i)).then((h) => h.slice(0, 32));
+    }
+    function label(scope, id2, parts, i) {
+      return JSON.stringify(["homebound-chunk-1", scope, id2, parts.seed, parts.size, i]);
+    }
+    var ChunkTransfer2 = class {
+      constructor(cache, { enabled = false, progress = () => {
+      }, active = () => true, wait = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
+        this.cache = cache;
+        this.enabled = enabled;
+        this.progress = progress;
+        this.active = active;
+        this.wait = wait;
+      }
+      shouldSplit(bytes) {
+        return this.enabled && bytes?.byteLength >= threshold;
+      }
+      checkActive() {
+        if (!this.active()) throw Error("\u4F20\u8F93\u5DF2\u505C\u6B62\u3002");
+      }
+      async retry(info, operation) {
+        for (let attempt = 0; ; attempt++) {
+          this.checkActive();
+          try {
+            return await operation(attempt);
+          } catch (e) {
+            if (!transient(e)) throw e;
+            if (attempt >= 3) {
+              throw Object.assign(Error(e.message + " \xB7 \u5DF2\u4FDD\u7559\u5206\u5757\u8FDB\u5EA6\uFF0C\u53EF\u91CD\u65B0\u540C\u6B65\u3002"), { status: e.status, offline: e.offline });
+            }
+            this.progress({ ...info, retry: attempt + 1 });
+            await this.wait(500 * 2 ** attempt);
+          }
+        }
+      }
+      async upload({ objects, scope, epoch, wrapKey, path, parents, hash, bytes }) {
+        const data = new Uint8Array(bytes.buffer ?? bytes, bytes.byteOffset ?? 0, bytes.byteLength);
+        const slot = [scope, "put", path];
+        const binding = JSON.stringify(["upload-1", scope, epoch, path, hash, [...parents].sort()]);
+        let pending = await this.cache.get(slot);
+        let raw;
+        if (pending?.binding === binding) {
+          raw = await core2.unseal(wrapKey, binding, pending.wrapped);
+        } else {
+          raw = crypto.getRandomValues(new Uint8Array(32));
+          pending = {
+            binding,
+            id: core2.randomId(),
+            parts: { v: 1, size: data.length, seed: core2.randomId() },
+            done: 0,
+            inFlight: false,
+            wrapped: await core2.seal(wrapKey, binding, raw)
+          };
+          await this.cache.put(slot, pending);
+        }
+        const { id: id2, parts } = pending, total = Math.ceil(data.length / blockSize2);
+        if (!validParts(parts) || parts.size !== data.length || !Number.isInteger(pending.done) || pending.done < 0 || pending.done > total) throw Error("\u5206\u5757\u4E0A\u4F20\u8BB0\u5F55\u635F\u574F\u3002");
+        const key = await aes(raw);
+        const info = { direction: "upload", path, total, size: data.length, done: pending.done };
+        this.progress(info);
+        for (let i = pending.done; i < total; i++) {
+          this.checkActive();
+          const chunk = data.subarray(i * blockSize2, (i + 1) * blockSize2);
+          const name = await chunkName(parts, i), aad = label(scope, id2, parts, i);
+          const uncertain = pending.inFlight;
+          pending.inFlight = true;
+          await this.cache.put(slot, pending);
+          await this.retry(info, async (attempt) => {
+            if (uncertain || attempt > 0) {
+              let packet;
+              try {
+                packet = await objects.read(name);
+              } catch (e) {
+                if (e.status !== 404) throw e;
+              }
+              if (packet) {
+                const old = new Uint8Array(await core2.unseal(key, aad, packet));
+                if (old.length !== chunk.length || !old.every((b, j) => b === chunk[j])) throw Error("\u8FDC\u7AEF\u5206\u5757\u5185\u5BB9\u4E0D\u4E00\u81F4\u3002");
+                return;
+              }
+            }
+            await objects.put(name, await core2.seal(key, aad, chunk));
+          });
+          pending.done = ++info.done;
+          pending.inFlight = false;
+          await this.cache.put(slot, pending);
+          this.progress(info);
+        }
+        this.checkActive();
+        return { id: id2, parts, key: base64(new Uint8Array(raw)) };
+      }
+      async download(objects, scope, rev, { audit = false } = {}) {
+        const { parts, id: id2, path } = rev;
+        if (!validParts(parts)) throw Error("\u65E0\u6CD5\u8BC6\u522B\u9644\u4EF6\u5206\u5757\u683C\u5F0F\u3002");
+        const total = Math.ceil(parts.size / blockSize2), key = await aes(from64(rev.key));
+        let output;
+        const info = { direction: "download", path, total, size: parts.size, done: 0 };
+        this.progress(info);
+        for (let i = 0; i < total; i++) {
+          this.checkActive();
+          const slot = [scope, "get", id2, i], aad = label(scope, id2, parts, i);
+          let packet = audit ? void 0 : await this.cache.get(slot), clear;
+          if (packet) {
+            try {
+              clear = await core2.unseal(key, aad, packet);
+            } catch {
+              await this.cache.remove(slot);
+            }
+          }
+          if (!clear) {
+            const name = await chunkName(parts, i);
+            packet = await this.retry(info, () => objects.read(name));
+            clear = await core2.unseal(key, aad, packet);
+            if (!audit) await this.cache.put(slot, packet);
+          }
+          const expected = Math.min(blockSize2, parts.size - i * blockSize2);
+          if (clear.byteLength !== expected) throw Error("\u9644\u4EF6\u5206\u5757\u957F\u5EA6\u4E0D\u4E00\u81F4\u3002");
+          if (!output) output = new Uint8Array(parts.size);
+          output.set(new Uint8Array(clear), i * blockSize2);
+          info.done++;
+          this.progress(info);
+        }
+        if (await core2.sha(output) !== rev.hash) throw Error("\u9644\u4EF6\u5B8C\u6574\u6027\u68C0\u67E5\u5931\u8D25\uFF1A" + path);
+        if (!audit) await this.cache.clearDownload(scope, id2);
+        return output.buffer;
+      }
+      uploaded(scope, path) {
+        return this.cache.remove([scope, "put", path]);
+      }
+    };
+    module2.exports = { ChunkTransfer: ChunkTransfer2, TransferCache: TransferCache2, blockSize: blockSize2, threshold, validParts };
+  }
+});
+
 // src/plugin.cjs
 var { Plugin, PluginSettingTab, Setting, Modal, Notice, TFile, TFolder, requestUrl, getLanguage } = require("obsidian");
 var core = require_core();
@@ -3261,6 +3519,7 @@ var tr = (en, zh) => getLanguage().startsWith("zh") ? zh : en;
 var namespace = "homebound-v1";
 var { Dav, VaultFiles, credentials } = require_adapter();
 var PqcMode = require_pqc_mode();
+var { ChunkTransfer, TransferCache, blockSize } = require_transfer();
 var modeKey = "homebound-webdav-mode";
 async function probe(dav, milliseconds) {
   let timer;
@@ -3272,7 +3531,7 @@ async function probe(dav, milliseconds) {
     clearTimeout(timer);
   }
 }
-async function connect(config, password, passphrase) {
+async function connect(config, password, passphrase, transfer) {
   const auth = credentials(config.username, password);
   const addresses = [[config.home, "LAN"]];
   if (config.away && config.away !== config.home) addresses.push([config.away, "VPS/VPN"]);
@@ -3286,7 +3545,7 @@ async function connect(config, password, passphrase) {
       throw error;
     }
     const key = await core.unlock(header, passphrase, config.id);
-    return { store: new core.Store(dav, header.id, key), route };
+    return { store: new core.Store(dav, header.id, key, transfer), route };
   }
 }
 var ConfirmFolder = class extends Modal {
@@ -3324,6 +3583,10 @@ var HomeboundSettings = class extends PluginSettingTab {
         new Notice(e.message);
       }
       this.display();
+    }));
+    new Setting(el).setName(tr("Resumable large attachments", "\u5927\u9644\u4EF6\u5206\u5757\u7EED\u4F20")).setDesc(tr("Enable after updating every device in this remote vault to 0.2.1-rc.2 or later. Earlier versions cannot read chunked files.", "\u8BF7\u5148\u5C06\u6B64\u8FDC\u7AEF\u5E93\u7684\u6240\u6709\u8BBE\u5907\u5347\u7EA7\u81F3 0.2.1-rc.2 \u6216\u66F4\u9AD8\u7248\u672C\u3002\u65E7\u7248\u65E0\u6CD5\u8BFB\u53D6\u5206\u5757\u9644\u4EF6\u3002")).addToggle((t) => t.setValue(p.transfer.enabled).onChange((value) => {
+      p.transfer.enabled = value;
+      p.app.saveLocalStorage("homebound-chunk-upload", value);
     }));
     if (p.mode === "pqc") {
       p.pqc.display(el, () => this.display());
@@ -3391,10 +3654,15 @@ module.exports = class HomeboundPlugin extends Plugin {
       ...await this.loadData()
     };
     if (this.manifest.id !== "homebound-webdav") throw Error("Install this candidate as Homebound WebDAV.");
+    this.transfer = new ChunkTransfer(new TransferCache(this.app.appId), {
+      enabled: this.app.loadLocalStorage("homebound-chunk-upload") === true,
+      active: () => !this.closed,
+      progress: (event) => this.showTransfer(event)
+    });
     const savedMode = this.app.loadLocalStorage(modeKey);
     if (savedMode != null && savedMode !== "legacy" && savedMode !== "pqc") throw Error("Unknown Homebound sync mode.");
     this.mode = savedMode || "legacy";
-    if (this.mode === "pqc") this.pqc = new PqcMode(this.app);
+    if (this.mode === "pqc") this.pqc = new PqcMode(this.app, this.transfer);
     this.settingsTab = new HomeboundSettings(this.app, this);
     this.addSettingTab(this.settingsTab);
     this.addCommand({ id: "sync", name: tr("Sync now", "\u7ACB\u5373\u540C\u6B65"), callback: () => this.run() });
@@ -3428,13 +3696,27 @@ module.exports = class HomeboundPlugin extends Plugin {
     if (mode !== "legacy" && mode !== "pqc") throw Error("Unknown sync mode.");
     if (this.mode === mode) return;
     if (this.closed || this.busy || this.pqc?.busy) throw Error(tr("Finish the current sync first.", "\u8BF7\u7B49\u5F53\u524D\u64CD\u4F5C\u5B8C\u6210\u540E\u518D\u5207\u6362\u3002"));
-    const next = mode === "pqc" ? new PqcMode(this.app) : null;
+    const next = mode === "pqc" ? new PqcMode(this.app, this.transfer) : null;
     this.app.saveLocalStorage(modeKey, mode);
     if (this.pqc) this.pqc.closed = true;
     this.pqc = next;
     this.mode = mode;
   }
+  showTransfer(event) {
+    if (!event) {
+      this.transferNotice?.hide();
+      this.transferNotice = null;
+      return;
+    }
+    const action = event.direction === "upload" ? tr("Uploading", "\u4E0A\u4F20") : tr("Downloading", "\u4E0B\u8F7D");
+    const complete = Math.min(event.size, event.done * blockSize);
+    let message = action + " " + event.path + "\n" + event.done + "/" + event.total + tr(" blocks", " \u5757") + " \xB7 " + Math.floor(100 * complete / event.size) + "%";
+    if (event.retry) message += tr(" \xB7 retry ", " \xB7 \u91CD\u8BD5 ") + event.retry + "/3";
+    if (!this.transferNotice) this.transferNotice = new Notice(message, 0);
+    else this.transferNotice.setMessage(message);
+  }
   onunload() {
+    this.showTransfer(null);
     this.closed = true;
     if (this.pqc) this.pqc.closed = true;
   }
@@ -3494,7 +3776,7 @@ module.exports = class HomeboundPlugin extends Plugin {
     try {
       const c = this.config;
       if (!c.id) throw Error(tr("Connect a vault in settings first.", "\u8BF7\u5148\u5230\u8BBE\u7F6E\u4E2D\u8FDE\u63A5\u7B14\u8BB0\u5E93\u3002"));
-      const { store, route } = await connect(c, c.username ? this.secret("dav") : "", this.secret("vault"));
+      const { store, route } = await connect(c, c.username ? this.secret("dav") : "", this.secret("vault"), this.transfer);
       const key = "homebound-webdav-baseline-" + c.id;
       const baseline = new Map(this.app.loadLocalStorage(key) || []);
       const result = await core.synchronize({
@@ -3517,6 +3799,7 @@ module.exports = class HomeboundPlugin extends Plugin {
       if (!quiet) new Notice(this.last, 1e4);
     } finally {
       this.busy = false;
+      this.showTransfer(null);
     }
   }
 };

@@ -82,7 +82,8 @@ async function unlock(header, passphrase, pinned) {
 // A revision is visible only after its immutable data and metadata have both arrived.
 // MKCOL publishes a unique completion marker with a single WebDAV operation.
 class Store {
-    constructor(dav, id, key) {
+    constructor(dav, id, key, transfer) {
+        this.transfer = transfer;
         this.dav = dav;
         this.id = id;
         this.key = key;
@@ -94,15 +95,28 @@ class Store {
         await this.dav.put("objects/" + name, await seal(this.key, this.id + "/" + name, bytes));
     }
     async publish(path, parents, bytes) {
-        const id = randomId();
         const hash = bytes === null ? null : await sha(bytes);
-        if (bytes !== null) await this.writeObject("b-" + id, bytes);
+        const scope = "legacy/" + this.id;
+        const staged = this.transfer?.shouldSplit(bytes) ? await this.transfer.upload({
+            objects:this.chunkObjects(), scope, epoch:"passphrase", wrapKey:this.key, path, parents, hash, bytes
+        }) : null;
+        const id = staged?.id || randomId();
+        if (bytes !== null && !staged) await this.writeObject("b-" + id, bytes);
         const rev = { id, path, parents, hash };
+        if (staged) Object.assign(rev, {parts:staged.parts, key:staged.key});
         await this.writeObject("r-" + id, jsonBytes(rev));
         await this.dav.mkdir("commits/" + id);
+        if (staged) await this.transfer.uploaded(scope,path);
         return rev;
     }
-    async readBody(rev) {
+    chunkObjects() {
+        return {read:id=>this.dav.read("objects/b-"+id), put:(id,data)=>this.dav.put("objects/b-"+id,data)};
+    }
+    async readBody(rev,options) {
+        if (rev.parts) {
+            if (!this.transfer) throw Error("此附件需要支持分块的客户端。");
+            return this.transfer.download(this.chunkObjects(),"legacy/"+this.id,rev,options);
+        }
         const bytes = await this.readObject("b-" + rev.id);
         if (await sha(bytes) !== rev.hash) throw Error("File integrity check failed: " + rev.path);
         return bytes;
@@ -291,4 +305,4 @@ async function createVault(home, folder, passphrase, namespace) {
 }
 
 module.exports = { createVault, Store, synchronize, headsByPath, safePath, isRecovery, conflictFolder, directory, endpoint, encodePath,
-    newHeader, unlock, randomId, sha, jsonBytes, parseBytes };
+    newHeader, unlock, randomId, sha, jsonBytes, parseBytes, seal, unseal };

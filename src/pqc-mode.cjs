@@ -85,7 +85,8 @@ function displaySettings(el,p,app,redraw){
         });
     }
 class PqcMode{
-    constructor(app){
+    constructor(app, transfer){
+        this.transfer=transfer;
         this.app=app;
         this.conflicts=[];
         const saved=app.loadLocalStorage("homebound-webdav-pqc-config");
@@ -95,7 +96,7 @@ class PqcMode{
     }
     saveData(data){this.app.saveLocalStorage("homebound-webdav-pqc-config",data);}
     display(el,redraw){displaySettings(el,this,this.app,redraw);}
-    async exclusive(fn){if(this.closed)throw Error("PQC 模式已关闭。");if(this.busy)throw Error("操作进行中。");this.busy=true;try{return await fn();}finally{this.busy=false;}}
+    async exclusive(fn){if(this.closed)throw Error("PQC 模式已关闭。");if(this.busy)throw Error("操作进行中。");this.busy=true;try{return await fn();}finally{this.busy=false;this.transfer?.progress(null);}}
     secret(k,v){
         const s=this.app.secretStorage,id="hbpqc-"+this.config.local+"-"+k;
         if(v!==undefined)s.setSecret(id,v);
@@ -216,7 +217,7 @@ class PqcMode{
         let report;
         try{
             const {s,dav,device}=await this.context();
-            const store=await pq.storeFor(this.ledger.bind(this),dav,s,device);
+            const store=await pq.storeFor(this.ledger.bind(this),dav,s,device,this.transfer);
             report=await pq.auditData(store);
             this.config.integrity=report.faults.length?"已接管，数据不完整："+report.faults.map(f=>f.path+" ["+f.id+"]").join("，"):"已校验 "+report.checked+" 条历史修订及对应正文。";
         }catch(e){this.config.integrity="已接管，数据校验失败："+e.message;report={faults:[{path:e.path,id:e.id,error:e.message}]};}
@@ -263,7 +264,7 @@ class PqcMode{
             await this.refresh(s);
             throw Error("此设备未获授权，或已被撤销。请在设置中重新申请配对。");
         }
-        const store=await pq.storeFor(this.ledger.bind(this),dav,s,device);
+        const store=await pq.storeFor(this.ledger.bind(this),dav,s,device,this.transfer);
         this.config.pin={n:last.p.n,digest:last.digest}; delete this.config.request;
         await this.saveData(this.config);
         return {store, route};

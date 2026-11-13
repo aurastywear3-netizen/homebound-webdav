@@ -291,3 +291,33 @@ test("15: official-ID candidate preserves legacy settings and opens PQC only aft
         assert.equal(plugin.config.id,legacy.id);assert.equal(plugin.config.auto,true);
     }finally{Object.assign(global,globals);}
 });
+
+test("chunked transfer crossing revocation leaves ciphertext only; a new epoch cannot reuse staged keys",async t=>{
+    const {ChunkTransfer,threshold}=require("../src/transfer.cjs");
+    const f=await setup(t),cache=new Map(),stored=new Map(),path="附件.bin";
+    const transfer=new ChunkTransfer({
+        get:k=>cache.get(JSON.stringify(k)),put:(k,v)=>cache.set(JSON.stringify(k),structuredClone(v)),
+        remove:k=>cache.delete(JSON.stringify(k)),clearDownload:()=>cache.clear()
+    },{enabled:true,wait:async()=>{}});
+    const data=new Uint8Array(threshold+3);data[100]=98;
+    const old=await pq.storeFor(f.ledger,f.dav,f.s,f.guest,transfer);
+    let uploads=0;
+    const remote=f.dav.child("objects"),child=f.dav.child.bind(f.dav);
+    f.dav.child=n=>n==="objects"?remote:child(n);
+    const put=remote.put.bind(remote);
+    remote.put=async(n,b)=>{await put(n,b);stored.set(n,b);if(++uploads===2)await f.revoke();};
+    const writer=await pq.storeFor(f.ledger,f.dav,f.s,f.guest,transfer);
+    await assert.rejects(writer.publish(path,[],data),e=>e.status===409 || e.status===403);
+    const current=await f.state();assert.equal(current.rows.length,0);
+    await assert.rejects(pq.storeFor(f.ledger,f.dav,current,f.guest,transfer),/撤销/);
+    const orphanNames=[...stored.keys()];assert.equal(orphanNames.length,9);
+    remote.put=put;
+    const owner=await pq.storeFor(f.ledger,f.dav,current,f.owner,transfer);
+    const rev=await owner.publish(path,[],data);
+    for(const id of orphanNames)f.dav.files.delete("objects/"+id);
+    const reader=await pq.storeFor(f.ledger,f.dav,await f.state(),f.owner,transfer);
+    const history=await reader.history();assert.equal(history.size,1);
+    assert.deepEqual(new Uint8Array(await reader.readBody(history.get(rev.id))),data);
+    const raw=(await f.state()).rows[0];assert.ok(!raw.includes(path) && !raw.includes(rev.parts.seed));
+    assert.equal((await old.history()).size,0);
+});

@@ -275,9 +275,10 @@ var require_core = __commonJS({
         }
       }
     }
-    async function synchronize({ store, local, baseline, cache, checkpoint, resolve, active = () => true }) {
+    async function synchronize({ store, local, baseline, cache, checkpoint, resolve, selection, active = () => true }) {
       const history = await store.history(cache);
       const groups = headsByPath(history);
+      if (selection && !groups.has(selection.path)) throw Error("\u51B2\u7A81\u7248\u672C\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u540C\u6B65\u5E76\u6BD4\u8F83\u3002");
       const localPaths = local.paths();
       for (const [path, base] of baseline) {
         if (!local.allowed(path) || !base.ids.length || base.ids.some((id2) => history.get(id2)?.path !== path || history.get(id2).hash !== base.hash)) {
@@ -296,10 +297,17 @@ var require_core = __commonJS({
         let heads = groups.get(path) ?? [];
         const base = baseline.get(path);
         const bytes = await local.read(path);
-        const hash = bytes === null ? null : await sha(bytes);
+        let hash = bytes === null ? null : await sha(bytes);
         const matching = heads.some((rev) => rev.hash === hash);
         const changed = base ? hash !== base.hash : bytes !== null;
         const alreadySplit = new Set(heads.map((rev) => rev.hash)).size > 1;
+        const reviewing = selection?.path === path;
+        if (reviewing) {
+          const ids = heads.map((rev) => rev.id).sort();
+          if (!alreadySplit || hash !== selection.localHash || JSON.stringify(ids) !== JSON.stringify(selection.headIds)) {
+            throw Error("\u6B63\u6587\u6216\u51B2\u7A81\u7248\u672C\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u540C\u6B65\u5E76\u6BD4\u8F83\u3002");
+          }
+        }
         if (changed && !matching && !alreadySplit) {
           const parents = base?.ids ?? [];
           const rev = await store.publish(path, parents, bytes);
@@ -311,15 +319,35 @@ var require_core = __commonJS({
           for (const rev2 of heads) {
             if (rev2.hash !== null) await local.archive(rev2, () => store.readBody(rev2));
           }
-          if (resolve !== path || bytes === null) {
+          const matchingIds = heads.filter((rev2) => rev2.hash === hash).map((rev2) => rev2.id).sort();
+          if (matchingIds.length && (bytes !== null || base) && JSON.stringify(base?.ids) !== JSON.stringify(matchingIds)) {
+            baseline.set(path, { ids: matchingIds, hash });
+            checkpoint(baseline);
+          }
+          if (!reviewing && (resolve !== path || bytes === null)) {
             if (!base && bytes === null) {
               const candidate = heads.filter((r) => r.hash !== null).sort((a, b) => a.id.localeCompare(b.id))[0];
-              if (candidate) await local.apply(path, null, await store.readBody(candidate));
+              if (candidate) {
+                await local.apply(path, null, await store.readBody(candidate));
+                baseline.set(path, { ids: [candidate.id], hash: candidate.hash });
+                checkpoint(baseline);
+              }
             }
             conflicts.push(path);
             continue;
           }
-          const rev = await store.publish(path, heads.map((r) => r.id), bytes);
+          let chosen = bytes;
+          if (reviewing && selection.source !== "local") {
+            const source = heads.find((rev2) => rev2.id === selection.source);
+            if (!source) throw Error("\u6240\u9009\u526F\u672C\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u6BD4\u8F83\u3002");
+            if (source.hash !== hash) {
+              chosen = source.hash === null ? null : await store.readBody(source);
+              await local.apply(path, hash, chosen);
+              hash = source.hash;
+            }
+          }
+          if (!active()) throw Error("Sync stopped.");
+          const rev = await store.publish(path, heads.map((r) => r.id), chosen);
           history.set(rev.id, rev);
           heads = [rev];
           sent++;
@@ -376,6 +404,7 @@ var require_core = __commonJS({
       createVault,
       Store,
       synchronize,
+      headsByPath,
       safePath,
       isRecovery,
       conflictFolder,
@@ -2695,6 +2724,7 @@ var require_pqc = __commonJS({
         verify("revision", [r], sig, policy.p.members[r.from].sig);
         const rev = parseBytes(await decrypt(un64(ring[r.epoch]), [suite, p.anchor, r.epoch, r.id, "manifest"], un64(r.payload)));
         check(rev.id === r.id && (rev.hash === null ? rev.key === null : typeof rev.key === "string" && un64(rev.key).length === 32), "\u4FEE\u8BA2\u8BB0\u5F55\u5F02\u5E38\u3002");
+        rev.author = policy.p.members[r.from].name;
         revisions.push(rev);
         previousEpoch = r.epoch;
       }
@@ -2744,6 +2774,66 @@ var require_pqc = __commonJS({
   }
 });
 
+// src/pqc-conflict.cjs
+var require_pqc_conflict = __commonJS({
+  "src/pqc-conflict.cjs"(exports2, module2) {
+    "use strict";
+    var { Modal: Modal2, Setting: Setting2 } = require("obsidian");
+    var ConflictModal = class extends Modal2 {
+      constructor(app, review, submit) {
+        super(app);
+        this.review = review;
+        this.submit = submit;
+      }
+      onOpen() {
+        this.setTitle("\u6BD4\u8F83\u51B2\u7A81\u526F\u672C");
+        const { path, choices } = this.review;
+        this.contentEl.createEl("p", { text: path });
+        const group = this.contentEl.createDiv({ cls: "homebound-conflict-copies" });
+        const radios = [];
+        let selected, confirm;
+        for (const choice of choices) {
+          const card = group.createDiv({ cls: "homebound-conflict-copy" });
+          const label = card.createEl("label");
+          const radio = label.createEl("input", { attr: { type: "radio", name: "homebound-conflict-" + this.review.headIds[0] } });
+          radios.push(radio);
+          label.createSpan({ text: " " + choice.label });
+          radio.addEventListener("change", () => {
+            selected = choice.source;
+            confirm.setButtonText(choice.bytes === null ? "\u786E\u8BA4\u91C7\u7528\u5220\u9664\u7248\u672C" : "\u91C7\u7528\u9009\u5B9A\u6B63\u6587").setDisabled(false);
+          });
+          if (choice.bytes === null) {
+            card.createEl("p", { text: "\u6B64\u7248\u672C\u5DF2\u5220\u9664\u6587\u4EF6\u3002" });
+          } else if (/\.(md|txt|canvas|json)$/i.test(path)) {
+            const text = new TextDecoder().decode(choice.bytes);
+            card.createEl("pre", { text: text || "\uFF08\u7A7A\u6587\u4EF6\uFF09", cls: "homebound-conflict-preview" });
+          } else {
+            card.createEl("p", { text: "\u4E8C\u8FDB\u5236\u9644\u4EF6 \xB7 " + choice.bytes.byteLength + " \u5B57\u8282" });
+          }
+        }
+        const status = this.contentEl.createDiv({ attr: { role: "status" } });
+        new Setting2(this.contentEl).addButton((b) => b.setButtonText("\u53D6\u6D88").onClick(() => this.close())).addButton((b) => {
+          confirm = b.setButtonText("\u91C7\u7528\u9009\u5B9A\u6B63\u6587").setCta().setDisabled(true).onClick(async () => {
+            confirm.setDisabled(true);
+            for (const radio of radios) radio.disabled = true;
+            status.setText("\u6B63\u5728\u63D0\u4EA4\u2026");
+            try {
+              await this.submit(selected);
+              this.close();
+            } catch (e) {
+              status.setText((e.message || String(e)) + " \u8BF7\u5173\u95ED\u7A97\u53E3\uFF0C\u91CD\u65B0\u540C\u6B65\u540E\u518D\u6BD4\u8F83\u3002");
+            }
+          });
+        });
+      }
+      onClose() {
+        this.contentEl.empty();
+      }
+    };
+    module2.exports = { ConflictModal };
+  }
+});
+
 // src/pqc-mode.cjs
 var require_pqc_mode = __commonJS({
   "src/pqc-mode.cjs"(exports2, module2) {
@@ -2755,6 +2845,7 @@ var require_pqc_mode = __commonJS({
     var folder = "Homebound-PQC";
     var namespace2 = "pqc-preview-2";
     var notice = (e) => new Notice2(e.message || String(e), 1e4);
+    var { ConflictModal } = require_pqc_conflict();
     var Output = class extends Modal2 {
       constructor(app, title, value) {
         super(app);
@@ -2834,8 +2925,11 @@ var require_pqc_mode = __commonJS({
       if (p.config.anchor) {
         button("\u7ACB\u5373\u540C\u6B65 / \u68C0\u67E5\u914D\u5BF9", async () => {
           const r = await p.sync();
-          new Notice2(r.route + " \xB7 \u4E0A\u4F20 " + r.sent + " \xB7 \u4E0B\u8F7D " + r.received);
+          new Notice2(p.syncSummary(r));
         });
+        for (const path of p.conflicts) {
+          new Setting2(el).setName(path).addButton((b) => b.setButtonText("\u6BD4\u8F83\u51B2\u7A81\u526F\u672C").onClick(() => p.compare(path, redraw)));
+        }
         if (p.config.admin) {
           button("\u91CD\u65B0\u6821\u9A8C\u6062\u590D\u6570\u636E", () => p.verifyRecovery());
           field("\u65B0\u8BBE\u5907\u663E\u793A\u7684\u914D\u5BF9\u7801", "", (v) => request = v);
@@ -2880,6 +2974,7 @@ var require_pqc_mode = __commonJS({
     var PqcMode2 = class {
       constructor(app) {
         this.app = app;
+        this.conflicts = [];
         const saved = app.loadLocalStorage("homebound-webdav-pqc-config");
         if (saved && saved.format !== 2) throw Error("\u65E0\u6CD5\u8BC6\u522B\u6B64\u8BBE\u5907\u7684 PQC \u914D\u7F6E\u3002");
         this.config = { format: 2, home: "", away: "", witness: "", username: "", name: "\u6211\u7684\u8BBE\u5907", ...saved };
@@ -3090,7 +3185,44 @@ var require_pqc_mode = __commonJS({
         await this.saveData(this.config);
         return report;
       }
-      async sync() {
+      syncSummary(r) {
+        const lines = [r.route + " \xB7 \u4E0A\u4F20 " + r.sent + " \xB7 \u4E0B\u8F7D " + r.received];
+        if (r.conflicts.length) lines.push("\u5F85\u89E3\u51B3\u51B2\u7A81 " + r.conflicts.length + " \u9879 \xB7 \u5728\u63D2\u4EF6\u8BBE\u7F6E\u4E2D\u6BD4\u8F83\u526F\u672C");
+        return lines.join("\n");
+      }
+      async compare(path, redraw) {
+        try {
+          const review = await this.exclusive(async () => {
+            const { store } = await this.syncStore();
+            const heads = core2.headsByPath(await store.history()).get(path) || [];
+            if (new Set(heads.map((r) => r.hash)).size < 2) throw Error("\u6B64\u51B2\u7A81\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u540C\u6B65\u3002");
+            const local = new VaultFiles2(this.app);
+            if (!core2.safePath(path) || !local.allowed(path)) throw Error("\u65E0\u6548\u7684\u7B14\u8BB0\u8DEF\u5F84\u3002");
+            const bytes = await local.read(path);
+            const localHash = bytes === null ? null : await core2.sha(bytes);
+            const choices = [];
+            if (!heads.some((r) => r.hash === localHash) && bytes !== null) {
+              choices.push({ source: "local", label: "\u672C\u673A\u5F53\u524D\u6B63\u6587", bytes });
+            }
+            for (const rev of heads) {
+              const here = rev.hash === localHash;
+              const label = (rev.author || "\u8BBE\u5907") + " \xB7 " + rev.id.slice(0, 8) + (here ? "\uFF08\u672C\u673A\u5F53\u524D\uFF09" : "");
+              const body = here ? bytes : rev.hash === null ? null : await store.readBody(rev);
+              choices.push({ source: rev.id, label, bytes: body });
+            }
+            return { path, localHash, headIds: heads.map((r) => r.id).sort(), choices };
+          });
+          if (!this.closed) new ConflictModal(this.app, review, async (source) => {
+            const { path: path2, localHash, headIds } = review;
+            const r = await this.exclusive(() => this.sync({ path: path2, localHash, headIds, source }));
+            new Notice2(this.syncSummary(r));
+            redraw?.();
+          }).open();
+        } catch (e) {
+          notice(e);
+        }
+      }
+      async syncStore() {
         const { dav, device, s, route } = await this.context(), last = pq.latest(s);
         if (!last.p.members[device.id]) {
           await this.refresh(s);
@@ -3100,15 +3232,21 @@ var require_pqc_mode = __commonJS({
         this.config.pin = { n: last.p.n, digest: last.digest };
         delete this.config.request;
         await this.saveData(this.config);
+        return { store, route };
+      }
+      async sync(selection) {
+        const { store, route } = await this.syncStore();
         const id2 = "hbpqc-baseline-" + this.config.anchor;
         const r = await core2.synchronize({
           store,
           local: new VaultFiles2(this.app),
           baseline: new Map(this.app.loadLocalStorage(id2) || []),
           cache: /* @__PURE__ */ new Map(),
+          selection,
           checkpoint: (m) => this.app.saveLocalStorage(id2, [...m]),
           active: () => !this.closed
         });
+        this.conflicts = r.conflicts;
         return { route, sent: r.sent, received: r.received, conflicts: r.conflicts };
       }
     };
@@ -3266,6 +3404,12 @@ module.exports = class HomeboundPlugin extends Plugin {
       if (!checking) this.run(file.path);
       return true;
     } });
+    this.addCommand({ id: "compare-pqc-conflict", name: tr("Compare PQC conflict copies", "\u6BD4\u8F83 PQC \u51B2\u7A81\u526F\u672C"), checkCallback: (checking) => {
+      const path = this.app.workspace.getActiveFile()?.path;
+      if (this.mode !== "pqc" || !this.pqc.conflicts.includes(path)) return false;
+      if (!checking) this.pqc.compare(path, () => this.settingsTab.display());
+      return true;
+    } });
     this.addCommand({ id: "seal-history", name: tr("Rotate PQC vault keys", "\u8F6E\u6362 PQC \u5E93\u5BC6\u94A5"), checkCallback: (checking) => {
       const q = this.pqc;
       if (this.mode !== "pqc" || !q?.config.admin) return false;
@@ -3338,7 +3482,8 @@ module.exports = class HomeboundPlugin extends Plugin {
       const q = this.pqc;
       try {
         const result = await q.exclusive(() => q.sync());
-        new Notice(result.route + tr(" \xB7 uploaded ", " \xB7 \u5DF2\u4E0A\u4F20 ") + result.sent + tr(" \xB7 received ", " \xB7 \u5DF2\u63A5\u6536 ") + result.received);
+        new Notice(q.syncSummary(result));
+        this.settingsTab.display();
         return result;
       } catch (e) {
         new Notice(e.message);

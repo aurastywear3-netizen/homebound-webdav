@@ -23,8 +23,8 @@ async function fixture() {
             },
             async archive(rev, body) { archived.set(rev.id, await body()); }
         };
-        return { contents, archived, baseline, local, async sync(resolve) {
-            const result = await core.synchronize({ store, local, baseline, cache, checkpoint() {}, resolve });
+        return { contents, archived, baseline, local, async sync(resolve, selection) {
+            const result = await core.synchronize({ store, local, baseline, cache, checkpoint() {}, resolve, selection });
             cache = result.history;
             return result;
         } };
@@ -165,4 +165,55 @@ test("interrupted initialization and lost MOVE response are retriable; an existi
     const header = await setup();
     assert.equal(core.parseBytes(files.get("/nested/中文/homebound-v1/vault.json")).id, header.id);
     await assert.rejects(setup(), /empty remote folder/);
+});
+
+async function offlineConflict() {
+    const f = await fixture(), mac = f.device(), ipad = f.device(), note = "中文/冲突.md";
+    mac.contents.set(note, text("base")); await mac.sync(); await ipad.sync();
+    mac.contents.set(note, text("Mac")); ipad.contents.set(note, text("iPad"));
+    await mac.sync(); await ipad.sync(); await mac.sync();
+    const heads = core.headsByPath(await f.store.history(new Map())).get(note);
+    const selection = {path:note, headIds:heads.map(r => r.id).sort(), localHash:await core.sha(text("Mac")),
+        source:heads.find(r => r.hash !== mac.baseline.get(note).hash).id};
+    return {f, mac, ipad, note, selection};
+}
+
+test("select a reviewed peer copy and converge without reporting the old conflict again", async () => {
+    const {mac, ipad, note, selection} = await offlineConflict();
+    const result = await mac.sync(undefined, selection);
+    assert.equal(result.sent, 1); assert.deepEqual(result.conflicts, []);
+    await ipad.sync();
+    assert.deepEqual(mac.contents.get(note), text("iPad"));
+    assert.deepEqual(ipad.contents, mac.contents);
+    for (const device of [mac, ipad]) {
+        const again = await device.sync();
+        assert.deepEqual([again.sent, again.received, again.conflicts], [0,0,[]]);
+    }
+});
+
+test("keep the resolver's version without a losing peer re-uploading its offline edit", async () => {
+    const {mac, ipad, note, selection} = await offlineConflict();
+    await mac.sync(undefined, {...selection, source:"local"}); await ipad.sync();
+    assert.deepEqual(ipad.contents.get(note), text("Mac"));
+    assert.deepEqual((await mac.sync()).conflicts, []);
+});
+
+test("a stale comparison cannot replace a newer edit or resolve a different set of heads", async () => {
+    const {mac, f, note, selection} = await offlineConflict();
+    mac.contents.set(note, text("unsaved in comparison"));
+    await assert.rejects(mac.sync(undefined, selection), /已变化/);
+    assert.deepEqual(mac.contents.get(note), text("unsaved in comparison"));
+    mac.contents.set(note, text("Mac"));
+    await f.store.publish(note, [], text("offline third device"));
+    await assert.rejects(mac.sync(undefined, selection), /已变化/);
+    assert.equal(core.headsByPath(await f.store.history(new Map())).get(note).length, 3);
+});
+
+test("a selected deletion supersedes all reviewed conflict heads", async () => {
+    const {mac, ipad, f, note, selection} = await offlineConflict();
+    const deleted = await f.store.publish(note, [selection.source], null);
+    await mac.sync();
+    const heads = core.headsByPath(await f.store.history(new Map())).get(note);
+    await mac.sync(undefined, {...selection, headIds:heads.map(r => r.id).sort(), source:deleted.id});
+    assert.equal(mac.contents.has(note), false);
 });

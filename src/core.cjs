@@ -159,9 +159,10 @@ function checkAliases(paths) {
     }
 }
 
-async function synchronize({ store, local, baseline, cache, checkpoint, resolve, active = () => true }) {
+async function synchronize({ store, local, baseline, cache, checkpoint, resolve, selection, active = () => true }) {
     const history = await store.history(cache);
     const groups = headsByPath(history);
+    if (selection && !groups.has(selection.path)) throw Error("冲突版本已变化，请重新同步并比较。");
     const localPaths = local.paths();
     // Every checkpoint must still be backed by a published revision on this server.
     for (const [path, base] of baseline) {
@@ -183,10 +184,18 @@ async function synchronize({ store, local, baseline, cache, checkpoint, resolve,
         let heads = groups.get(path) ?? [];
         const base = baseline.get(path);
         const bytes = await local.read(path);
-        const hash = bytes === null ? null : await sha(bytes);
+        let hash = bytes === null ? null : await sha(bytes);
         const matching = heads.some(rev => rev.hash === hash);
         const changed = base ? hash !== base.hash : bytes !== null;
         const alreadySplit = new Set(heads.map(rev => rev.hash)).size > 1;
+        const reviewing = selection?.path === path;
+        if (reviewing) {
+            const ids = heads.map(rev => rev.id).sort();
+            if (!alreadySplit || hash !== selection.localHash ||
+                JSON.stringify(ids) !== JSON.stringify(selection.headIds)) {
+                throw Error("正文或冲突版本已变化，请重新同步并比较。");
+            }
+        }
         if (changed && !matching && !alreadySplit) {
             const parents = base?.ids ?? [];
             const rev = await store.publish(path, parents, bytes);
@@ -199,16 +208,39 @@ async function synchronize({ store, local, baseline, cache, checkpoint, resolve,
             for (const rev of heads) {
                 if (rev.hash !== null) await local.archive(rev, () => store.readBody(rev));
             }
-            if (resolve !== path || bytes === null) {
+            // Remember which published branch the local file represents. Otherwise a peer
+            // can re-upload its losing version as a new edit after someone resolves it.
+            const matchingIds = heads.filter(rev => rev.hash === hash).map(rev => rev.id).sort();
+            if (matchingIds.length && (bytes !== null || base) &&
+                JSON.stringify(base?.ids) !== JSON.stringify(matchingIds)) {
+                baseline.set(path, { ids: matchingIds, hash });
+                checkpoint(baseline);
+            }
+            if (!reviewing && (resolve !== path || bytes === null)) {
                 // Give a device with an empty vault a file it can open to resolve the dispute.
                 if (!base && bytes === null) {
                     const candidate = heads.filter(r => r.hash !== null).sort((a,b) => a.id.localeCompare(b.id))[0];
-                    if (candidate) await local.apply(path, null, await store.readBody(candidate));
+                    if (candidate) {
+                        await local.apply(path, null, await store.readBody(candidate));
+                        baseline.set(path, { ids: [candidate.id], hash: candidate.hash });
+                        checkpoint(baseline);
+                    }
                 }
                 conflicts.push(path);
                 continue;
             }
-            const rev = await store.publish(path, heads.map(r => r.id), bytes);
+            let chosen = bytes;
+            if (reviewing && selection.source !== "local") {
+                const source = heads.find(rev => rev.id === selection.source);
+                if (!source) throw Error("所选副本已变化，请重新比较。");
+                if (source.hash !== hash) {
+                    chosen = source.hash === null ? null : await store.readBody(source);
+                    await local.apply(path, hash, chosen);
+                    hash = source.hash;
+                }
+            }
+            if (!active()) throw Error("Sync stopped.");
+            const rev = await store.publish(path, heads.map(r => r.id), chosen);
             history.set(rev.id, rev);
             heads = [rev];
             sent++;
@@ -258,5 +290,5 @@ async function createVault(home, folder, passphrase, namespace) {
     return header;
 }
 
-module.exports = { createVault, Store, synchronize, safePath, isRecovery, conflictFolder, directory, endpoint, encodePath,
+module.exports = { createVault, Store, synchronize, headsByPath, safePath, isRecovery, conflictFolder, directory, endpoint, encodePath,
     newHeader, unlock, randomId, sha, jsonBytes, parseBytes };

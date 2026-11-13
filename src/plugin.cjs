@@ -122,6 +122,12 @@ module.exports = class HomeboundPlugin extends Plugin {
             if (!checking) this.run(file.path);
             return true;
         } });
+        this.addCommand({ id: "compare-pqc-conflict", name: tr("Compare PQC conflict copies", "比较 PQC 冲突副本"), checkCallback: checking => {
+            const path = this.app.workspace.getActiveFile()?.path;
+            if (this.mode !== "pqc" || !this.pqc.conflicts.includes(path)) return false;
+            if (!checking) this.pqc.compare(path, () => this.settingsTab.display());
+            return true;
+        }});
         this.addCommand({ id: "seal-history", name: tr("Rotate PQC vault keys", "轮换 PQC 库密钥"), checkCallback: checking => {
             const q = this.pqc;
             if (this.mode !== "pqc" || !q?.config.admin) return false;
@@ -183,7 +189,8 @@ module.exports = class HomeboundPlugin extends Plugin {
             const q = this.pqc;
             try {
                 const result = await q.exclusive(() => q.sync());
-                new Notice(result.route + tr(" · uploaded ", " · 已上传 ") + result.sent + tr(" · received ", " · 已接收 ") + result.received);
+                new Notice(q.syncSummary(result));
+                this.settingsTab.display();
                 return result;
             } catch (e) { new Notice(e.message); return; }
         }

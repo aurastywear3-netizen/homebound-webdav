@@ -187,6 +187,8 @@ async function storeFor(ledger,dav,s,device){
         verify("revision",[r],sig,policy.p.members[r.from].sig);
         const rev=parseBytes(await decrypt(un64(ring[r.epoch]),[suite,p.anchor,r.epoch,r.id,"manifest"],un64(r.payload)));
         check(rev.id===r.id && (rev.hash===null?rev.key===null:typeof rev.key==="string"&&un64(rev.key).length===32),"修订记录异常。");
+        // Display attribution from the verified policy at the time of signing.
+        rev.author = policy.p.members[r.from].name;
         revisions.push(rev);previousEpoch=r.epoch;
     }
     const history=validateGraph(revisions);

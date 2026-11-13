@@ -6,6 +6,7 @@ const {Dav,VaultFiles,credentials}=require("./adapter.cjs");
 const folder="Homebound-PQC";
 const namespace="pqc-preview-2";
 const notice=e=>new Notice(e.message||String(e),10000);
+const { ConflictModal } = require("./pqc-conflict.cjs");
 class Output extends Modal {
     constructor(app,title,value){super(app);this.title=title;this.value=value;}
     onOpen(){
@@ -55,7 +56,10 @@ function displaySettings(el,p,app,redraw){
         }
         if(p.config.integrity)el.createEl("p",{text:p.config.integrity});
         if(p.config.anchor){
-            button("立即同步 / 检查配对",async()=>{const r=await p.sync();new Notice(r.route+" · 上传 "+r.sent+" · 下载 "+r.received);});
+            button("立即同步 / 检查配对",async()=>{const r=await p.sync();new Notice(p.syncSummary(r));});
+            for (const path of p.conflicts) {
+                new Setting(el).setName(path).addButton(b => b.setButtonText("比较冲突副本").onClick(() => p.compare(path, redraw)));
+            }
             if(p.config.admin){
                 button("重新校验恢复数据",()=>p.verifyRecovery());
                 field("新设备显示的配对码","",v=>request=v);
@@ -83,6 +87,7 @@ function displaySettings(el,p,app,redraw){
 class PqcMode{
     constructor(app){
         this.app=app;
+        this.conflicts=[];
         const saved=app.loadLocalStorage("homebound-webdav-pqc-config");
         if(saved && saved.format!==2)throw Error("无法识别此设备的 PQC 配置。");
         this.config={format:2,home:"",away:"",witness:"",username:"",name:"我的设备",...saved};
@@ -217,7 +222,42 @@ class PqcMode{
         }catch(e){this.config.integrity="已接管，数据校验失败："+e.message;report={faults:[{path:e.path,id:e.id,error:e.message}]};}
         await this.saveData(this.config);return report;
     }
-    async sync(){
+    syncSummary(r) {
+        const lines = [r.route + " · 上传 " + r.sent + " · 下载 " + r.received];
+        if (r.conflicts.length) lines.push("待解决冲突 " + r.conflicts.length + " 项 · 在插件设置中比较副本");
+        return lines.join("\n");
+    }
+    async compare(path, redraw) {
+        try {
+            const review = await this.exclusive(async () => {
+                const {store} = await this.syncStore();
+                const heads = core.headsByPath(await store.history()).get(path) || [];
+                if (new Set(heads.map(r => r.hash)).size < 2) throw Error("此冲突已变化，请重新同步。");
+                const local = new VaultFiles(this.app);
+                if (!core.safePath(path) || !local.allowed(path)) throw Error("无效的笔记路径。");
+                const bytes = await local.read(path);
+                const localHash = bytes === null ? null : await core.sha(bytes);
+                const choices = [];
+                if (!heads.some(r => r.hash === localHash) && bytes !== null) {
+                    choices.push({source:"local", label:"本机当前正文", bytes});
+                }
+                for (const rev of heads) {
+                    const here = rev.hash === localHash;
+                    const label = (rev.author || "设备") + " · " + rev.id.slice(0,8) + (here ? "（本机当前）" : "");
+                    const body = here ? bytes : rev.hash === null ? null : await store.readBody(rev);
+                    choices.push({source:rev.id, label, bytes:body});
+                }
+                return {path, localHash, headIds:heads.map(r => r.id).sort(), choices};
+            });
+            if (!this.closed) new ConflictModal(this.app, review, async source => {
+                const {path, localHash, headIds} = review;
+                const r = await this.exclusive(() => this.sync({path, localHash, headIds, source}));
+                new Notice(this.syncSummary(r));
+                redraw?.();
+            }).open();
+        } catch (e) { notice(e); }
+    }
+    async syncStore(){
         const {dav,device,s,route}=await this.context(),last=pq.latest(s);
         if(!last.p.members[device.id]){
             await this.refresh(s);
@@ -226,9 +266,14 @@ class PqcMode{
         const store=await pq.storeFor(this.ledger.bind(this),dav,s,device);
         this.config.pin={n:last.p.n,digest:last.digest}; delete this.config.request;
         await this.saveData(this.config);
+        return {store, route};
+    }
+    async sync(selection){
+        const {store, route} = await this.syncStore();
         const id="hbpqc-baseline-"+this.config.anchor;
         const r=await core.synchronize({store,local:new VaultFiles(this.app),baseline:new Map(this.app.loadLocalStorage(id)||[]),
-            cache:new Map(),checkpoint:m=>this.app.saveLocalStorage(id,[...m]),active:()=>!this.closed});
+            cache:new Map(),selection,checkpoint:m=>this.app.saveLocalStorage(id,[...m]),active:()=>!this.closed});
+        this.conflicts = r.conflicts;
         return {route,sent:r.sent,received:r.received,conflicts:r.conflicts};
     }
 }

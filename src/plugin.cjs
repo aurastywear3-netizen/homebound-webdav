@@ -87,6 +87,9 @@ class Settings extends PluginSettingTab {
 module.exports=class Preview extends Plugin{
     async onload(){
         const saved=await this.loadData();
+        if(this.manifest.id!=="homebound-webdav-pqc-preview" || (saved && ("secretId" in saved || "id" in saved))){
+            throw Error("此安装位置或配置属于正式版。请保留原插件，在独立位置安装 PQC 测试版。");
+        }
         if(saved?.anchor && saved.format!==2)throw Error("请在独立 beta.2 本地库启用，旧测试库使用原版本。");
         this.config={format:2,home:"",away:"",witness:"",username:"",name:"我的设备",...saved};
         if(!this.config.local){this.config.local=core.randomId();await this.saveData(this.config);}
@@ -155,7 +158,7 @@ module.exports=class Preview extends Plugin{
         }
         return response.json;
     }
-    async snapshot(anchor=this.config.anchor){return pq.state(this.ledger.bind(this),anchor,this.config.pin);}
+    async snapshot(anchor=this.config.anchor,withRevisions=true){return pq.state(this.ledger.bind(this),anchor,this.config.pin,withRevisions);}
     async context(anchor=this.config.anchor){
         const [s,r]=await Promise.all([this.snapshot(anchor),this.route()]);
         const marker=core.parseBytes(await r.dav.read("vault.json"));
@@ -163,7 +166,7 @@ module.exports=class Preview extends Plugin{
         return {...r,s,device:await this.device()};
     }
     async refresh(snapshot){
-        const s=snapshot||await this.snapshot(),dev=await this.device(),{p,digest}=pq.latest(s);
+        const s=snapshot||await this.snapshot(this.config.anchor,false),dev=await this.device(),{p,digest}=pq.latest(s);
         this.config.pin={n:p.n,digest};this.config.admin=p.admin===dev.id;
         this.config.others=Object.entries(p.members).filter(([id])=>id!==dev.id).map(([id,m])=>({id,name:m.name}));
         if(p.members[dev.id])delete this.config.request;
@@ -184,7 +187,7 @@ module.exports=class Preview extends Plugin{
     async sealHistory(){await this.change("seal-history");}
     async revoke(id){await this.change("revoke",id);}
     async change(action,arg){
-        await pq.nextPolicy(this.ledger.bind(this),await this.snapshot(),await this.device(),action,arg);
+        await pq.nextPolicy(this.ledger.bind(this),await this.snapshot(this.config.anchor,false),await this.device(),action,arg);
         await this.refresh();
     }
     pendingRecovery(){return this.secret("pending-root")||"";}
@@ -198,7 +201,7 @@ module.exports=class Preview extends Plugin{
     }
     async replacementKit(input,seed){const {anchor}=await this.recoveryKit(input);return anchor+"."+seed;}
     async restore(input,replacement){
-        const {rec,anchor}=await this.recoveryKit(input),s=await this.snapshot(anchor);
+        const {rec,anchor}=await this.recoveryKit(input),s=await this.snapshot(anchor,false);
         if(!replacement || replacement===input.split(".").at(-1))throw Error("请离线保存新的随机恢复码。");
         const newRoot=await pq.identity(replacement,"recovery");
         const existing=this.pendingRecovery(),pending=this.secret("pending-device");

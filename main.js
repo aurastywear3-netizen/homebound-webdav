@@ -2397,11 +2397,12 @@ var require_pqc = __commonJS({
       check(typeof name === "string" && name.trim() && name.length <= 64, "\u8BF7\u8F93\u5165\u8BBE\u5907\u540D\u79F0\uFF081 \u81F3 64 \u5B57\uFF09\u3002");
       return { ...device.pub, name: name.trim() };
     }
-    async function state(ledger, anchor, pin) {
+    async function state(ledger, anchor, pin, withRevisions = true) {
       check(idPattern.test(anchor), "\u5E93\u6307\u7EB9\u65E0\u6548\u3002");
-      const nonce = randomId(), snapshot = await ledger("state", { anchor, nonce });
+      const nonce = randomId(), snapshot = await ledger("state", { anchor, nonce, withRevisions });
       check(snapshot.nonce === nonce && snapshot.policies.length > 0, "\u53EF\u4FE1\u63D0\u4EA4\u670D\u52A1\u672A\u63D0\u4F9B\u5F53\u524D\u72B6\u6001\u3002");
       const policies = [];
+      let linked = false;
       for (const raw of snapshot.policies) {
         const { policy: p, sig } = JSON.parse(raw), prev = policies.at(-1);
         check(p.suite === suite && p.n === policies.length && p.anchor === anchor && p.parent === (prev?.digest || ""), "\u6388\u6743\u94FE\u4E0D\u5339\u914D\u3002");
@@ -2410,6 +2411,10 @@ var require_pqc = __commonJS({
         check(p.by === "recovery" || p.by === prior.admin, "\u65E0\u7BA1\u7406\u6743\u9650\u3002");
         verify("policy", [p], sig, p.by === "recovery" ? prior.recovery.sig : prior.members[prior.admin].sig);
         check(p.members[p.admin] && (p.by === "recovery" || JSON.stringify(p.recovery) === JSON.stringify(prior.recovery)), "\u65E0\u6548\u6062\u590D\u6839\u3002");
+        if (p.keyLink !== void 0) {
+          check(prev && typeof p.keyLink === "string" && un64(p.keyLink).length === 60, "\u5386\u53F2\u5BC6\u94A5\u94FE\u63A5\u635F\u574F\u3002");
+          linked = true;
+        } else check(!linked, "\u5386\u53F2\u5BC6\u94A5\u683C\u5F0F\u53D1\u751F\u56DE\u9000\u3002");
         const digest = await digestOf(raw);
         if (pin?.n === p.n) check(pin.digest === digest, "\u6388\u6743\u8BB0\u5F55\u5DF2\u88AB\u66FF\u6362\u3002");
         policies.push({ p, digest });
@@ -2424,6 +2429,7 @@ var require_pqc = __commonJS({
       const row = JSON.stringify({ policy: p, sig: signed("policy", [p], actor.sign) });
       const result = await ledger("policy", { head: p.parent, row }, token);
       check(result.digest === await digestOf(row), "\u63D0\u4EA4\u670D\u52A1\u8FD4\u56DE\u4E86\u4E0D\u540C\u7684\u6388\u6743\u6458\u8981\u3002");
+      return { p, digest: result.digest };
     }
     async function genesis(ledger, device, name, recovery, bootstrap) {
       const p = { suite, n: 0, parent: "", by: "recovery", anchor: recovery.id, recovery: recovery.pub, admin: device.id, members: { [device.id]: publicDevice(device, name) } };
@@ -2452,6 +2458,7 @@ var require_pqc = __commonJS({
       const recoveryId = await publicId(p.recovery);
       check(restoring ? actor.id === recoveryId : actor.id === p.admin, "\u6062\u590D\u8EAB\u4EFD\u6216\u7BA1\u7406\u5458\u4E0D\u5339\u914D\u3002");
       const keys = await openRing(actor, restoring ? p.recoveryBox : p.boxes[actor.id], [p.anchor, p.n, restoring ? "recovery" : actor.id]);
+      check(keys.length === (p.keyLink ? 1 : p.n + 1), "\u5F53\u524D\u4EE3\u5BC6\u94A5\u8BB0\u5F55\u4E0D\u5B8C\u6574\u3002");
       let members = { ...p.members }, admin = p.admin, recovery = p.recovery;
       if (restoring) {
         check(arg.id !== p.admin && !members[arg.id] && await publicId(arg.recovery) !== recoveryId, "\u8BF7\u751F\u6210\u65B0\u7684\u8BBE\u5907\u8EAB\u4EFD\u548C\u6062\u590D\u7801\u3002");
@@ -2466,7 +2473,12 @@ var require_pqc = __commonJS({
         members[arg.id] = arg.pub;
       } else check(action === "seal-history", "\u672A\u77E5\u64CD\u4F5C\u3002");
       const next = { suite, n: p.n + 1, parent: digest, anchor: p.anchor, by: restoring ? "recovery" : actor.id, recovery, admin, members };
-      await signPolicy(ledger, next, actor, [...keys, freshSeed()]);
+      const current = freshSeed();
+      next.keyLink = b64(await encrypt(un64(current), [suite, p.anchor, next.n, digest, "previous-key"], un64(keys.at(-1))));
+      if (!p.keyLink && p.n > 0) {
+        next.legacyKeys = b64(await encrypt(un64(current), [suite, p.anchor, next.n, digest, "legacy-keys"], jsonBytes(keys.slice(0, -1))));
+      }
+      return signPolicy(ledger, next, actor, [current]);
     }
     async function encrypt(rawKey, label, bytes) {
       const iv = random(12), cipher = await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: jsonBytes(label) }, await aes(rawKey), bytes);
@@ -2493,7 +2505,26 @@ var require_pqc = __commonJS({
     }
     async function storeFor(ledger, dav, s, device) {
       const { p, digest } = latest(s);
-      const ring = await openRing(device, p.boxes[device.id], [p.anchor, p.n, device.id]);
+      const envelopeKeys = await openRing(device, p.boxes[device.id], [p.anchor, p.n, device.id]);
+      let ring = envelopeKeys;
+      if (p.keyLink) {
+        check(envelopeKeys.length === 1, "\u5F53\u524D\u4EE3\u5BC6\u94A5\u8BB0\u5F55\u4E0D\u5B8C\u6574\u3002");
+        ring = new Array(p.n + 1);
+        let n = p.n;
+        ring[n] = envelopeKeys[0];
+        while (n > 0 && s.policies[n].p.keyLink) {
+          const policy = s.policies[n].p;
+          const previous = await decrypt(un64(ring[n]), [suite, p.anchor, n, policy.parent, "previous-key"], un64(policy.keyLink));
+          ring[--n] = b64(previous);
+        }
+        if (n > 0) {
+          const bridge = s.policies[n + 1].p.legacyKeys;
+          check(typeof bridge === "string", "\u7F3A\u5C11\u65E7\u7248\u5386\u53F2\u5BC6\u94A5\u3002");
+          const legacy = parseBytes(await decrypt(un64(ring[n + 1]), [suite, p.anchor, n + 1, s.policies[n].digest, "legacy-keys"], un64(bridge)));
+          check(legacy.length === n && legacy.every((k) => typeof k === "string" && un64(k).length === 32), "\u65E7\u7248\u5BC6\u94A5\u8BB0\u5F55\u4E0D\u5B8C\u6574\u3002");
+          for (let i = 0; i < n; i++) ring[i] = legacy[i];
+        }
+      }
       check(ring.length === s.policies.length, "\u5BC6\u94A5\u8BB0\u5F55\u4E0D\u5B8C\u6574\u3002");
       const bodies = dav.child("objects"), revisions = [];
       let previousEpoch = -1;
@@ -2854,6 +2885,9 @@ var Settings = class extends PluginSettingTab {
 module.exports = class Preview extends Plugin {
   async onload() {
     const saved = await this.loadData();
+    if (this.manifest.id !== "homebound-webdav-pqc-preview" || saved && ("secretId" in saved || "id" in saved)) {
+      throw Error("\u6B64\u5B89\u88C5\u4F4D\u7F6E\u6216\u914D\u7F6E\u5C5E\u4E8E\u6B63\u5F0F\u7248\u3002\u8BF7\u4FDD\u7559\u539F\u63D2\u4EF6\uFF0C\u5728\u72EC\u7ACB\u4F4D\u7F6E\u5B89\u88C5 PQC \u6D4B\u8BD5\u7248\u3002");
+    }
     if (saved?.anchor && saved.format !== 2) throw Error("\u8BF7\u5728\u72EC\u7ACB beta.2 \u672C\u5730\u5E93\u542F\u7528\uFF0C\u65E7\u6D4B\u8BD5\u5E93\u4F7F\u7528\u539F\u7248\u672C\u3002");
     this.config = { format: 2, home: "", away: "", witness: "", username: "", name: "\u6211\u7684\u8BBE\u5907", ...saved };
     if (!this.config.local) {
@@ -2968,8 +3002,8 @@ module.exports = class Preview extends Plugin {
     }
     return response.json;
   }
-  async snapshot(anchor = this.config.anchor) {
-    return pq.state(this.ledger.bind(this), anchor, this.config.pin);
+  async snapshot(anchor = this.config.anchor, withRevisions = true) {
+    return pq.state(this.ledger.bind(this), anchor, this.config.pin, withRevisions);
   }
   async context(anchor = this.config.anchor) {
     const [s, r] = await Promise.all([this.snapshot(anchor), this.route()]);
@@ -2978,7 +3012,7 @@ module.exports = class Preview extends Plugin {
     return { ...r, s, device: await this.device() };
   }
   async refresh(snapshot) {
-    const s = snapshot || await this.snapshot(), dev = await this.device(), { p, digest } = pq.latest(s);
+    const s = snapshot || await this.snapshot(this.config.anchor, false), dev = await this.device(), { p, digest } = pq.latest(s);
     this.config.pin = { n: p.n, digest };
     this.config.admin = p.admin === dev.id;
     this.config.others = Object.entries(p.members).filter(([id2]) => id2 !== dev.id).map(([id2, m]) => ({ id: id2, name: m.name }));
@@ -3008,7 +3042,7 @@ module.exports = class Preview extends Plugin {
     await this.change("revoke", id2);
   }
   async change(action, arg) {
-    await pq.nextPolicy(this.ledger.bind(this), await this.snapshot(), await this.device(), action, arg);
+    await pq.nextPolicy(this.ledger.bind(this), await this.snapshot(this.config.anchor, false), await this.device(), action, arg);
     await this.refresh();
   }
   pendingRecovery() {
@@ -3027,7 +3061,7 @@ module.exports = class Preview extends Plugin {
     return anchor + "." + seed;
   }
   async restore(input, replacement) {
-    const { rec, anchor } = await this.recoveryKit(input), s = await this.snapshot(anchor);
+    const { rec, anchor } = await this.recoveryKit(input), s = await this.snapshot(anchor, false);
     if (!replacement || replacement === input.split(".").at(-1)) throw Error("\u8BF7\u79BB\u7EBF\u4FDD\u5B58\u65B0\u7684\u968F\u673A\u6062\u590D\u7801\u3002");
     const newRoot = await pq.identity(replacement, "recovery");
     const existing = this.pendingRecovery(), pending = this.secret("pending-device");

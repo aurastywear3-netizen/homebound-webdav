@@ -187,3 +187,89 @@ test("12: damaged existing attachment is named during recovery",async t=>{
     const report=await pq.auditData(await pq.storeFor(f.ledger,f.dav,s,device));
     assert.deepEqual(report,{checked:1,faults:[{id:rev.id,path:"图像.bin"}]});
 });
+
+// Recreate the beta.2 wire format, including a separate full historical keyring in each recipient envelope.
+async function legacySeal(f,s,keys){
+    const {p,digest}=pq.latest(s);
+    const epoch={suite,n:p.n+1,parent:digest,anchor:p.anchor,by:f.owner.id,recovery:p.recovery,admin:p.admin,members:p.members,boxes:{}};
+    const box=async(pub,id)=>{
+        const {sharedSecret,cipherText}=kem.encapsulate(un64(pub.kem)),iv=randomBytes(12);
+        const context=core.jsonBytes([suite,"envelope",p.anchor,epoch.n,id]);
+        const body=await crypto.subtle.encrypt({name:"AES-GCM",iv,additionalData:context},await aes(sharedSecret,"encrypt"),core.jsonBytes(keys));
+        return [b64(cipherText),b64(iv),b64(body)];
+    };
+    for(const [id,pub] of Object.entries(epoch.members))epoch.boxes[id]=await box(pub,id);
+    epoch.recoveryBox=await box(epoch.recovery,"recovery");
+    const sig=b64(dsa.sign(core.jsonBytes([suite,"policy",epoch]),f.owner.sign));
+    const result=await f.ledger("policy",{head:digest,row:JSON.stringify({policy:epoch,sig})},f.owner.token);
+    return {p:epoch,digest:result.digest};
+}
+test("13: a genuine 256-record legacy vault can revoke, recover repeatedly and decrypt pre-upgrade history",async t=>{
+    const {ledger,bootstrap}=await service(t),dav=new Dav(),owner=await seed(),guest=await seed(),rec=await root();
+    await pq.genesis(ledger,owner,"Owner",rec,bootstrap);
+    let s=await pq.state(ledger,rec.id);
+    const first=await (await pq.storeFor(ledger,dav,s,owner)).publish("旧代.md",[],buffer("before capacity"));
+    const keys=[await oldKey(s,owner)],f={ledger,owner};
+    // A beta.2 owner can sign a membership change. Keep the guest enrolled up to the real boundary.
+    for(let n=1;n<=255;n++){
+        keys.push(pq.freshSeed());
+        const prev=pq.latest(s);
+        const input={policies:[{...prev,p:{...prev.p,members:{...prev.p.members,[guest.id]:pq.publicDevice(guest,"Guest")}}}]};
+        s={policies:[await legacySeal(f,input,keys)]};
+    }
+    const full=await pq.state(ledger,rec.id);
+    assert.equal(full.policies.length,256);
+    const writer=await pq.storeFor(ledger,dav,full,guest);
+    const lastWrite=await writer.publish("满额.md",[],buffer("last legacy"));
+    await assert.rejects(legacySeal(f,full,[...keys,pq.freshSeed()]),/Upgrade/);
+    await pq.nextPolicy(ledger,full,owner,"revoke",guest.id);
+    await assert.rejects(writer.publish("被撤销.md",[],buffer("stale")),/changed/);
+    const latestState=()=>pq.state(ledger,rec.id),rotated=await latestState();
+    assert.equal(pq.latest(rotated).p.n,256);
+    await assert.rejects(pq.storeFor(ledger,dav,rotated,guest),/撤销/);
+    const read=await pq.storeFor(ledger,dav,rotated,owner);
+    assert.equal(text(await read.readBody((await read.history()).get(first.id))),"before capacity");
+    const after=await read.publish("换钥后.md",[],buffer("after revoke"));
+    const recovered=await takeover({ledger,state:latestState,rec});
+    const again=await takeover({ledger,state:latestState,rec:recovered.renewed});
+    assert.equal(pq.latest(again.s).p.n,258);
+    assert.equal(pq.latest(again.s).p.legacyKeys,undefined);
+    const restored=await pq.storeFor(ledger,dav,again.s,again.device);
+    const history=await restored.history();
+    assert.equal(text(await restored.readBody(history.get(lastWrite.id))),"last legacy");
+    assert.equal(text(await restored.readBody(history.get(after.id))),"after revoke");
+    assert.deepEqual((await pq.auditData(restored)).faults,[]);
+    await assert.rejects(pq.storeFor(ledger,dav,again.s,recovered.device),/撤销/);
+    await assert.rejects(takeover({ledger,state:latestState,rec}),/恢复身份/);
+});
+test("14: full 32-member roster still permits revocation and recovery, compact rows stay bounded",async t=>{
+    const f=await setup(t);
+    let current=f.s;
+    const guests=[];
+    for(let i=2;i<=32;i++){
+        const device=await seed(),code=await pq.requestPair(f.dav,current,device,"Guest "+i);
+        const request=await pq.readRequest(f.dav,current,code);
+        const add=()=>pq.nextPolicy(f.ledger,current,f.owner,"approve",request);
+        if(i===32){await assert.rejects(add(),/membership/);break;}
+        const committed=await add();guests.push(device);current.policies.push(committed);
+    }
+    assert.equal(Object.keys(pq.latest(current).p.members).length,32);
+    const head=pq.latest(current);
+    assert.ok(Buffer.byteLength(JSON.stringify(head.p))<300*1024);
+    await pq.nextPolicy(f.ledger,current,f.owner,"revoke",guests.at(-1).id);
+    const {device,s}=await takeover({...f,state:f.state});
+    assert.equal(Object.keys(pq.latest(s).p.members).length,1);
+    assert.deepEqual((await pq.auditData(await pq.storeFor(f.ledger,f.dav,s,device))).faults,[]);
+});
+
+test("15: misplaced preview refuses the stable plugin ID and stable settings before any write",async()=>{
+    const bundle=await fs.readFile(require.resolve("../main.js"),"utf8");
+    const mock={exports:{}};
+    new Function("module","require",bundle)(mock,()=>({Plugin:class{},PluginSettingTab:class{},Modal:class{}}));
+    for(const [id,data] of [["homebound-webdav",null],["homebound-webdav-pqc-preview",{id:"old",secretId:"legacy-binding"}]]){
+        const plugin=new mock.exports();
+        plugin.manifest={id};plugin.loadData=async()=>data;
+        plugin.saveData=async()=>assert.fail("modified legacy settings");
+        await assert.rejects(plugin.onload(),/正式版/);
+    }
+});

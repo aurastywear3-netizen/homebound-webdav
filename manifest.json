@@ -1,7 +1,7 @@
 {
   "id": "homebound-webdav-pqc-preview",
   "name": "Homebound WebDAV PQC Preview",
-  "version": "0.2.0-beta.2",
+  "version": "0.2.0-beta.3",
   "minAppVersion": "1.11.4",
   "description": "Pair devices and sync a separate experimental post-quantum encrypted WebDAV vault.",
   "author": "aurastywear3-netizen",

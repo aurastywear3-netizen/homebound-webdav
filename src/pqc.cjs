@@ -52,11 +52,12 @@ function publicDevice(device,name){
     check(typeof name==="string" && name.trim() && name.length<=64,"请输入设备名称（1 至 64 字）。");
     return {...device.pub,name:name.trim()};
 }
-async function state(ledger,anchor,pin) {
+async function state(ledger,anchor,pin,withRevisions=true) {
     check(idPattern.test(anchor),"库指纹无效。");
-    const nonce=randomId(), snapshot=await ledger("state",{anchor,nonce});
+    const nonce=randomId(), snapshot=await ledger("state",{anchor,nonce,withRevisions});
     check(snapshot.nonce===nonce && snapshot.policies.length>0,"可信提交服务未提供当前状态。");
     const policies=[];
+    let linked=false;
     for(const raw of snapshot.policies){
         const {policy:p,sig}=JSON.parse(raw),prev=policies.at(-1);
         check(p.suite===suite && p.n===policies.length && p.anchor===anchor && p.parent===(prev?.digest||""),"授权链不匹配。");
@@ -65,6 +66,10 @@ async function state(ledger,anchor,pin) {
         check(p.by==="recovery" || p.by===prior.admin,"无管理权限。");
         verify("policy",[p],sig,p.by==="recovery"?prior.recovery.sig:prior.members[prior.admin].sig);
         check(p.members[p.admin] && (p.by==="recovery"||JSON.stringify(p.recovery)===JSON.stringify(prior.recovery)),"无效恢复根。");
+        if(p.keyLink!==undefined){
+            check(prev && typeof p.keyLink==="string" && un64(p.keyLink).length===60,"历史密钥链接损坏。");
+            linked=true;
+        }else check(!linked,"历史密钥格式发生回退。");
         const digest=await digestOf(raw);
         if(pin?.n===p.n)check(pin.digest===digest,"授权记录已被替换。");
         policies.push({p,digest});
@@ -79,6 +84,7 @@ async function signPolicy(ledger,p,actor,keys,token=actor.token){
     const row=JSON.stringify({policy:p,sig:signed("policy",[p],actor.sign)});
     const result=await ledger("policy",{head:p.parent,row},token);
     check(result.digest===await digestOf(row),"提交服务返回了不同的授权摘要。");
+    return {p,digest:result.digest};
 }
 async function genesis(ledger,device,name,recovery,bootstrap){
     const p={suite,n:0,parent:"",by:"recovery",anchor:recovery.id,recovery:recovery.pub,admin:device.id,members:{[device.id]:publicDevice(device,name)}};
@@ -107,6 +113,7 @@ async function nextPolicy(ledger,s,actor,action,arg){
     const recoveryId=await publicId(p.recovery);
     check(restoring?actor.id===recoveryId:actor.id===p.admin,"恢复身份或管理员不匹配。");
     const keys=await openRing(actor,restoring?p.recoveryBox:p.boxes[actor.id],[p.anchor,p.n,restoring?"recovery":actor.id]);
+    check(keys.length===(p.keyLink?1:p.n+1),"当前代密钥记录不完整。");
     let members={...p.members},admin=p.admin,recovery=p.recovery;
     if(restoring){
         check(arg.id!==p.admin && !members[arg.id] && await publicId(arg.recovery)!==recoveryId,"请生成新的设备身份和恢复码。");
@@ -118,7 +125,13 @@ async function nextPolicy(ledger,s,actor,action,arg){
     }else check(action==="seal-history","未知操作。");
     // A policy transaction is independent of the DAV data plane. Damaged bodies cannot veto rotation.
     const next={suite,n:p.n+1,parent:digest,anchor:p.anchor,by:restoring?"recovery":actor.id,recovery,admin,members};
-    await signPolicy(ledger,next,actor,[...keys,freshSeed()]);
+    // A new key unlocks its predecessor. Possession of an old key cannot unlock a successor.
+    const current=freshSeed();
+    next.keyLink=b64(await encrypt(un64(current),[suite,p.anchor,next.n,digest,"previous-key"],un64(keys.at(-1))));
+    if(!p.keyLink && p.n>0){
+        next.legacyKeys=b64(await encrypt(un64(current),[suite,p.anchor,next.n,digest,"legacy-keys"],jsonBytes(keys.slice(0,-1))));
+    }
+    return signPolicy(ledger,next,actor,[current]);
 }
 async function encrypt(rawKey,label,bytes){
     const iv=random(12),cipher=await crypto.subtle.encrypt({name:"AES-GCM",iv,additionalData:jsonBytes(label)},await aes(rawKey),bytes);
@@ -144,7 +157,27 @@ function validateGraph(revisions){
 }
 async function storeFor(ledger,dav,s,device){
     const {p,digest}=latest(s);
-    const ring=await openRing(device,p.boxes[device.id],[p.anchor,p.n,device.id]);
+    const envelopeKeys=await openRing(device,p.boxes[device.id],[p.anchor,p.n,device.id]);
+    let ring=envelopeKeys;
+    if(p.keyLink){
+        check(envelopeKeys.length===1,"当前代密钥记录不完整。");
+        ring=new Array(p.n+1);
+        let n=p.n;
+        ring[n]=envelopeKeys[0];
+        while(n>0 && s.policies[n].p.keyLink){
+            const policy=s.policies[n].p;
+            const previous=await decrypt(un64(ring[n]),[suite,p.anchor,n,policy.parent,"previous-key"],un64(policy.keyLink));
+            ring[--n]=b64(previous);
+        }
+        if(n>0){
+            // The authenticated bridge is stored once, even for a full beta.2 keyring.
+            const bridge=s.policies[n+1].p.legacyKeys;
+            check(typeof bridge==="string","缺少旧版历史密钥。");
+            const legacy=parseBytes(await decrypt(un64(ring[n+1]),[suite,p.anchor,n+1,s.policies[n].digest,"legacy-keys"],un64(bridge)));
+            check(legacy.length===n && legacy.every(k=>typeof k==="string"&&un64(k).length===32),"旧版密钥记录不完整。");
+            for(let i=0;i<n;i++)ring[i]=legacy[i];
+        }
+    }
     check(ring.length===s.policies.length,"密钥记录不完整。");
     const bodies=dav.child("objects"), revisions=[];
     let previousEpoch=-1;

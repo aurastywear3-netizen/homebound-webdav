@@ -53,7 +53,7 @@ def transact(db, bootstrap_hash, method, data, token):
             require(head,404,"Uninitialized")
             require(json.loads(head[2])["policy"]["anchor"]==data["anchor"],403,"Wrong vault")
             return {"nonce":data["nonce"],"policies":[r[0] for r in c.execute("SELECT row FROM policies ORDER BY n")],
-                    "revisions":[r[0] for r in c.execute("SELECT row FROM revisions ORDER BY seq")]}
+                    "revisions":[r[0] for r in c.execute("SELECT row FROM revisions ORDER BY seq")] if data.get("withRevisions",True) else []}
         require(method in ("policy","commit"),404,"Unknown operation")
         row=data["row"]
         require(isinstance(row,str) and len(raw(row))<=512*1024,413,"Record too large")
@@ -89,7 +89,11 @@ def transact(db, bootstrap_hash, method, data, token):
             require(by=="recovery" or new["recovery"]==policy["recovery"],400,"Root rotation requires recovery")
         p=obj["policy"]
         require(p["n"]==n+1 and p["parent"]==previous and ID.fullmatch(p["anchor"]),409,"Wrong successor")
-        require(p["n"]<256 and 0<len(p["members"])<=32 and p["admin"] in p["members"],400,"Invalid membership")
+        require(0<len(p["members"])<=32 and p["admin"] in p["members"],400,"Invalid membership")
+        if "keyLink" in p:
+            require(n>=0 and valid_b64(p["keyLink"],60),400,"Invalid epoch key link")
+        elif n>=0:
+            require("keyLink" not in policy and p["n"]<256,409,"Upgrade client for further authorization changes")
         require(all(HEX.fullmatch(v["cap"]) for v in [p["recovery"],*p["members"].values()]),400,"Invalid device verifier")
         if n==-1: require(p["by"]=="recovery",400,"Invalid genesis")
         c.execute("INSERT INTO policies VALUES(?,?,?)",(p["n"],digest,row))

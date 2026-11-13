@@ -2336,7 +2336,7 @@ var require_pqc = __commonJS({
     var { ml_dsa65: dsa } = (init_ml_dsa(), __toCommonJS(ml_dsa_exports));
     var core2 = require_core();
     var { jsonBytes, parseBytes, randomId, sha } = core2;
-    var suite = "homebound-pqc-preview-1";
+    var suite = "homebound-pqc-preview-2";
     var random = (n) => crypto.getRandomValues(new Uint8Array(n));
     var idPattern = /^[a-f0-9]{32}$/;
     function b64(bytes) {
@@ -2364,6 +2364,7 @@ var require_pqc = __commonJS({
       return (await sha(message("fingerprint", fields))).slice(0, 32);
     }
     async function identity(seed, label) {
+      check(typeof seed === "string" && un64(seed).length === 32 && b64(un64(seed)) === seed, "\u65E0\u6548\u7684 256 \u4F4D\u79CD\u5B50\u3002");
       const master = await crypto.subtle.importKey("raw", un64(seed), "HKDF", false, ["deriveBits"]);
       const derive = async (purpose, size) => new Uint8Array(await crypto.subtle.deriveBits({
         name: "HKDF",
@@ -2372,8 +2373,9 @@ var require_pqc = __commonJS({
         info: jsonBytes([label, purpose])
       }, master, size * 8));
       const enc = kem.keygen(await derive("kem", 64)), sig = dsa.keygen(await derive("signature", 32));
-      const pub = { kem: b64(enc.publicKey), sig: b64(sig.publicKey) };
-      return { pub, id: await fingerprint([pub.kem, pub.sig]), enc: enc.secretKey, sign: sig.secretKey };
+      const token = b64(await derive("ledger-capability", 32));
+      const pub = { kem: b64(enc.publicKey), sig: b64(sig.publicKey), cap: await sha(new TextEncoder().encode(token)) };
+      return { pub, token, id: await fingerprint([pub.kem, pub.sig, pub.cap]), enc: enc.secretKey, sign: sig.secretKey };
     }
     var freshSeed = () => b64(random(32));
     var aes = (raw) => crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]);
@@ -2388,216 +2390,165 @@ var require_pqc = __commonJS({
       const secret = kem.decapsulate(un64(wrapped[0]), pair.enc);
       return parseBytes(await crypto.subtle.decrypt({ name: "AES-GCM", iv: un64(wrapped[1]), additionalData: message("envelope", context) }, await aes(secret), un64(wrapped[2])));
     }
-    var epochName = (n) => "e-" + String(n).padStart(8, "0");
-    async function readPolicy(dav, n) {
-      return parseBytes(await dav.child(epochName(n)).read("policy.json"));
+    var digestOf = (text) => sha(new TextEncoder().encode(text));
+    var publicId = (pub) => fingerprint([pub.kem, pub.sig, pub.cap]);
+    var latest = (state2) => state2.policies.at(-1);
+    function publicDevice(device, name) {
+      check(typeof name === "string" && name.trim() && name.length <= 64, "\u8BF7\u8F93\u5165\u8BBE\u5907\u540D\u79F0\uFF081 \u81F3 64 \u5B57\uFF09\u3002");
+      return { ...device.pub, name: name.trim() };
     }
-    async function chain(dav, anchor, checkpoint) {
-      check(idPattern.test(anchor), "\u8BF7\u6838\u5BF9\u7BA1\u7406\u5458\u63D0\u4F9B\u7684 32 \u4F4D\u5E93\u6307\u7EB9\u3002");
+    async function state(ledger, anchor, pin) {
+      check(idPattern.test(anchor), "\u5E93\u6307\u7EB9\u65E0\u6548\u3002");
+      const nonce = randomId(), snapshot = await ledger("state", { anchor, nonce });
+      check(snapshot.nonce === nonce && snapshot.policies.length > 0, "\u53EF\u4FE1\u63D0\u4EA4\u670D\u52A1\u672A\u63D0\u4F9B\u5F53\u524D\u72B6\u6001\u3002");
       const policies = [];
-      for (let n = 0; ; n++) {
-        let row;
-        try {
-          row = await readPolicy(dav, n);
-        } catch (e) {
-          if (n > 0 && e.status === 404) break;
-          throw e;
-        }
-        const p = row.policy;
-        check(p.suite === suite && p.n === n && p.anchor === anchor && Number.isSafeInteger(n), "\u5E93\u8EAB\u4EFD\u6216\u4EE3\u6570\u65E0\u6548\u3002");
-        check(await fingerprint([p.recovery.kem, p.recovery.sig]) === anchor, "\u6062\u590D\u8EAB\u4EFD\u4E0D\u5339\u914D\u3002");
-        const prev = policies.at(-1);
-        check(p.parent === (prev?.digest || ""), "\u8BBE\u5907\u6388\u6743\u8BB0\u5F55\u5DF2\u5206\u53C9\u3002");
-        const signer = p.by === "recovery" ? p.recovery.sig : prev?.p.members[prev.p.admin]?.sig;
-        check(signer && (p.by === "recovery" || p.by === prev.p.admin), "\u65E0\u6743\u4FEE\u6539\u8BBE\u5907\u5217\u8868\u3002");
-        verify("policy", [p], row.sig, signer);
-        check(p.members[p.admin] && Array.isArray(p.frozen) && p.frozen.every((x) => idPattern.test(x)), "\u8BBE\u5907\u5217\u8868\u6216\u5C01\u5B58\u8BB0\u5F55\u65E0\u6548\u3002");
-        const digest = await sha(jsonBytes(row));
-        if (checkpoint?.n === n) check(checkpoint.digest === digest, "\u670D\u52A1\u5668\u56DE\u9000\u6216\u66FF\u6362\u4E86\u8BBE\u5907\u6388\u6743\u8BB0\u5F55\u3002");
+      for (const raw of snapshot.policies) {
+        const { policy: p, sig } = JSON.parse(raw), prev = policies.at(-1);
+        check(p.suite === suite && p.n === policies.length && p.anchor === anchor && p.parent === (prev?.digest || ""), "\u6388\u6743\u94FE\u4E0D\u5339\u914D\u3002");
+        if (!prev) check(await publicId(p.recovery) === anchor && p.by === "recovery", "\u521D\u59CB\u6062\u590D\u8EAB\u4EFD\u4E0D\u5339\u914D\u3002");
+        const prior = prev?.p || p;
+        check(p.by === "recovery" || p.by === prior.admin, "\u65E0\u7BA1\u7406\u6743\u9650\u3002");
+        verify("policy", [p], sig, p.by === "recovery" ? prior.recovery.sig : prior.members[prior.admin].sig);
+        check(p.members[p.admin] && (p.by === "recovery" || JSON.stringify(p.recovery) === JSON.stringify(prior.recovery)), "\u65E0\u6548\u6062\u590D\u6839\u3002");
+        const digest = await digestOf(raw);
+        if (pin?.n === p.n) check(pin.digest === digest, "\u6388\u6743\u8BB0\u5F55\u5DF2\u88AB\u66FF\u6362\u3002");
         policies.push({ p, digest });
       }
-      check(!checkpoint || checkpoint.n < policies.length, "\u670D\u52A1\u5668\u8FD4\u56DE\u4E86\u65E7\u6388\u6743\u8BB0\u5F55\u3002");
-      return policies;
+      check(!pin || pin.n < policies.length, "\u6388\u6743\u8BB0\u5F55\u56DE\u9000\u3002");
+      return { policies, rows: snapshot.revisions };
     }
-    async function publishPolicy(dav, p, signer, ring) {
-      const temp = "stage-" + randomId();
+    async function signPolicy(ledger, p, actor, keys, token = actor.token) {
       p.boxes = {};
-      for (const [id2, pub] of Object.entries(p.members))
-        p.boxes[id2] = await envelope(pub, ring, [p.anchor, p.n, id2]);
-      p.recoveryBox = await envelope(p.recovery, ring, [p.anchor, p.n, "recovery"]);
-      const row = { policy: p, sig: signed("policy", [p], signer.sign) };
-      await dav.mkdir(temp);
-      const stage = dav.child(temp);
-      await stage.mkdir("objects");
-      await stage.mkdir("commits");
-      await stage.put("policy.json", jsonBytes(row).buffer);
-      const name = epochName(p.n);
-      try {
-        await dav.call("MOVE", temp, [201], { headers: { Destination: dav.child(name).root, Overwrite: "F" } });
-      } catch (e) {
-        let found;
-        try {
-          found = await readPolicy(dav, p.n);
-        } catch {
-          throw e;
-        }
-        check(await sha(jsonBytes(found)) === await sha(jsonBytes(row)), "\u53E6\u4E00\u53F0\u8BBE\u5907\u5DF2\u66F4\u65B0\u6388\u6743\uFF0C\u8BF7\u5237\u65B0\u5E76\u91CD\u8BD5\u3002");
-      }
-      return row;
+      for (const [id2, m] of Object.entries(p.members)) p.boxes[id2] = await envelope(m, keys, [p.anchor, p.n, id2]);
+      p.recoveryBox = await envelope(p.recovery, keys, [p.anchor, p.n, "recovery"]);
+      const row = JSON.stringify({ policy: p, sig: signed("policy", [p], actor.sign) });
+      const result = await ledger("policy", { head: p.parent, row }, token);
+      check(result.digest === await digestOf(row), "\u63D0\u4EA4\u670D\u52A1\u8FD4\u56DE\u4E86\u4E0D\u540C\u7684\u6388\u6743\u6458\u8981\u3002");
     }
-    function publicDevice(device, name) {
-      check(typeof name === "string" && name.trim().length > 0 && name.length <= 64, "\u8BF7\u8F93\u5165\u8BBE\u5907\u540D\u79F0\uFF081 \u81F3 64 \u5B57\uFF09\u3002");
-      return { kem: device.pub.kem, sig: device.pub.sig, name: name.trim() };
+    async function genesis(ledger, device, name, recovery, bootstrap) {
+      const p = { suite, n: 0, parent: "", by: "recovery", anchor: recovery.id, recovery: recovery.pub, admin: device.id, members: { [device.id]: publicDevice(device, name) } };
+      await signPolicy(ledger, p, recovery, [freshSeed()], bootstrap);
     }
-    async function genesis(dav, device, name, recovery) {
-      const p = {
-        suite,
-        n: 0,
-        parent: "",
-        by: "recovery",
-        anchor: recovery.id,
-        recovery: recovery.pub,
-        admin: device.id,
-        members: { [device.id]: publicDevice(device, name) },
-        frozen: []
-      };
-      return publishPolicy(dav, p, recovery, [freshSeed()]);
-    }
-    async function nextPolicy(dav, policies, device, action, arg) {
-      const { p, digest } = policies.at(-1);
-      const restoring = action === "restore";
-      check(restoring ? device.id === p.anchor : device.id === p.admin, "\u8BE5\u64CD\u4F5C\u9700\u8981\u7BA1\u7406\u5458\u6216\u6B63\u786E\u7684\u6062\u590D\u7801\u3002");
-      const keys = await openRing(device, restoring ? p.recoveryBox : p.boxes[device.id], [p.anchor, p.n, restoring ? "recovery" : device.id]);
-      const members = { ...p.members };
-      let admin = p.admin;
-      if (action === "approve") {
-        check(!members[arg.id], "\u6B64\u8BBE\u5907\u5DF2\u914D\u5BF9\u3002");
-        members[arg.id] = arg.pub;
-      } else if (action === "revoke") {
-        check(arg !== admin && members[arg], "\u8BF7\u9009\u62E9\u4E00\u4E2A\u5DF2\u914D\u5BF9\u7684\u5176\u4ED6\u8BBE\u5907\u3002");
-        delete members[arg];
-      } else if (restoring) {
-        for (const id2 of Object.keys(members)) delete members[id2];
-        admin = arg.id;
-        members[admin] = arg.pub;
-      } else if (action !== "seal-history") throw Error("\u672A\u77E5\u64CD\u4F5C\u3002");
-      const epochs = await epochStores(dav, policies, device, keys);
-      const { all, locations } = await verifiedHistory(epochs, policies);
-      const frozen = [...locations.keys()].filter((id2) => locations.get(id2) === epochs.at(-1)).sort();
-      const next = {
-        suite,
-        n: p.n + 1,
-        parent: digest,
-        by: restoring ? "recovery" : device.id,
-        anchor: p.anchor,
-        recovery: p.recovery,
-        admin,
-        members,
-        frozen,
-        historyDigest: await historyDigest(all)
-      };
-      return publishPolicy(dav, next, device, [...keys, freshSeed()]);
-    }
-    async function requestPair(dav, anchor, device, name) {
-      const pub = publicDevice(device, name);
-      const fields = [anchor, pub.kem, pub.sig, pub.name];
-      const code = await fingerprint(fields);
-      const req = { pub, signature: signed("join", fields, device.sign) };
-      await dav.child("requests").put(code, jsonBytes(req).buffer);
+    var lifetime = 10 * 60 * 1e3;
+    async function requestPair(dav, s, device, name) {
+      const { p, digest } = latest(s), pub = publicDevice(device, name);
+      const request = { anchor: p.anchor, head: digest, nonce: randomId(), expires: Date.now() + lifetime, pub };
+      const code = await fingerprint([request]);
+      await dav.child("requests").put(code, jsonBytes({ request, sig: signed("join", [request], device.sign) }).buffer);
       return code;
     }
-    async function readRequest(dav, anchor, code) {
-      check(idPattern.test(code), "\u914D\u5BF9\u7801\u5E94\u4E3A 32 \u4F4D\uFF0C\u8BF7\u4ECE\u65B0\u8BBE\u5907\u5B8C\u6574\u590D\u5236\u3002");
-      const { pub, signature } = parseBytes(await dav.child("requests").read(code));
-      const fields = [anchor, pub.kem, pub.sig, pub.name];
-      check(await fingerprint(fields) === code, "\u914D\u5BF9\u7801\u4E0E\u65B0\u8BBE\u5907\u4E0D\u4E00\u81F4\u3002");
-      verify("join", fields, signature, pub.sig);
-      return { id: await fingerprint([pub.kem, pub.sig]), pub };
+    async function readRequest(dav, s, code) {
+      check(idPattern.test(code), "\u914D\u5BF9\u7801\u683C\u5F0F\u9519\u8BEF\u3002");
+      const { request, sig } = parseBytes(await dav.child("requests").read(code));
+      const { p, digest } = latest(s);
+      check(request.anchor === p.anchor && request.head === digest, "\u914D\u5BF9\u7533\u8BF7\u5DF2\u8FC7\u671F\u6216\u5DF2\u4F7F\u7528\u3002");
+      check(Number.isSafeInteger(request.expires) && request.expires >= Date.now() && request.expires <= Date.now() + lifetime + 6e4, "\u914D\u5BF9\u7533\u8BF7\u5DF2\u8FC7\u671F\u3002");
+      check(idPattern.test(request.nonce) && await fingerprint([request]) === code, "\u914D\u5BF9\u7801\u88AB\u66FF\u6362\u3002");
+      verify("join", [request], sig, request.pub.sig);
+      return { id: await publicId(request.pub), pub: request.pub, expires: request.expires, head: digest };
     }
-    var EpochStore = class extends core2.Store {
-      constructor(dav, p, device, key, frozen = null) {
-        const epoch = dav.child(epochName(p.n));
-        const transport = {
-          read: (path) => epoch.read(path),
-          put: (path, v) => epoch.put(path, v),
-          mkdir: (path) => epoch.mkdir(path),
-          list: (path) => frozen === null ? epoch.list(path) : Promise.resolve(frozen)
-        };
-        super(transport, p.anchor + "/" + p.n, key);
-        this.policy = p;
-        this.device = device;
-      }
-      async writeObject(name, bytes) {
-        if (name.startsWith("r-")) {
-          const fields = [this.id, name, this.device.id, b64(bytes)];
-          bytes = jsonBytes({ from: this.device.id, data: fields[3], sig: signed("revision", fields, this.device.sign) });
+    async function nextPolicy(ledger, s, actor, action, arg) {
+      const { p, digest } = latest(s), restoring = action === "restore";
+      const recoveryId = await publicId(p.recovery);
+      check(restoring ? actor.id === recoveryId : actor.id === p.admin, "\u6062\u590D\u8EAB\u4EFD\u6216\u7BA1\u7406\u5458\u4E0D\u5339\u914D\u3002");
+      const keys = await openRing(actor, restoring ? p.recoveryBox : p.boxes[actor.id], [p.anchor, p.n, restoring ? "recovery" : actor.id]);
+      let members = { ...p.members }, admin = p.admin, recovery = p.recovery;
+      if (restoring) {
+        check(arg.id !== p.admin && !members[arg.id] && await publicId(arg.recovery) !== recoveryId, "\u8BF7\u751F\u6210\u65B0\u7684\u8BBE\u5907\u8EAB\u4EFD\u548C\u6062\u590D\u7801\u3002");
+        members = { [arg.id]: arg.pub };
+        admin = arg.id;
+        recovery = arg.recovery;
+      } else if (action === "revoke") {
+        check(arg !== admin && members[arg], "\u65E0\u6CD5\u64A4\u9500\u8BE5\u8BBE\u5907\u3002");
+        delete members[arg];
+      } else if (action === "approve") {
+        check(!members[arg.id] && arg.expires >= Date.now() && arg.head === digest, "\u914D\u5BF9\u7533\u8BF7\u5931\u6548\u3002");
+        members[arg.id] = arg.pub;
+      } else check(action === "seal-history", "\u672A\u77E5\u64CD\u4F5C\u3002");
+      const next = { suite, n: p.n + 1, parent: digest, anchor: p.anchor, by: restoring ? "recovery" : actor.id, recovery, admin, members };
+      await signPolicy(ledger, next, actor, [...keys, freshSeed()]);
+    }
+    async function encrypt(rawKey, label, bytes) {
+      const iv = random(12), cipher = await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: jsonBytes(label) }, await aes(rawKey), bytes);
+      const packet = new Uint8Array(12 + cipher.byteLength);
+      packet.set(iv);
+      packet.set(new Uint8Array(cipher), 12);
+      return packet;
+    }
+    async function decrypt(rawKey, label, packet) {
+      const a = new Uint8Array(packet);
+      return crypto.subtle.decrypt({ name: "AES-GCM", iv: a.subarray(0, 12), additionalData: jsonBytes(label) }, await aes(rawKey), a.subarray(12));
+    }
+    function validateGraph(revisions) {
+      const seen = /* @__PURE__ */ new Map();
+      for (const r of revisions) {
+        check(idPattern.test(r.id) && !seen.has(r.id) && core2.safePath(r.path) && !core2.isRecovery(r.path), "\u65E0\u6548\u7684\u4FEE\u8BA2\u6216\u8DEF\u5F84\u3002");
+        if (!Array.isArray(r.parents) || new Set(r.parents).size !== r.parents.length || !r.parents.every((id2) => seen.get(id2)?.path === r.path)) {
+          throw Object.assign(Error("\u4FEE\u8BA2\u56FE\u7F3A\u5C11\u7236\u9879\u3001\u542B\u73AF\u6216\u8DEF\u5F84\u4E0D\u4E00\u81F4\uFF1A" + r.path + " [" + r.id + "]"), { path: r.path, id: r.id });
         }
-        return super.writeObject(name, bytes);
+        check(r.hash === null || /^[a-f0-9]{64}$/.test(r.hash), "\u65E0\u6548\u7684\u6B63\u6587\u6458\u8981\u3002");
+        seen.set(r.id, r);
       }
-      async readObject(name) {
-        const bytes = await super.readObject(name);
-        if (!name.startsWith("r-")) return bytes;
-        const row = parseBytes(bytes), author = this.policy.members[row.from];
-        check(author, "\u672A\u83B7\u6388\u6743\u7684\u8BBE\u5907\u7B7E\u540D\u3002");
-        verify("revision", [this.id, name, row.from, row.data], row.sig, author.sig);
-        return un64(row.data);
+      return seen;
+    }
+    async function storeFor(ledger, dav, s, device) {
+      const { p, digest } = latest(s);
+      const ring = await openRing(device, p.boxes[device.id], [p.anchor, p.n, device.id]);
+      check(ring.length === s.policies.length, "\u5BC6\u94A5\u8BB0\u5F55\u4E0D\u5B8C\u6574\u3002");
+      const bodies = dav.child("objects"), revisions = [];
+      let previousEpoch = -1;
+      for (const raw of s.rows) {
+        const { record: r, sig } = JSON.parse(raw), policy = s.policies[r.epoch];
+        check(policy && r.anchor === p.anchor && r.head === policy.digest && r.epoch >= previousEpoch && policy.p.members[r.from], "\u975E\u6CD5\u5199\u5165\u4EE3\u9645\u6216\u4F5C\u8005\u3002");
+        verify("revision", [r], sig, policy.p.members[r.from].sig);
+        const rev = parseBytes(await decrypt(un64(ring[r.epoch]), [suite, p.anchor, r.epoch, r.id, "manifest"], un64(r.payload)));
+        check(rev.id === r.id && (rev.hash === null ? rev.key === null : typeof rev.key === "string" && un64(rev.key).length === 32), "\u4FEE\u8BA2\u8BB0\u5F55\u5F02\u5E38\u3002");
+        revisions.push(rev);
+        previousEpoch = r.epoch;
       }
-    };
-    async function historyDigest(revisions) {
-      const ids = [...revisions.keys()].sort();
-      return sha(message("frozen-history", ids.map((id2) => {
-        const rev = revisions.get(id2);
-        return [id2, rev.path, rev.parents, rev.hash];
-      })));
-    }
-    function epochStores(dav, policies, device, keys) {
-      return Promise.all(policies.map(async ({ p }, i) => new EpochStore(dav, p, device, await aes(un64(keys[i])), policies[i + 1]?.p.frozen ?? null)));
-    }
-    async function verifiedHistory(epochs, policies) {
-      const all = /* @__PURE__ */ new Map(), locations = /* @__PURE__ */ new Map();
-      for (const [i, epoch] of epochs.entries()) {
-        const expected = policies[i].p.historyDigest;
-        if (expected) check(await historyDigest(all) === expected, "\u5386\u53F2\u4FEE\u8BA2\u5185\u5BB9\u4E0E\u7BA1\u7406\u5458\u7B7E\u540D\u7684\u5C01\u5B58\u8BB0\u5F55\u4E0D\u7B26\u3002");
-        for (const [id2, rev] of await epoch.history(/* @__PURE__ */ new Map())) {
-          check(!all.has(id2), "\u91CD\u590D\u4FEE\u8BA2\u7F16\u53F7\u3002");
-          all.set(id2, rev);
-          locations.set(id2, epoch);
-        }
-      }
-      return { all, locations };
-    }
-    async function storeFor(dav, policies, device) {
-      const { p } = policies.at(-1);
-      const keys = await openRing(device, p.boxes[device.id], [p.anchor, p.n, device.id]);
-      check(keys.length === policies.length, "\u5386\u53F2\u5BC6\u94A5\u4E0D\u5B8C\u6574\u3002");
-      const epochs = await epochStores(dav, policies, device, keys);
-      let locations = /* @__PURE__ */ new Map();
+      const history = validateGraph(revisions);
       return {
         async history() {
-          const verified = await verifiedHistory(epochs, policies);
-          locations = verified.locations;
-          return verified.all;
+          return new Map(history);
         },
-        readBody: (rev) => locations.get(rev.id).readBody(rev),
-        async publish(...args) {
-          await assertLatest(dav, p.n);
-          const rev = await epochs.at(-1).publish(...args);
-          await assertLatest(dav, p.n);
-          locations.set(rev.id, epochs.at(-1));
+        async readBody(rev) {
+          const body = await decrypt(un64(rev.key), [suite, p.anchor, rev.id, "body"], await bodies.read(rev.id));
+          check(await sha(body) === rev.hash, "\u6B63\u6587\u6821\u9A8C\u5931\u8D25\u3002");
+          return body;
+        },
+        async publish(path, parents, bytes) {
+          const id2 = randomId(), contentKey = bytes === null ? null : random(32);
+          const rev = { id: id2, path, parents, hash: bytes === null ? null : await sha(bytes), key: contentKey ? b64(contentKey) : null };
+          validateGraph([...history.values(), rev]);
+          if (contentKey) await bodies.put(id2, (await encrypt(contentKey, [suite, p.anchor, id2, "body"], bytes)).buffer);
+          const r = {
+            anchor: p.anchor,
+            head: digest,
+            epoch: p.n,
+            id: id2,
+            from: device.id,
+            payload: b64(await encrypt(un64(ring[p.n]), [suite, p.anchor, p.n, id2, "manifest"], jsonBytes(rev)))
+          };
+          const row = JSON.stringify({ record: r, sig: signed("revision", [r], device.sign) });
+          const receipt = await ledger("commit", { head: digest, row }, device.token);
+          check(receipt.digest === await digestOf(row), "\u5199\u5165\u56DE\u6267\u65E0\u6548\u3002");
+          history.set(id2, rev);
           return rev;
         }
       };
     }
-    async function assertLatest(dav, n) {
-      try {
-        await readPolicy(dav, n + 1);
-      } catch (e) {
-        if (e.status === 404) return;
-        throw e;
+    async function auditData(store) {
+      const history = await store.history(), faults = [];
+      for (const rev of history.values()) if (rev.hash !== null) {
+        try {
+          await store.readBody(rev);
+        } catch {
+          faults.push({ id: rev.id, path: rev.path });
+        }
       }
-      throw Error("\u6388\u6743\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u540C\u6B65\u3002");
+      return { checked: history.size, faults };
     }
-    module2.exports = { freshSeed, identity, genesis, chain, nextPolicy, storeFor, requestPair, readRequest, publicDevice, assertLatest, fingerprint };
+    module2.exports = { identity, freshSeed, publicDevice, publicId, genesis, state, latest, requestPair, readRequest, nextPolicy, storeFor, auditData, validateGraph };
   }
 });
 
@@ -2605,7 +2556,7 @@ var require_pqc = __commonJS({
 var require_adapter = __commonJS({
   "src/adapter.cjs"(exports2, module2) {
     "use strict";
-    var { Plugin: Plugin2, PluginSettingTab: PluginSettingTab2, Setting: Setting2, Modal: Modal2, Notice: Notice2, TFile, TFolder, requestUrl, getLanguage } = require("obsidian");
+    var { Plugin: Plugin2, PluginSettingTab: PluginSettingTab2, Setting: Setting2, Modal: Modal2, Notice: Notice2, TFile, TFolder, requestUrl: requestUrl2, getLanguage } = require("obsidian");
     var core2 = require_core();
     var tr = (en, zh) => getLanguage().startsWith("zh") ? zh : en;
     var paused = () => new Error(tr("File changed during sync. Run sync again.", "\u6587\u4EF6\u5728\u540C\u6B65\u671F\u95F4\u53D1\u751F\u53D8\u5316\uFF0C\u8BF7\u518D\u540C\u6B65\u4E00\u6B21\u3002"));
@@ -2623,7 +2574,7 @@ var require_adapter = __commonJS({
         if (this.authorization) headers.Authorization = this.authorization;
         let response;
         try {
-          response = await requestUrl({ url, method, ...extras, headers, throw: false });
+          response = await requestUrl2({ url, method, ...extras, headers, throw: false });
         } catch {
           throw Object.assign(Error(tr("Server unreachable. Check the route and TLS certificate.", "\u65E0\u6CD5\u8FDE\u63A5\u670D\u52A1\u5668\uFF0C\u8BF7\u68C0\u67E5\u7F51\u7EDC\u548C TLS \u8BC1\u4E66\u3002")), { offline: true });
         }
@@ -2763,12 +2714,12 @@ var require_adapter = __commonJS({
 });
 
 // src/plugin.cjs
-var { Plugin, PluginSettingTab, Setting, Modal, Notice } = require("obsidian");
+var { Plugin, PluginSettingTab, Setting, Modal, Notice, requestUrl } = require("obsidian");
 var core = require_core();
 var pq = require_pqc();
 var { Dav, VaultFiles, credentials } = require_adapter();
-var folder = "Homebound-PQC-Lab";
-var namespace = "pqc-preview-1";
+var folder = "Homebound-PQC-Beta2";
+var namespace = "pqc-preview-2";
 var notice = (e) => new Notice(e.message || String(e), 1e4);
 var Output = class extends Modal {
   constructor(app, title, value) {
@@ -2799,7 +2750,7 @@ var Settings = class extends PluginSettingTab {
     const p = this.p, el = this.containerEl;
     el.empty();
     const c = { ...p.config };
-    let password = "", code = "", request = "", recovery = "";
+    let password = "", code = "", request = "", recovery = "", bootstrap = "";
     const field = (label, value, change, secret = false) => new Setting(el).setName(label).addText((t) => {
       t.setValue(value).onChange(change);
       if (secret) t.inputEl.type = "password";
@@ -2810,18 +2761,21 @@ var Settings = class extends PluginSettingTab {
         this.display();
         if (result?.title) new Output(this.app, result.title, result.value).open();
       } catch (e) {
+        this.display();
         notice(e);
       }
     }));
     el.createEl("p", { text: "\u72EC\u7ACB\u6D4B\u8BD5\u5E93\uFF1A" + folder });
     field("\u5C40\u57DF\u7F51 WebDAV \u5730\u5740", c.home, (v) => c.home = v);
     field("\u5916\u7F51 WebDAV \u5730\u5740", c.away, (v) => c.away = v);
+    field("\u53EF\u4FE1\u63D0\u4EA4\u670D\u52A1 HTTPS \u5730\u5740", c.witness, (v) => c.witness = v);
     field("WebDAV \u7528\u6237\u540D", c.username, (v) => c.username = v);
     field("WebDAV \u5BC6\u7801\uFF08\u7559\u7A7A\u6CBF\u7528\uFF09", "", (v) => password = v, true);
     field("\u8FD9\u53F0\u8BBE\u5907\u7684\u540D\u79F0", c.name, (v) => c.name = v);
     button("\u4FDD\u5B58\u8FDE\u63A5\u8BBE\u7F6E", () => p.configure(c, password));
     if (p.config.anchor) el.createEl("p", { text: "\u5E93\u6307\u7EB9\uFF1A" + p.config.anchor });
     if (!p.config.anchor) {
+      field("\u5EFA\u5E93\u6388\u6743\uFF08\u670D\u52A1\u90E8\u7F72\u8005\u63D0\u4F9B\uFF09", "", (v) => bootstrap = v, true);
       button("\u5728\u5C40\u57DF\u7F51\u521B\u5EFA\u6D4B\u8BD5\u5E93", async () => {
         const seed = pq.freshSeed();
         const out = new Output(this.app, "\u5148\u79BB\u7EBF\u4FDD\u5B58\u6062\u590D\u7801\uFF0C\u7136\u540E\u786E\u8BA4\u521B\u5EFA", seed);
@@ -2830,7 +2784,7 @@ var Settings = class extends PluginSettingTab {
           previous();
           new Setting(out.contentEl).addButton((b) => b.setButtonText("\u6211\u5DF2\u4FDD\u5B58\uFF0C\u521B\u5EFA").onClick(async () => {
             try {
-              await p.exclusive(() => p.create(seed));
+              await p.exclusive(() => p.create(seed, bootstrap));
               out.close();
               this.display();
             } catch (e) {
@@ -2843,13 +2797,20 @@ var Settings = class extends PluginSettingTab {
       field("\u4ECE\u7BA1\u7406\u5458 Mac \u6838\u5BF9\u7684\u5E93\u6307\u7EB9", "", (v) => code = v);
       button("\u7533\u8BF7\u914D\u5BF9", async () => ({ title: "\u8BF7\u5728\u7BA1\u7406\u5458 Mac \u8F93\u5165\u6B64\u914D\u5BF9\u7801", value: await p.request(code.trim()) }));
     }
-    if (p.config.request) el.createEl("p", { text: "\u672C\u8BBE\u5907\u914D\u5BF9\u7801\uFF1A" + p.config.request });
+    if (p.config.request) {
+      el.createEl("p", { text: "\u672C\u8BBE\u5907\u914D\u5BF9\u7801\uFF0810 \u5206\u949F\u6709\u6548\uFF09\uFF1A" + p.config.request });
+    }
+    if (p.config.anchor && !p.config.admin) {
+      button("\u91CD\u65B0\u7533\u8BF7\u914D\u5BF9", async () => ({ title: "\u65B0\u914D\u5BF9\u7801", value: await p.request(p.config.anchor) }));
+    }
+    if (p.config.integrity) el.createEl("p", { text: p.config.integrity });
     if (p.config.anchor) {
       button("\u7ACB\u5373\u540C\u6B65 / \u68C0\u67E5\u914D\u5BF9", async () => {
         const r = await p.sync();
         new Notice(r.route + " \xB7 \u4E0A\u4F20 " + r.sent + " \xB7 \u4E0B\u8F7D " + r.received);
       });
       if (p.config.admin) {
+        button("\u91CD\u65B0\u6821\u9A8C\u6062\u590D\u6570\u636E", () => p.verifyRecovery());
         field("\u65B0\u8BBE\u5907\u663E\u793A\u7684\u914D\u5BF9\u7801", "", (v) => request = v);
         button("\u6279\u51C6\u5DF2\u6838\u5BF9\u7684\u914D\u5BF9\u7801", () => p.approve(request.trim()));
         for (const member of p.config.others || []) button("\u64A4\u9500\u8BBE\u5907 \xB7 " + member.name + " \xB7 " + member.id.slice(-8), async () => {
@@ -2870,24 +2831,31 @@ var Settings = class extends PluginSettingTab {
     }
     field("\u79BB\u7EBF\u6062\u590D\u7801", "", (v) => recovery = v, true);
     button("\u7528\u6062\u590D\u7801\u63A5\u7BA1\uFF0C\u64A4\u9500\u539F\u8BBE\u5907", async () => {
-      const modal = new Modal(this.app);
-      modal.setTitle("\u63A5\u7BA1\u6D4B\u8BD5\u5E93\u5E76\u64A4\u9500\u6240\u6709\u539F\u8BBE\u5907\uFF1F");
-      new Setting(modal.contentEl).addButton((b) => b.setButtonText("\u786E\u8BA4\u6062\u590D").onClick(async () => {
-        try {
-          await p.exclusive(() => p.restore(recovery.trim()));
-          modal.close();
-          this.display();
-        } catch (e) {
-          notice(e);
-        }
-      }));
+      const saved = p.pendingRecovery(), replacement = saved || pq.freshSeed();
+      const kit = await p.replacementKit(recovery.trim(), replacement);
+      const modal = new Output(this.app, "\u5148\u79BB\u7EBF\u4FDD\u5B58\u65B0\u6062\u590D\u7801\u3002\u786E\u8BA4\u540E\u65E7\u7801\u3001\u539F\u8BBE\u5907\u5747\u4F1A\u5931\u6548\u3002", kit);
+      const open = modal.onOpen.bind(modal);
+      modal.onOpen = () => {
+        open();
+        new Setting(modal.contentEl).addButton((b) => b.setButtonText("\u786E\u8BA4\u6062\u590D").onClick(async () => {
+          try {
+            await p.exclusive(() => p.restore(recovery.trim(), replacement));
+            modal.close();
+            this.display();
+          } catch (e) {
+            notice(e);
+          }
+        }));
+      };
       modal.open();
     });
   }
 };
 module.exports = class Preview extends Plugin {
   async onload() {
-    this.config = { home: "", away: "", username: "", name: "\u6211\u7684\u8BBE\u5907", ...await this.loadData() };
+    const saved = await this.loadData();
+    if (saved?.anchor && saved.format !== 2) throw Error("\u8BF7\u5728\u72EC\u7ACB beta.2 \u672C\u5730\u5E93\u542F\u7528\uFF0C\u65E7\u6D4B\u8BD5\u5E93\u4F7F\u7528\u539F\u7248\u672C\u3002");
+    this.config = { format: 2, home: "", away: "", witness: "", username: "", name: "\u6211\u7684\u8BBE\u5907", ...saved };
     if (!this.config.local) {
       this.config.local = core.randomId();
       await this.saveData(this.config);
@@ -2916,7 +2884,9 @@ module.exports = class Preview extends Plugin {
   }
   async configure(c, password) {
     const home = core.endpoint(c.home), away = c.away ? core.endpoint(c.away) : "";
-    Object.assign(this.config, { home, away, name: c.name.trim(), username: c.username.trim() });
+    const witness = core.endpoint(c.witness);
+    if (!witness.startsWith("https://") || this.config.anchor && this.config.witness !== witness) throw Error("\u53EF\u4FE1\u63D0\u4EA4\u670D\u52A1\u9700\u4F7F\u7528\u5EFA\u5E93\u65F6\u6838\u5BF9\u7684 HTTPS \u5730\u5740\u3002");
+    Object.assign(this.config, { home, away, witness, name: c.name.trim(), username: c.username.trim() });
     if (password) this.secret("dav", password);
     await this.saveData(this.config);
   }
@@ -2940,7 +2910,7 @@ module.exports = class Preview extends Plugin {
       const dav = this.base(url).child(folder).child(namespace);
       let timer;
       try {
-        await Promise.race([dav.child("e-00000000").read("policy.json"), new Promise((_, reject) => {
+        await Promise.race([dav.read("vault.json"), new Promise((_, reject) => {
           timer = setTimeout(() => reject(Object.assign(Error("\u8FDE\u63A5\u8D85\u65F6"), { offline: true })), i === 0 && c.away ? 3e3 : 16e3);
         })]);
         return { dav, route: i ? "VPS/VPN" : "LAN" };
@@ -2951,73 +2921,155 @@ module.exports = class Preview extends Plugin {
       }
     }
   }
-  async create(seed) {
+  async create(seed, bootstrap) {
     const rec = await pq.identity(seed, "recovery"), dev = await this.device(), home = this.base(this.config.home), dir = home.child(folder);
     try {
       await home.mkdir(folder);
     } catch (e) {
       if (e.status !== 405) throw e;
     }
-    const stage = "stage-" + core.randomId();
-    if ((await dir.list()).some((x) => !/^stage-[a-f0-9]{32}$/.test(x))) throw Error("\u4E13\u7528\u76EE\u5F55\u5DF2\u88AB\u4F7F\u7528\u3002\u8BF7\u9009\u62E9\u914D\u5BF9\u6216\u6062\u590D\u3002");
-    await dir.mkdir(stage);
-    const tmp = dir.child(stage);
-    await tmp.mkdir("requests");
-    await pq.genesis(tmp, dev, this.config.name, rec);
-    await dir.call("MOVE", stage, [201], { headers: { Destination: dir.child(namespace).root, Overwrite: "F" } });
+    const known = await dir.list();
+    if (known.some((x) => x !== namespace)) throw Error("\u65B0\u6D4B\u8BD5\u76EE\u5F55\u5305\u542B\u5176\u4ED6\u6587\u4EF6\u3002");
+    const dav = dir.child(namespace);
+    if (!known.length) await dir.mkdir(namespace);
+    for (const name of ["objects", "requests"]) try {
+      await dav.mkdir(name);
+    } catch (e) {
+      if (e.status !== 405) throw e;
+    }
+    let live;
+    try {
+      live = await pq.state(this.ledger.bind(this), rec.id);
+    } catch (e) {
+      if (e.status !== 404) throw e;
+    }
+    if (live) {
+      if (live.policies.length !== 1 || pq.latest(live).p.admin !== dev.id) throw Error("\u670D\u52A1\u5DF2\u7ED1\u5B9A\u5230\u53E6\u4E00\u7BA1\u7406\u5458\u3002");
+    } else await pq.genesis(this.ledger.bind(this), dev, this.config.name, rec, bootstrap);
+    await dav.put("vault.json", core.jsonBytes({ format: 2, anchor: rec.id }).buffer);
     this.config.anchor = rec.id;
     await this.refresh();
     return rec.id;
   }
-  async context(anchor = this.config.anchor) {
-    const r = await this.route();
-    const policies = await pq.chain(r.dav, anchor, this.config.pin);
-    return { ...r, policies, device: await this.device() };
+  async ledger(method, data, token) {
+    const nonce = core.randomId(), headers = { "Cache-Control": "no-store" };
+    if (token) headers.Authorization = "Bearer " + token;
+    const response = await requestUrl({
+      url: this.config.witness + "/" + method,
+      method: "POST",
+      headers,
+      contentType: "application/json",
+      body: JSON.stringify({ ...data, transportNonce: nonce }),
+      throw: false
+    });
+    if (response.status !== 200) {
+      const msg = { 403: "\u672A\u83B7\u6388\u6743\u3001\u5DF2\u64A4\u9500\u6216\u6062\u590D\u7801\u5931\u6548", 404: "\u8BF7\u6C42\u4E0D\u5B58\u5728", 409: "\u6388\u6743\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u540C\u6B65\u6216\u914D\u5BF9" }[response.status] || "\u53EF\u4FE1\u63D0\u4EA4\u670D\u52A1\u4E0D\u53EF\u7528";
+      throw Object.assign(Error(msg + " (" + response.status + ")"), { status: response.status });
+    }
+    return response.json;
   }
-  async refresh() {
-    const { policies, device } = await this.context(), { p, digest } = policies.at(-1);
+  async snapshot(anchor = this.config.anchor) {
+    return pq.state(this.ledger.bind(this), anchor, this.config.pin);
+  }
+  async context(anchor = this.config.anchor) {
+    const [s, r] = await Promise.all([this.snapshot(anchor), this.route()]);
+    const marker = core.parseBytes(await r.dav.read("vault.json"));
+    if (marker.format !== 2 || marker.anchor !== anchor) throw Error("WebDAV \u6307\u5411\u53E6\u4E00\u6D4B\u8BD5\u5E93\u3002");
+    return { ...r, s, device: await this.device() };
+  }
+  async refresh(snapshot) {
+    const s = snapshot || await this.snapshot(), dev = await this.device(), { p, digest } = pq.latest(s);
     this.config.pin = { n: p.n, digest };
-    this.config.admin = p.admin === device.id;
-    this.config.others = Object.entries(p.members).filter(([id2]) => id2 !== device.id).map(([id2, m]) => ({ id: id2, name: m.name }));
-    if (p.members[device.id]) delete this.config.request;
+    this.config.admin = p.admin === dev.id;
+    this.config.others = Object.entries(p.members).filter(([id2]) => id2 !== dev.id).map(([id2, m]) => ({ id: id2, name: m.name }));
+    if (p.members[dev.id]) delete this.config.request;
     await this.saveData(this.config);
   }
   async request(anchor) {
-    if (this.config.anchor && this.config.anchor !== anchor) throw Error("\u5E93\u6307\u7EB9\u4E0D\u4E00\u81F4\u3002");
-    const { dav, device } = await this.context(anchor);
-    const code = await pq.requestPair(dav, anchor, device, this.config.name);
+    if (this.config.anchor && this.config.anchor !== anchor) throw Error("\u5E93\u6307\u7EB9\u4E0D\u5339\u914D\u3002");
+    const { dav, s, device } = await this.context(anchor);
+    if (pq.latest(s).p.members[device.id]) throw Error("\u8FD9\u53F0\u8BBE\u5907\u5DF2\u83B7\u6388\u6743\uFF0C\u53EF\u4EE5\u76F4\u63A5\u540C\u6B65\u3002");
+    const code = await pq.requestPair(dav, s, device, this.config.name);
     Object.assign(this.config, { anchor, request: code });
     await this.refresh();
     return code;
   }
   async approve(code) {
-    const { dav, device, policies } = await this.context();
-    const target = await pq.readRequest(dav, this.config.anchor, code);
-    await pq.nextPolicy(dav, policies, device, "approve", target);
+    const { dav, s, device } = await this.context();
+    const target = await pq.readRequest(dav, s, code);
+    await pq.nextPolicy(this.ledger.bind(this), s, device, "approve", target);
     await this.refresh();
     return target.id;
   }
   async sealHistory() {
-    const { dav, device, policies } = await this.context();
-    await pq.nextPolicy(dav, policies, device, "seal-history");
-    await this.refresh();
+    await this.change("seal-history");
   }
   async revoke(id2) {
-    const { dav, device, policies } = await this.context();
-    await pq.nextPolicy(dav, policies, device, "revoke", id2);
+    await this.change("revoke", id2);
+  }
+  async change(action, arg) {
+    await pq.nextPolicy(this.ledger.bind(this), await this.snapshot(), await this.device(), action, arg);
     await this.refresh();
   }
-  async restore(seed) {
-    const rec = await pq.identity(seed, "recovery");
-    if (this.config.anchor && rec.id !== this.config.anchor) throw Error("\u6062\u590D\u7801\u4E0E\u672C\u5E93\u4E0D\u7B26\u3002");
-    const { dav, device, policies } = await this.context(rec.id);
-    await pq.nextPolicy(dav, policies, rec, "restore", { id: device.id, pub: pq.publicDevice(device, this.config.name) });
-    this.config.anchor = rec.id;
+  pendingRecovery() {
+    return this.secret("pending-root") || "";
+  }
+  async recoveryKit(input) {
+    const fields = input.split(".");
+    if (fields.length > 2) throw Error("\u65E0\u6548\u7684\u6062\u590D\u5305\u3002");
+    const rec = await pq.identity(fields.at(-1), "recovery");
+    const anchor = fields.length === 1 ? rec.id : fields[0];
+    if (!/^[a-f0-9]{32}$/.test(anchor) || this.config.anchor && this.config.anchor !== anchor) throw Error("\u6062\u590D\u8EAB\u4EFD\u4E0E\u672C\u5E93\u4E0D\u7B26\u3002");
+    return { anchor, rec };
+  }
+  async replacementKit(input, seed) {
+    const { anchor } = await this.recoveryKit(input);
+    return anchor + "." + seed;
+  }
+  async restore(input, replacement) {
+    const { rec, anchor } = await this.recoveryKit(input), s = await this.snapshot(anchor);
+    if (!replacement || replacement === input.split(".").at(-1)) throw Error("\u8BF7\u79BB\u7EBF\u4FDD\u5B58\u65B0\u7684\u968F\u673A\u6062\u590D\u7801\u3002");
+    const newRoot = await pq.identity(replacement, "recovery");
+    const existing = this.pendingRecovery(), pending = this.secret("pending-device");
+    const resume = existing === replacement && pending && await pq.publicId(pq.latest(s).p.recovery) === newRoot.id;
+    if (!resume && await pq.publicId(pq.latest(s).p.recovery) !== rec.id) throw Error("\u6062\u590D\u8EAB\u4EFD\u5DF2\u5931\u6548\u3002");
+    const seed = existing === replacement && pending || pq.freshSeed();
+    const dev = await pq.identity(seed, "device");
+    this.secret("pending-device", seed);
+    this.secret("pending-root", replacement);
+    if (!resume) {
+      await pq.nextPolicy(this.ledger.bind(this), s, rec, "restore", { id: dev.id, pub: pq.publicDevice(dev, this.config.name), recovery: newRoot.pub });
+    } else if (pq.latest(s).p.admin !== dev.id) throw Error("\u6062\u590D\u4E8B\u52A1\u4E0E\u5F53\u524D\u7BA1\u7406\u5458\u4E0D\u7B26\u3002");
+    this.secret("device", seed);
+    this.keys = dev;
+    this.config.anchor = anchor;
+    this.config.integrity = "\u7BA1\u7406\u5458\u5DF2\u63A5\u7BA1\uFF0C\u5C1A\u672A\u5B8C\u6210\u6570\u636E\u6821\u9A8C\u3002";
     await this.refresh();
+    this.secret("pending-root", "");
+    this.secret("pending-device", "");
+    return this.verifyRecovery();
+  }
+  async verifyRecovery() {
+    let report;
+    try {
+      const { s, dav, device } = await this.context();
+      const store = await pq.storeFor(this.ledger.bind(this), dav, s, device);
+      report = await pq.auditData(store);
+      this.config.integrity = report.faults.length ? "\u5DF2\u63A5\u7BA1\uFF0C\u6570\u636E\u4E0D\u5B8C\u6574\uFF1A" + report.faults.map((f) => f.path + " [" + f.id + "]").join("\uFF0C") : "\u5DF2\u6821\u9A8C " + report.checked + " \u6761\u5386\u53F2\u4FEE\u8BA2\u53CA\u5BF9\u5E94\u6B63\u6587\u3002";
+    } catch (e) {
+      this.config.integrity = "\u5DF2\u63A5\u7BA1\uFF0C\u6570\u636E\u6821\u9A8C\u5931\u8D25\uFF1A" + e.message;
+      report = { faults: [{ path: e.path, id: e.id, error: e.message }] };
+    }
+    await this.saveData(this.config);
+    return report;
   }
   async sync() {
-    const { dav, device, policies, route } = await this.context(), last = policies.at(-1);
-    const store = await pq.storeFor(dav, policies, device);
+    const { dav, device, s, route } = await this.context(), last = pq.latest(s);
+    if (!last.p.members[device.id]) {
+      await this.refresh(s);
+      throw Error("\u6B64\u8BBE\u5907\u672A\u83B7\u6388\u6743\uFF0C\u6216\u5DF2\u88AB\u64A4\u9500\u3002\u8BF7\u5728\u8BBE\u7F6E\u4E2D\u91CD\u65B0\u7533\u8BF7\u914D\u5BF9\u3002");
+    }
+    const store = await pq.storeFor(this.ledger.bind(this), dav, s, device);
     this.config.pin = { n: last.p.n, digest: last.digest };
     delete this.config.request;
     await this.saveData(this.config);
@@ -3030,7 +3082,6 @@ module.exports = class Preview extends Plugin {
       checkpoint: (m) => this.app.saveLocalStorage(id2, [...m]),
       active: () => !this.closed
     });
-    await pq.assertLatest(dav, last.p.n);
     return { route, sent: r.sent, received: r.received, conflicts: r.conflicts };
   }
   onunload() {

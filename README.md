@@ -1,54 +1,21 @@
-# Homebound WebDAV
+# Homebound WebDAV PQC Preview
 
-Sync notes and attachments to a private WebDAV server from home Wi-Fi or away. Use a direct HTTPS address at home and an optional second address for the same server through your own gateway. Notes, filenames and attachments are encrypted on each device. The plugin works with an ordinary WebDAV server supporting GET, PUT, MKCOL and depth-one PROPFIND. Initial setup also uses MOVE with overwrite disabled.
+独立的 Obsidian 测试插件，版本 0.2.0-beta.1。库目录固定为 `Homebound-PQC-Lab/pqc-preview-1`。新建一个独立的本地 Obsidian 库，将 `main.js`、`manifest.json` 和 `styles.css` 放到 `.obsidian/plugins/homebound-webdav-pqc-preview/`，然后启用插件。
 
-## Set up
+## 使用
 
-1. Install and enable the plugin in Obsidian 1.11.4 or later. For a manual install, put `main.js`, `manifest.json` and `styles.css` together in the vault's configuration folder under `plugins/homebound-webdav/`.
-2. In settings, enter the **LAN WebDAV address**, an optional **Away WebDAV address**, a folder such as `Notes/个人 笔记`, and the WebDAV account credentials. Enter folder names literally, including spaces, Chinese characters and percent signs. The input occupies its own full-width row. Review the resulting destination in the confirmation dialog.
-3. On the first device, choose an empty folder, enter a strong vault passphrase, then select **Create new vault** and confirm. Keep the passphrase in your password manager. Other devices select **Connect existing vault** with the same directory, account and passphrase. A device can join an existing vault from away.
-4. Run **Sync now** from settings or the command palette. The result shows the chosen route and counts. Enable **Sync while open** to check on opening or returning to the app, on reconnection, and every five minutes while visible. Mobile operating systems may suspend the app in the background.
-5. For remote access, use an existing private network or set up the [outbound SSH tunnel and HTTPS gateway](relay/README.md). The gateway forwards to the original WebDAV server, so both routes share one history. Initializing a vault requires the home route.
+1. 在插件设置中填写局域网和外网 WebDAV 地址、账号、密码和本机名称，点“保存连接设置”。首次建库使用局域网。
+2. 创建时先离线保存随机恢复码。它可以接管库、读取历史并撤销设备。在自己的 Mac 和新设备之间通过可信渠道传递、核对库指纹。
+3. 新设备输入库指纹，申请配对。管理员在局域网输入新设备屏幕显示的完整配对码。批准后，新设备点“立即同步”。外网使用自己管理的 HTTPS 网关。
+4. 管理员可撤销其他设备。丢失所有原设备时，在干净的本地库输入恢复码接管，再同步历史并重新配对其他设备。管理员变更通过局域网完成；公网入口允许申请、读取授权和同步。
+5. 测试版手动同步。如遇笔记冲突，可在本地的 Homebound conflicts 中查看各版本。
 
-Existing Remotely Save vaults use another format, including rclone crypt. To switch, fully sync the original plugin, back up the decrypted local vault, then disable the original sync. Create a new empty remote directory and upload from that local copy. Keep the old remote directory for recovery.
+## 加密与边界
 
-## Conflict handling and recovery
+每台设备在本机生成独立的 ML-KEM-768 和 ML-DSA-65 密钥。Obsidian Secret storage 保存设备种子与 WebDAV 密码。经已批准的公钥封装随机 AES-256-GCM 库密钥。文件名、正文和附件均在客户端加密；修订签名绑定库指纹、密钥代数、修订编号、作者和内容摘要。设备名及公钥、配对请求、文件大小和访问时间对服务器可见。网关可见 WebDAV 账号凭据。
 
-Changes are recorded as immutable encrypted revisions. If two devices independently edit or delete the same file, sync continues on other paths. The plugin keeps the local file and saves copies of competing contents under `Homebound conflicts/<revision>/<original path>`. Compare them, edit the original, then run **Resolve conflict using the active file**. If one device deleted the original, use a device that still has the file, or copy the version you want back to its original path and sync. Run the command on that path. A later deliberate deletion can be synced after resolution.
+每次成员变更都生成新库密钥。旧代仅接受管理员在签名授权记录中封存的修订。撤销无法清除已经下载的文件；持有 WebDAV 写凭据者仍能破坏存储可用性。客户端记录最后验证的授权记录来检测回退。恶意服务器隔离设备或向全新设备隐藏更晚的授权记录，需要通过独立可信渠道核对最新状态。成员变更期间进行中的同步可能需要重试。恢复码对全部历史拥有权限，应另存于安全位置。协议及其组合尚未经过独立安全审计。测试库格式与 0.1.1 分开，适用于测试数据。
 
-Deletions are explicit revisions. The plugin passes synced local deletions to Obsidian's configured trash handler. A new device with an empty vault downloads the current files. Empty folders, hidden files, the configuration folder and the reserved conflict folder are excluded. File names must be portable across supported devices. Each changed attachment fits in device memory. Server history grows with changes and the initial scan reads one small metadata record per revision. Keep an independent backup of the whole remote folder. An interrupted setup can be retried in the same folder. Unpublished staging directories have names beginning with `homebound-init-` and contain setup data only.
+## 构建与验证
 
-## Privacy and network use
-
-Only the WebDAV endpoints you configure receive requests. Use HTTPS with a trusted certificate. HTTP is accepted only on loopback for local testing. The plugin uses Obsidian Secret storage for WebDAV passwords and vault passphrases. The folder you enter, endpoint addresses and WebDAV username are saved in plugin settings. Device checkpoints include local paths and content hashes. There is no vendor account, telemetry or hosted service. The optional SSH gateway is self-hosted.
-
-A per-vault random salt and PBKDF2-HMAC-SHA-256 (600,000 iterations) derive an AES-256-GCM key. Each encrypted object gets a random 96-bit nonce and authenticates its vault and object identifier. File names, relative paths, contents and hashes are encrypted. The server sees the folder you enter, random object identifiers, sizes, timing and history length. A gateway terminating HTTPS sees WebDAV credentials. Keep a dedicated account scoped to the sync folder. A lost vault passphrase cannot be reset. The first release uses an independent format and has not undergone an external security audit.
-
-## 中文快速开始
-
-局域网填写 WebDAV 的 HTTPS 地址，外网填写能转发至同一台服务器的 HTTPS 地址。远端目录支持中文、空格、百分号和多级路径，直接粘贴即可。首次在主设备选择“创建新库”，核对目录后确认。其他设备输入相同的目录与加密口令，选择“连接已有库”。通过命令面板或设置里的“立即同步”开始同步。
-
-建议先用测试库走通一次“家中上传 → 蜂窝网络修改 → 家中读回”。如果在用 Remotely Save，请从已解密的本地副本向新目录迁移。异地访问的公网域名、VPS 配置和家庭端常驻连接见[外网接入说明](relay/README.md)。
-
-## Verification for 0.1.0
-
-Two isolated Obsidian 1.15.0 desktop vaults exchanged a Markdown note and a binary attachment through an authenticated Apache WebDAV server. The second vault reached that server through a loopback gateway and a real reverse SSH tunnel while its direct endpoint was unavailable. The test exercised Chinese folder names with spaces, a literal percent sign, narrow settings windows, plugin reload, concurrent edits, conflict resolution, deletion and rejection of a different vault identity. A separate round trip through the supplied Caddy configuration verified TLS on both sides of the SSH forward with temporary test certificates. The U30, a physical iPad and a public cellular network still require field testing with this release.
-
-## Build and release
-
-Use Node.js 22 or later. No package installation is required.
-
-```sh
-node --test tests/sync.test.cjs
-node build.mjs
-```
-
-The GitHub Actions release workflow tests the code, rebuilds the plugin, and signs build provenance for `main.js`, `manifest.json`, and `styles.css`. It verifies all three against the release commit before publishing the files under the version in the manifest.
-
-To verify a downloaded file with GitHub CLI, run the following command in the download directory. Replace `main.js` with `manifest.json` or `styles.css` to check the other files.
-
-```sh
-gh attestation verify main.js --repo aurastywear3-netizen/homebound-webdav
-```
-
-For an initial community submission, publish this project in a public repository with its root manifest, README and license. Sign in to the Obsidian Community directory, link the repository owner's GitHub account, and submit the repository. [Official submission guide](https://docs.obsidian.md/Plugins/Releasing/Submit%20your%20plugin)
+使用 Node 22.19 以上版本或更新的 LTS，执行 `npm ci`、`npm test`、`npm run build`。依赖版本通过锁文件固定；安装包包含密码库及其许可文本。测试版仅本地分发。

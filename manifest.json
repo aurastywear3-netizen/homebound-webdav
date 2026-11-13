@@ -1,9 +1,9 @@
 {
-  "id": "homebound-webdav",
-  "name": "Homebound WebDAV",
-  "version": "0.1.1",
+  "id": "homebound-webdav-pqc-preview",
+  "name": "Homebound WebDAV PQC Preview",
+  "version": "0.2.0-beta.1",
   "minAppVersion": "1.11.4",
-  "description": "Sync encrypted notes and attachments to one WebDAV vault at home or through your own remote access gateway.",
+  "description": "Pair devices and sync a separate experimental post-quantum encrypted WebDAV vault.",
   "author": "aurastywear3-netizen",
   "isDesktopOnly": false,
   "authorUrl": "https://github.com/aurastywear3-netizen"

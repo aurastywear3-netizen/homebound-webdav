@@ -1,4 +1,4 @@
-# Homebound WebDAV · 0.2.0-rc.1
+# Homebound WebDAV · 0.2.0
 
 这是使用正式插件 ID `homebound-webdav` 的双模式候选包。独立测试通过后仍需另行决定正式发布。手动测试时，用 `main.js`、`manifest.json`、`styles.css` 覆盖测试库原插件目录中同名文件，保留 `data.json`，然后重新加载插件。回退 0.1.1 时也只替换这三个文件。
 

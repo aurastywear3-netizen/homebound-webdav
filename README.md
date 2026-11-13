@@ -1,25 +1,41 @@
-# Homebound WebDAV PQC Preview · beta.3
+# Homebound WebDAV · 0.2.0-rc.1
 
-在独立 Obsidian 库安装本预览插件。远端目录沿用 `Homebound-PQC-Beta2/pqc-preview-2`。beta.3 可以读取 beta.2 数据。先更新独立提交服务和所有测试设备，再进行首次授权变更。首次变更写入新格式后，beta.2 设备需要升级才能继续同步。beta.1 使用原版本及其原目录。
+这是使用正式插件 ID `homebound-webdav` 的双模式候选包。独立测试通过后仍需另行决定正式发布。手动测试时，用 `main.js`、`manifest.json`、`styles.css` 覆盖测试库原插件目录中同名文件，保留 `data.json`，然后重新加载插件。回退 0.1.1 时也只替换这三个文件。
 
-## 使用
+## 升级与模式选择
 
-1. 填写局域网、外网 WebDAV 地址、WebDAV 凭据、设备名称及自管提交服务的 HTTPS 地址，保存。本地和公网两条路径必须指向同一目录。首次建库需要服务部署者持有的一次性建库授权。先将恢复码保存到库外安全位置，再确认创建。
-2. 从可信渠道核对库指纹，在新设备申请配对，让管理员输入新设备显示的完整码。每次申请使用随机挑战，十分钟有效，绑定当前授权记录。一次批准或其他授权变更会使之前的码失效。管理员批准加入时也授权该设备读取本库历史。
-3. 在设置中点“立即同步”。管理员可以撤销设备。正在上传时遇到授权变化会显式报错；保留本地笔记并再次同步，未被撤销的设备会按新权限重试。
-4. 接管时输入原恢复码／恢复包，**先离线保存界面提供的新恢复包**。恢复时会更换本机设备身份、管理员身份和恢复密钥，旧设备须重新申请配对。只有新恢复包能进行下一次接管。应用中断后可在原本机重试，保留新恢复包。管理员权限接管与数据验证分开显示；正文损坏或缺失会列出路径和修订号，修复存储或从独立备份找回后可重新核验。未通过数据验证时请勿把这份库看作完整恢复副本。
-5. 本地加密种子和 WebDAV 密码使用 Obsidian Secret storage。已下载文件、先前解密的历史和设备本地副本无法远程清除。丢设备还应在服务器吊销对应 WebDAV 凭据。
+现有用户升级后默认沿用 0.1.1 口令模式、WebDAV 地址、账号、加密口令、同步记录和自动同步设置。没有手动选择过 PQC 的设备不会创建 PQC 身份或访问 PQC 服务。每个本地库独立保存模式选择。回退到 0.1.1 会恢复原口令库的行为，包括原先启用的自动同步。
 
-## 为什么需要提交服务
+要使用 PQC，请在插件设置的“同步模式”选择“后量子加密（PQC）”。选中时只初始化此设备的本地配置。填写独立 WebDAV 库和自管 HTTPS 提交服务后，由用户发起建库或配对。创建人先离线保存恢复码，再确认创建。其他设备核对库指纹并发起配对，管理员确认配对码后，设备才能取得库密钥。两种模式都会同步当前本地库里的文件。切换模式或回退后再次同步，可能将本地新增内容发送到所选模式对应的远端。要分开保存两套笔记，请使用不同本地库。
 
-每条修订的正文与附件使用一次性随机 AES-256-GCM 文件密钥，在本机加密后写入 WebDAV。文件密钥、路径、父修订和内容摘要加密成修订清单，并绑定 ML-DSA-65 设备签名。清单只发送给可信 HTTPS 提交服务；该服务用 SQLite 写事务给修改与授权变更排序。旧授权的提交会被拒绝且不会进入读接口。已确认的修订保存在同一份日志，换钥不会遗漏它。废弃上传可能在 WebDAV 留下无对应清单的密文。失败的请求体不能被代理或服务记录或向 WebDAV 用户暴露。
+PQC 使用独立的 `Homebound-PQC/pqc-preview-2` 目录及每库独立的提交服务。WebDAV 保存加密正文，提交服务为授权变化和提交排序。局域网同步也需要可信的 HTTPS 提交服务在线。服务实现见 `witness/server.py`，须部署在回环地址并由 HTTPS 代理提供访问。每个库使用自己的数据库；备份需包含一致的数据库快照、对应 WebDAV 密文以及单独保管的当前恢复包。丢失设备后应撤销设备并另行吊销该设备的 WebDAV 凭据。切换回口令模式会保留本机的 PQC 配对。beta 预览版的插件 ID 和远端目录与此候选版不同。
 
-管理员为每个仍有权限的设备及恢复根通过 ML-KEM-768 封装一把新的当代密钥。每次授权变更用新密钥加密上一代密钥，并将结果写入签名记录。当前设备能逐代读取历史；旧设备持有的旧密钥无法用来取得新密钥。从 beta.2 转换的首条记录额外封装一次旧历史，后续换钥记录的大小与历史代数无关。原始库指纹锚定有签名的授权继承链。客户端逐项验签，验证父修订已存在、路径一致且无环。紧急撤销和接管只请求授权记录。读取回滚的 WebDAV 副本时仍须向固定的提交服务取得当前状态。
+本机可使用 Node 22.19+ 和 Python 3 执行 `npm ci`、`npm run build`、`npm test`。查看 [候选版真机验收](RC1-ACCEPTANCE.md) 了解本次结果。
 
-**信任与备份。** 提交服务需要保密调用者令牌和被拒请求，并诚实维护最新状态。恶意的提交服务仍可能向干净设备提供旧数据库。库所有者管理 HTTPS 代理及提交服务。备份须包含同一时间点的 WebDAV 密文、SQLite 一致性快照，并另存当时有效的离线恢复包。即使在局域网同步也需要连接提交服务。每库最多同时授权 32 台设备，每条授权记录最多 512 KiB。历史已移除原 256 条上限；整链验签、存储空间和服务可用性仍会影响长历史库。未经过独立第三方密码协议审计。
+## Passphrase mode (0.1.1) setup
 
-## 构建与测试
+1. Install and enable the plugin in Obsidian 1.11.4 or later. For a manual install, put `main.js`, `manifest.json` and `styles.css` together in the vault's configuration folder under `plugins/homebound-webdav/`.
+2. In settings, enter the **LAN WebDAV address**, an optional **Away WebDAV address**, a folder such as `Notes/个人 笔记`, and the WebDAV account credentials. Enter folder names literally, including spaces, Chinese characters and percent signs. The input occupies its own full-width row. Review the resulting destination in the confirmation dialog.
+3. On the first device, choose an empty folder, enter a strong vault passphrase, then select **Create new vault** and confirm. Keep the passphrase in your password manager. Other devices select **Connect existing vault** with the same directory, account and passphrase. A device can join an existing vault from away.
+4. Run **Sync now** from settings or the command palette. The result shows the chosen route and counts. Enable **Sync while open** to check on opening or returning to the app, on reconnection, and every five minutes while visible. Mobile operating systems may suspend the app in the background.
+5. For remote access, use an existing private network or set up the [outbound SSH tunnel and HTTPS gateway](relay/README.md). The gateway forwards to the original WebDAV server, so both routes share one history. Initializing a vault requires the home route.
 
-使用 Node 22.19+（或更新 LTS）和 Python 3.9+，执行 `npm ci`、`npm test`、`npm run build`。测试在本机随机回环端口启动真实 Python/SQLite 提交服务，验证协议与并发边界。Obsidian 安装包包括 `manifest.json`、`main.js`、`styles.css`。服务端实现位于 `witness/server.py`，独立运行在回环端口，前置管理方自己的 HTTPS 代理；每个库使用独立数据库。仅在测试分支分发。
+Existing Remotely Save vaults use another format, including rclone crypt. To switch, fully sync the original plugin, back up the decrypted local vault, then disable the original sync. Create a new empty remote directory and upload from that local copy. Keep the old remote directory for recovery.
 
-容量边界、灾备和版本回退的实测结果见 [beta.3 复审记录](BETA3-REVIEW.md)。
+## Conflict handling and recovery
+
+Changes are recorded as immutable encrypted revisions. If two devices independently edit or delete the same file, sync continues on other paths. The plugin keeps the local file and saves copies of competing contents under `Homebound conflicts/<revision>/<original path>`. Compare them, edit the original, then run **Resolve conflict using the active file**. If one device deleted the original, use a device that still has the file, or copy the version you want back to its original path and sync. Run the command on that path. A later deliberate deletion can be synced after resolution.
+
+Deletions are explicit revisions. The plugin passes synced local deletions to Obsidian's configured trash handler. A new device with an empty vault downloads the current files. Empty folders, hidden files, the configuration folder and the reserved conflict folder are excluded. File names must be portable across supported devices. Each changed attachment fits in device memory. Server history grows with changes and the initial scan reads one small metadata record per revision. Keep an independent backup of the whole remote folder. An interrupted setup can be retried in the same folder. Unpublished staging directories have names beginning with `homebound-init-` and contain setup data only.
+
+## Passphrase mode privacy and network use
+
+Only the WebDAV endpoints you configure receive requests. Use HTTPS with a trusted certificate. HTTP is accepted only on loopback for local testing. The plugin uses Obsidian Secret storage for WebDAV passwords and vault passphrases. The folder you enter, endpoint addresses and WebDAV username are saved in plugin settings. Device checkpoints include local paths and content hashes. There is no vendor account, telemetry or hosted service. The optional SSH gateway is self-hosted.
+
+A per-vault random salt and PBKDF2-HMAC-SHA-256 (600,000 iterations) derive an AES-256-GCM key. Each encrypted object gets a random 96-bit nonce and authenticates its vault and object identifier. File names, relative paths, contents and hashes are encrypted. The server sees the folder you enter, random object identifiers, sizes, timing and history length. A gateway terminating HTTPS sees WebDAV credentials. Keep a dedicated account scoped to the sync folder. A lost vault passphrase cannot be reset. The first release uses an independent format and has not undergone an external security audit.
+
+## 口令模式快速开始
+
+局域网填写 WebDAV 的 HTTPS 地址，外网填写能转发至同一台服务器的 HTTPS 地址。远端目录支持中文、空格、百分号和多级路径，直接粘贴即可。首次在主设备选择“创建新库”，核对目录后确认。其他设备输入相同的目录与加密口令，选择“连接已有库”。通过命令面板或设置里的“立即同步”开始同步。
+
+建议先用测试库走通一次“家中上传 → 蜂窝网络修改 → 家中读回”。如果在用 Remotely Save，请从已解密的本地副本向新目录迁移。异地访问的公网域名、VPS 配置和家庭端常驻连接见[外网接入说明](relay/README.md)。

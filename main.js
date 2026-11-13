@@ -339,9 +339,9 @@ var require_core = __commonJS({
       }
       return { history, sent, received, conflicts };
     }
-    async function createVault(home, folder2, passphrase, namespace2) {
+    async function createVault(home, folder, passphrase, namespace2) {
       let current = home;
-      for (const part of folder2.split("/")) {
+      for (const part of folder.split("/")) {
         try {
           await current.mkdir(part);
         } catch (e) {
@@ -389,6 +389,167 @@ var require_core = __commonJS({
       jsonBytes,
       parseBytes
     };
+  }
+});
+
+// src/adapter.cjs
+var require_adapter = __commonJS({
+  "src/adapter.cjs"(exports2, module2) {
+    "use strict";
+    var { Plugin: Plugin2, PluginSettingTab: PluginSettingTab2, Setting: Setting2, Modal: Modal2, Notice: Notice2, TFile: TFile2, TFolder: TFolder2, requestUrl: requestUrl2, getLanguage: getLanguage2 } = require("obsidian");
+    var core2 = require_core();
+    var tr2 = (en, zh) => getLanguage2().startsWith("zh") ? zh : en;
+    var paused = () => new Error(tr2("File changed during sync. Run sync again.", "\u6587\u4EF6\u5728\u540C\u6B65\u671F\u95F4\u53D1\u751F\u53D8\u5316\uFF0C\u8BF7\u518D\u540C\u6B65\u4E00\u6B21\u3002"));
+    var Dav2 = class _Dav {
+      constructor(root, authorization) {
+        this.root = root;
+        this.authorization = authorization;
+      }
+      child(path) {
+        return new _Dav(this.root + "/" + core2.encodePath(path), this.authorization);
+      }
+      async call(method, path, accepted, extras = {}) {
+        const url = path ? this.root + "/" + core2.encodePath(path) : this.root;
+        const headers = { ...extras.headers };
+        if (this.authorization) headers.Authorization = this.authorization;
+        let response;
+        try {
+          response = await requestUrl2({ url, method, ...extras, headers, throw: false });
+        } catch {
+          throw Object.assign(Error(tr2("Server unreachable. Check the route and TLS certificate.", "\u65E0\u6CD5\u8FDE\u63A5\u670D\u52A1\u5668\uFF0C\u8BF7\u68C0\u67E5\u7F51\u7EDC\u548C TLS \u8BC1\u4E66\u3002")), { offline: true });
+        }
+        if (!accepted.includes(response.status)) {
+          throw Object.assign(Error(method + " returned HTTP " + response.status), {
+            status: response.status,
+            offline: [502, 503, 504].includes(response.status)
+          });
+        }
+        return response;
+      }
+      async read(path) {
+        return (await this.call("GET", path, [200])).arrayBuffer;
+      }
+      async put(path, body) {
+        await this.call("PUT", path, [200, 201, 204], { body, contentType: "application/octet-stream" });
+      }
+      async mkdir(path) {
+        await this.call("MKCOL", path, [201]);
+      }
+      async list(path = "") {
+        const result = await this.call("PROPFIND", path, [207], {
+          headers: { Depth: "1" },
+          contentType: "application/xml; charset=utf-8",
+          body: '<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>'
+        });
+        const xml = new DOMParser().parseFromString(result.text, "application/xml");
+        const docs = (el, tag) => Array.from(el.getElementsByTagNameNS("DAV:", tag));
+        if (xml.documentElement.localName !== "multistatus" || xml.documentElement.namespaceURI !== "DAV:") {
+          throw Error("Invalid WebDAV directory response.");
+        }
+        const url = new URL(path ? this.child(path).root : this.root);
+        const segments = (pathname) => pathname.replace(/\/+$/, "").split("/").map((x) => decodeURIComponent(x).normalize("NFC"));
+        const base = segments(url.pathname);
+        let self = false;
+        const names = [];
+        for (const entry of docs(xml, "response")) {
+          const href = docs(entry, "href")[0]?.textContent;
+          const successful = docs(entry, "status").some((s) => /^HTTP\/\S+ 2\d\d\b/i.test(s.textContent.trim()));
+          if (!href || !successful) throw Error("Incomplete WebDAV directory response.");
+          const item = segments(new URL(href, url.href.replace(/\/+$/, "") + "/").pathname);
+          if (!base.every((part, i) => part === item[i])) throw Error("WebDAV returned an unexpected directory.");
+          if (item.length === base.length) {
+            self = true;
+            continue;
+          }
+          if (item.length !== base.length + 1) throw Error("WebDAV returned an unexpected child path.");
+          names.push(item[item.length - 1]);
+        }
+        if (!self) throw Error("WebDAV did not confirm the requested directory.");
+        return names;
+      }
+    };
+    function credentials2(username, password) {
+      if (!username && !password) return "";
+      if (!username || username.includes(":")) throw Error("Enter a valid WebDAV username.");
+      const bytes = new TextEncoder().encode(username + ":" + password);
+      return "Basic " + btoa(Array.from(bytes, (b) => String.fromCharCode(b)).join(""));
+    }
+    var VaultFiles2 = class {
+      constructor(app) {
+        this.app = app;
+        this.vault = app.vault;
+      }
+      allowed(path) {
+        const first = path.split("/")[0].toLowerCase();
+        return !core2.isRecovery(path) && first !== this.vault.configDir.toLowerCase() && !path.split("/").some((part) => part.startsWith("."));
+      }
+      paths() {
+        return new Set(this.vault.getFiles().map((f) => f.path).filter((path) => this.allowed(path)));
+      }
+      file(path) {
+        const item = this.vault.getAbstractFileByPath(path);
+        if (item && (item.path !== path || !(item instanceof TFile2))) throw Error("File or folder collision: " + path);
+        return item;
+      }
+      async read(path) {
+        const file = this.file(path);
+        return file ? this.vault.readBinary(file) : null;
+      }
+      async folders(path) {
+        const parts = path.split("/").slice(0, -1);
+        let name = "";
+        for (const part of parts) {
+          name += (name ? "/" : "") + part;
+          let folder = this.vault.getAbstractFileByPath(name);
+          if (!folder) {
+            try {
+              folder = await this.vault.createFolder(name);
+            } catch (error) {
+              folder = this.vault.getAbstractFileByPath(name);
+              if (!folder) throw error;
+            }
+          }
+          if (!(folder instanceof TFolder2) || folder.path !== name) throw Error("Folder collision: " + name);
+        }
+      }
+      async apply(path, expected, bytes) {
+        const old = await this.read(path);
+        if ((old === null ? null : await core2.sha(old)) !== expected) throw paused();
+        const file = this.file(path);
+        if (old === null) {
+          if (bytes !== null) {
+            await this.folders(path);
+            await this.vault.createBinary(path, bytes);
+          }
+          return;
+        }
+        if (!file) throw paused();
+        if (bytes === null) {
+          await this.app.fileManager.trashFile(file);
+          return;
+        }
+        if (file.extension.toLowerCase() === "md") {
+          const decode = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+          const before = decode.decode(old), after = decode.decode(bytes);
+          await this.vault.process(file, (current) => {
+            if (current !== before) throw paused();
+            return after;
+          });
+        } else {
+          await this.vault.modifyBinary(file, bytes);
+        }
+      }
+      async archive(rev, body) {
+        const path = core2.conflictFolder + "/" + rev.id + "/" + rev.path;
+        const current = await this.read(path);
+        if (current !== null) {
+          if (await core2.sha(current) !== rev.hash) throw Error("Move your edited conflict copy before syncing: " + path);
+          return;
+        }
+        await this.apply(path, null, await body());
+      }
+    };
+    module2.exports = { Dav: Dav2, VaultFiles: VaultFiles2, credentials: credentials2 };
   }
 });
 
@@ -1965,11 +2126,11 @@ function getDilithium(opts_) {
         t1.push(r1);
       }
       const publicKey = publicCoder.encode([rho, t1]);
-      const tr = shake256(publicKey, { dkLen: TR_BYTES });
-      const secretKey = secretCoder.encode([rho, K_, tr, s1, s2, t0]);
+      const tr2 = shake256(publicKey, { dkLen: TR_BYTES });
+      const secretKey = secretCoder.encode([rho, K_, tr2, s1, s2, t0]);
       xof.clean();
       xofPrime.clean();
-      cleanBytes(rho, rhoPrime, K_, s1, s2, s1Hat, t, t0, t1, tr, seedDst);
+      cleanBytes(rho, rhoPrime, K_, s1, s2, s1Hat, t, t0, t1, tr2, seedDst);
       return {
         publicKey,
         secretKey
@@ -2015,7 +2176,7 @@ function getDilithium(opts_) {
           throw error;
         }
       })();
-      const [rho, _K, tr, s1, s2, t0] = decoded;
+      const [rho, _K, tr2, s1, s2, t0] = decoded;
       const A = [];
       const xof = XOF1282(rho);
       for (let i = 0; i < K; i++) {
@@ -2034,7 +2195,7 @@ function getDilithium(opts_) {
       const mu = externalMu ? msg : (
         // 6: µ ← H(tr||M, 512)
         //    ▷ Compute message representative µ
-        shake256.create({ dkLen: CRH_BYTES }).update(tr).update(msg).digest()
+        shake256.create({ dkLen: CRH_BYTES }).update(tr2).update(msg).digest()
       );
       const rhoprime = shake256.create({ dkLen: CRH_BYTES }).update(_K).update(rnd).update(mu).digest();
       if (ownRnd)
@@ -2103,7 +2264,7 @@ function getDilithium(opts_) {
       if (externalMu)
         abytesDoc(msg, CRH_BYTES, "mu");
       const [rho, t1] = publicCoder.decode(publicKey);
-      const tr = shake256(publicKey, { dkLen: TR_BYTES });
+      const tr2 = shake256(publicKey, { dkLen: TR_BYTES });
       if (sig.length !== sigCoder.bytesLen)
         return false;
       const [cTilde, z, h] = sigCoder.decode(sig);
@@ -2114,7 +2275,7 @@ function getDilithium(opts_) {
           return false;
       const mu = externalMu ? msg : (
         // 7: µ ← H(tr||M, 512)
-        shake256.create({ dkLen: CRH_BYTES }).update(tr).update(msg).digest()
+        shake256.create({ dkLen: CRH_BYTES }).update(tr2).update(msg).digest()
       );
       const c = crystals2.NTT.encode(SampleInBall(cTilde));
       const zNtt = z.map((i) => i.slice());
@@ -2583,543 +2744,635 @@ var require_pqc = __commonJS({
   }
 });
 
-// src/adapter.cjs
-var require_adapter = __commonJS({
-  "src/adapter.cjs"(exports2, module2) {
+// src/pqc-mode.cjs
+var require_pqc_mode = __commonJS({
+  "src/pqc-mode.cjs"(exports2, module2) {
     "use strict";
-    var { Plugin: Plugin2, PluginSettingTab: PluginSettingTab2, Setting: Setting2, Modal: Modal2, Notice: Notice2, TFile, TFolder, requestUrl: requestUrl2, getLanguage } = require("obsidian");
+    var { Setting: Setting2, Modal: Modal2, Notice: Notice2, requestUrl: requestUrl2 } = require("obsidian");
     var core2 = require_core();
-    var tr = (en, zh) => getLanguage().startsWith("zh") ? zh : en;
-    var paused = () => new Error(tr("File changed during sync. Run sync again.", "\u6587\u4EF6\u5728\u540C\u6B65\u671F\u95F4\u53D1\u751F\u53D8\u5316\uFF0C\u8BF7\u518D\u540C\u6B65\u4E00\u6B21\u3002"));
-    var Dav2 = class _Dav {
-      constructor(root, authorization) {
-        this.root = root;
-        this.authorization = authorization;
+    var pq = require_pqc();
+    var { Dav: Dav2, VaultFiles: VaultFiles2, credentials: credentials2 } = require_adapter();
+    var folder = "Homebound-PQC";
+    var namespace2 = "pqc-preview-2";
+    var notice = (e) => new Notice2(e.message || String(e), 1e4);
+    var Output = class extends Modal2 {
+      constructor(app, title, value) {
+        super(app);
+        this.title = title;
+        this.value = value;
       }
-      child(path) {
-        return new _Dav(this.root + "/" + core2.encodePath(path), this.authorization);
+      onOpen() {
+        this.setTitle(this.title);
+        const t = this.contentEl.createEl("textarea");
+        t.readOnly = true;
+        t.value = this.value;
+        t.rows = 4;
+        t.style.width = "100%";
+        new Setting2(this.contentEl).addButton((b) => b.setButtonText("\u590D\u5236").onClick(() => navigator.clipboard.writeText(this.value).catch(notice)));
       }
-      async call(method, path, accepted, extras = {}) {
-        const url = path ? this.root + "/" + core2.encodePath(path) : this.root;
-        const headers = { ...extras.headers };
-        if (this.authorization) headers.Authorization = this.authorization;
-        let response;
+      onClose() {
+        this.value = "";
+        this.contentEl.empty();
+      }
+    };
+    function displaySettings(el, p, app, redraw) {
+      const c = { ...p.config };
+      let password = "", code = "", request = "", recovery = "", bootstrap = "";
+      const field = (label, value, change, secret = false) => new Setting2(el).setName(label).addText((t) => {
+        t.setValue(value).onChange(change);
+        if (secret) t.inputEl.type = "password";
+      });
+      const button = (label, fn) => new Setting2(el).addButton((b) => b.setButtonText(label).onClick(async () => {
         try {
-          response = await requestUrl2({ url, method, ...extras, headers, throw: false });
-        } catch {
-          throw Object.assign(Error(tr("Server unreachable. Check the route and TLS certificate.", "\u65E0\u6CD5\u8FDE\u63A5\u670D\u52A1\u5668\uFF0C\u8BF7\u68C0\u67E5\u7F51\u7EDC\u548C TLS \u8BC1\u4E66\u3002")), { offline: true });
+          const result = await p.exclusive(fn);
+          redraw();
+          if (result?.title) new Output(app, result.title, result.value).open();
+        } catch (e) {
+          redraw();
+          notice(e);
         }
-        if (!accepted.includes(response.status)) {
-          throw Object.assign(Error(method + " returned HTTP " + response.status), {
-            status: response.status,
-            offline: [502, 503, 504].includes(response.status)
-          });
-        }
-        return response;
-      }
-      async read(path) {
-        return (await this.call("GET", path, [200])).arrayBuffer;
-      }
-      async put(path, body) {
-        await this.call("PUT", path, [200, 201, 204], { body, contentType: "application/octet-stream" });
-      }
-      async mkdir(path) {
-        await this.call("MKCOL", path, [201]);
-      }
-      async list(path = "") {
-        const result = await this.call("PROPFIND", path, [207], {
-          headers: { Depth: "1" },
-          contentType: "application/xml; charset=utf-8",
-          body: '<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>'
+      }));
+      el.createEl("p", { text: "PQC \u8FDC\u7AEF\u76EE\u5F55\uFF1A" + folder });
+      field("\u5C40\u57DF\u7F51 WebDAV \u5730\u5740", c.home, (v) => c.home = v);
+      field("\u5916\u7F51 WebDAV \u5730\u5740", c.away, (v) => c.away = v);
+      field("\u53EF\u4FE1\u63D0\u4EA4\u670D\u52A1 HTTPS \u5730\u5740", c.witness, (v) => c.witness = v);
+      field("WebDAV \u7528\u6237\u540D", c.username, (v) => c.username = v);
+      field("WebDAV \u5BC6\u7801\uFF08\u7559\u7A7A\u6CBF\u7528\uFF09", "", (v) => password = v, true);
+      field("\u8FD9\u53F0\u8BBE\u5907\u7684\u540D\u79F0", c.name, (v) => c.name = v);
+      button("\u4FDD\u5B58\u8FDE\u63A5\u8BBE\u7F6E", () => p.configure(c, password));
+      if (p.config.anchor) el.createEl("p", { text: "\u5E93\u6307\u7EB9\uFF1A" + p.config.anchor });
+      if (!p.config.anchor) {
+        field("\u5EFA\u5E93\u6388\u6743\uFF08\u670D\u52A1\u90E8\u7F72\u8005\u63D0\u4F9B\uFF09", "", (v) => bootstrap = v, true);
+        button("\u5728\u5C40\u57DF\u7F51\u521B\u5EFA PQC \u5E93", async () => {
+          const seed = pq.freshSeed();
+          const out = new Output(app, "\u5148\u79BB\u7EBF\u4FDD\u5B58\u6062\u590D\u7801\uFF0C\u7136\u540E\u786E\u8BA4\u521B\u5EFA", seed);
+          const previous = out.onOpen.bind(out);
+          out.onOpen = () => {
+            previous();
+            new Setting2(out.contentEl).addButton((b) => b.setButtonText("\u6211\u5DF2\u4FDD\u5B58\uFF0C\u521B\u5EFA").onClick(async () => {
+              try {
+                await p.exclusive(() => p.create(seed, bootstrap));
+                out.close();
+                redraw();
+              } catch (e) {
+                notice(e);
+              }
+            }));
+          };
+          out.open();
         });
-        const xml = new DOMParser().parseFromString(result.text, "application/xml");
-        const docs = (el, tag) => Array.from(el.getElementsByTagNameNS("DAV:", tag));
-        if (xml.documentElement.localName !== "multistatus" || xml.documentElement.namespaceURI !== "DAV:") {
-          throw Error("Invalid WebDAV directory response.");
-        }
-        const url = new URL(path ? this.child(path).root : this.root);
-        const segments = (pathname) => pathname.replace(/\/+$/, "").split("/").map((x) => decodeURIComponent(x).normalize("NFC"));
-        const base = segments(url.pathname);
-        let self = false;
-        const names = [];
-        for (const entry of docs(xml, "response")) {
-          const href = docs(entry, "href")[0]?.textContent;
-          const successful = docs(entry, "status").some((s) => /^HTTP\/\S+ 2\d\d\b/i.test(s.textContent.trim()));
-          if (!href || !successful) throw Error("Incomplete WebDAV directory response.");
-          const item = segments(new URL(href, url.href.replace(/\/+$/, "") + "/").pathname);
-          if (!base.every((part, i) => part === item[i])) throw Error("WebDAV returned an unexpected directory.");
-          if (item.length === base.length) {
-            self = true;
-            continue;
-          }
-          if (item.length !== base.length + 1) throw Error("WebDAV returned an unexpected child path.");
-          names.push(item[item.length - 1]);
-        }
-        if (!self) throw Error("WebDAV did not confirm the requested directory.");
-        return names;
+        field("\u4ECE\u7BA1\u7406\u5458 Mac \u6838\u5BF9\u7684\u5E93\u6307\u7EB9", "", (v) => code = v);
+        button("\u7533\u8BF7\u914D\u5BF9", async () => ({ title: "\u8BF7\u5728\u7BA1\u7406\u5458 Mac \u8F93\u5165\u6B64\u914D\u5BF9\u7801", value: await p.request(code.trim()) }));
       }
-    };
-    function credentials2(username, password) {
-      if (!username && !password) return "";
-      if (!username || username.includes(":")) throw Error("Enter a valid WebDAV username.");
-      const bytes = new TextEncoder().encode(username + ":" + password);
-      return "Basic " + btoa(Array.from(bytes, (b) => String.fromCharCode(b)).join(""));
-    }
-    var VaultFiles2 = class {
-      constructor(app) {
-        this.app = app;
-        this.vault = app.vault;
+      if (p.config.request) {
+        el.createEl("p", { text: "\u672C\u8BBE\u5907\u914D\u5BF9\u7801\uFF0810 \u5206\u949F\u6709\u6548\uFF09\uFF1A" + p.config.request });
       }
-      allowed(path) {
-        const first = path.split("/")[0].toLowerCase();
-        return !core2.isRecovery(path) && first !== this.vault.configDir.toLowerCase() && !path.split("/").some((part) => part.startsWith("."));
+      if (p.config.anchor && !p.config.admin) {
+        button("\u91CD\u65B0\u7533\u8BF7\u914D\u5BF9", async () => ({ title: "\u65B0\u914D\u5BF9\u7801", value: await p.request(p.config.anchor) }));
       }
-      paths() {
-        return new Set(this.vault.getFiles().map((f) => f.path).filter((path) => this.allowed(path)));
-      }
-      file(path) {
-        const item = this.vault.getAbstractFileByPath(path);
-        if (item && (item.path !== path || !(item instanceof TFile))) throw Error("File or folder collision: " + path);
-        return item;
-      }
-      async read(path) {
-        const file = this.file(path);
-        return file ? this.vault.readBinary(file) : null;
-      }
-      async folders(path) {
-        const parts = path.split("/").slice(0, -1);
-        let name = "";
-        for (const part of parts) {
-          name += (name ? "/" : "") + part;
-          let folder2 = this.vault.getAbstractFileByPath(name);
-          if (!folder2) {
-            try {
-              folder2 = await this.vault.createFolder(name);
-            } catch (error) {
-              folder2 = this.vault.getAbstractFileByPath(name);
-              if (!folder2) throw error;
-            }
-          }
-          if (!(folder2 instanceof TFolder) || folder2.path !== name) throw Error("Folder collision: " + name);
-        }
-      }
-      async apply(path, expected, bytes) {
-        const old = await this.read(path);
-        if ((old === null ? null : await core2.sha(old)) !== expected) throw paused();
-        const file = this.file(path);
-        if (old === null) {
-          if (bytes !== null) {
-            await this.folders(path);
-            await this.vault.createBinary(path, bytes);
-          }
-          return;
-        }
-        if (!file) throw paused();
-        if (bytes === null) {
-          await this.app.fileManager.trashFile(file);
-          return;
-        }
-        if (file.extension.toLowerCase() === "md") {
-          const decode = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
-          const before = decode.decode(old), after = decode.decode(bytes);
-          await this.vault.process(file, (current) => {
-            if (current !== before) throw paused();
-            return after;
+      if (p.config.integrity) el.createEl("p", { text: p.config.integrity });
+      if (p.config.anchor) {
+        button("\u7ACB\u5373\u540C\u6B65 / \u68C0\u67E5\u914D\u5BF9", async () => {
+          const r = await p.sync();
+          new Notice2(r.route + " \xB7 \u4E0A\u4F20 " + r.sent + " \xB7 \u4E0B\u8F7D " + r.received);
+        });
+        if (p.config.admin) {
+          button("\u91CD\u65B0\u6821\u9A8C\u6062\u590D\u6570\u636E", () => p.verifyRecovery());
+          field("\u65B0\u8BBE\u5907\u663E\u793A\u7684\u914D\u5BF9\u7801", "", (v) => request = v);
+          button("\u6279\u51C6\u5DF2\u6838\u5BF9\u7684\u914D\u5BF9\u7801", () => p.approve(request.trim()));
+          for (const member of p.config.others || []) button("\u64A4\u9500\u8BBE\u5907 \xB7 " + member.name + " \xB7 " + member.id.slice(-8), async () => {
+            const modal = new Modal2(app);
+            modal.setTitle("\u64A4\u9500 " + member.name + " \u5E76\u8F6E\u6362\u5E93\u5BC6\u94A5\uFF1F");
+            new Setting2(modal.contentEl).addButton((b) => b.setButtonText("\u786E\u8BA4\u64A4\u9500").onClick(async () => {
+              try {
+                await p.exclusive(() => p.revoke(member.id));
+                modal.close();
+                redraw();
+              } catch (e) {
+                notice(e);
+              }
+            }));
+            modal.open();
           });
-        } else {
-          await this.vault.modifyBinary(file, bytes);
         }
       }
-      async archive(rev, body) {
-        const path = core2.conflictFolder + "/" + rev.id + "/" + rev.path;
-        const current = await this.read(path);
-        if (current !== null) {
-          if (await core2.sha(current) !== rev.hash) throw Error("Move your edited conflict copy before syncing: " + path);
-          return;
-        }
-        await this.apply(path, null, await body());
-      }
-    };
-    module2.exports = { Dav: Dav2, VaultFiles: VaultFiles2, credentials: credentials2 };
-  }
-});
-
-// src/plugin.cjs
-var { Plugin, PluginSettingTab, Setting, Modal, Notice, requestUrl } = require("obsidian");
-var core = require_core();
-var pq = require_pqc();
-var { Dav, VaultFiles, credentials } = require_adapter();
-var folder = "Homebound-PQC-Beta2";
-var namespace = "pqc-preview-2";
-var notice = (e) => new Notice(e.message || String(e), 1e4);
-var Output = class extends Modal {
-  constructor(app, title, value) {
-    super(app);
-    this.title = title;
-    this.value = value;
-  }
-  onOpen() {
-    this.setTitle(this.title);
-    const t = this.contentEl.createEl("textarea");
-    t.readOnly = true;
-    t.value = this.value;
-    t.rows = 4;
-    t.style.width = "100%";
-    new Setting(this.contentEl).addButton((b) => b.setButtonText("\u590D\u5236").onClick(() => navigator.clipboard.writeText(this.value).catch(notice)));
-  }
-  onClose() {
-    this.value = "";
-    this.contentEl.empty();
-  }
-};
-var Settings = class extends PluginSettingTab {
-  constructor(app, p) {
-    super(app, p);
-    this.p = p;
-  }
-  display() {
-    const p = this.p, el = this.containerEl;
-    el.empty();
-    const c = { ...p.config };
-    let password = "", code = "", request = "", recovery = "", bootstrap = "";
-    const field = (label, value, change, secret = false) => new Setting(el).setName(label).addText((t) => {
-      t.setValue(value).onChange(change);
-      if (secret) t.inputEl.type = "password";
-    });
-    const button = (label, fn) => new Setting(el).addButton((b) => b.setButtonText(label).onClick(async () => {
-      try {
-        const result = await p.exclusive(fn);
-        this.display();
-        if (result?.title) new Output(this.app, result.title, result.value).open();
-      } catch (e) {
-        this.display();
-        notice(e);
-      }
-    }));
-    el.createEl("p", { text: "\u72EC\u7ACB\u6D4B\u8BD5\u5E93\uFF1A" + folder });
-    field("\u5C40\u57DF\u7F51 WebDAV \u5730\u5740", c.home, (v) => c.home = v);
-    field("\u5916\u7F51 WebDAV \u5730\u5740", c.away, (v) => c.away = v);
-    field("\u53EF\u4FE1\u63D0\u4EA4\u670D\u52A1 HTTPS \u5730\u5740", c.witness, (v) => c.witness = v);
-    field("WebDAV \u7528\u6237\u540D", c.username, (v) => c.username = v);
-    field("WebDAV \u5BC6\u7801\uFF08\u7559\u7A7A\u6CBF\u7528\uFF09", "", (v) => password = v, true);
-    field("\u8FD9\u53F0\u8BBE\u5907\u7684\u540D\u79F0", c.name, (v) => c.name = v);
-    button("\u4FDD\u5B58\u8FDE\u63A5\u8BBE\u7F6E", () => p.configure(c, password));
-    if (p.config.anchor) el.createEl("p", { text: "\u5E93\u6307\u7EB9\uFF1A" + p.config.anchor });
-    if (!p.config.anchor) {
-      field("\u5EFA\u5E93\u6388\u6743\uFF08\u670D\u52A1\u90E8\u7F72\u8005\u63D0\u4F9B\uFF09", "", (v) => bootstrap = v, true);
-      button("\u5728\u5C40\u57DF\u7F51\u521B\u5EFA\u6D4B\u8BD5\u5E93", async () => {
-        const seed = pq.freshSeed();
-        const out = new Output(this.app, "\u5148\u79BB\u7EBF\u4FDD\u5B58\u6062\u590D\u7801\uFF0C\u7136\u540E\u786E\u8BA4\u521B\u5EFA", seed);
-        const previous = out.onOpen.bind(out);
-        out.onOpen = () => {
-          previous();
-          new Setting(out.contentEl).addButton((b) => b.setButtonText("\u6211\u5DF2\u4FDD\u5B58\uFF0C\u521B\u5EFA").onClick(async () => {
+      field("\u79BB\u7EBF\u6062\u590D\u7801", "", (v) => recovery = v, true);
+      button("\u7528\u6062\u590D\u7801\u63A5\u7BA1\uFF0C\u64A4\u9500\u539F\u8BBE\u5907", async () => {
+        const saved = p.pendingRecovery(), replacement = saved || pq.freshSeed();
+        const kit = await p.replacementKit(recovery.trim(), replacement);
+        const modal = new Output(app, "\u5148\u79BB\u7EBF\u4FDD\u5B58\u65B0\u6062\u590D\u7801\u3002\u786E\u8BA4\u540E\u65E7\u7801\u3001\u539F\u8BBE\u5907\u5747\u4F1A\u5931\u6548\u3002", kit);
+        const open = modal.onOpen.bind(modal);
+        modal.onOpen = () => {
+          open();
+          new Setting2(modal.contentEl).addButton((b) => b.setButtonText("\u786E\u8BA4\u6062\u590D").onClick(async () => {
             try {
-              await p.exclusive(() => p.create(seed, bootstrap));
-              out.close();
-              this.display();
+              await p.exclusive(() => p.restore(recovery.trim(), replacement));
+              modal.close();
+              redraw();
             } catch (e) {
               notice(e);
             }
           }));
         };
-        out.open();
+        modal.open();
       });
-      field("\u4ECE\u7BA1\u7406\u5458 Mac \u6838\u5BF9\u7684\u5E93\u6307\u7EB9", "", (v) => code = v);
-      button("\u7533\u8BF7\u914D\u5BF9", async () => ({ title: "\u8BF7\u5728\u7BA1\u7406\u5458 Mac \u8F93\u5165\u6B64\u914D\u5BF9\u7801", value: await p.request(code.trim()) }));
     }
-    if (p.config.request) {
-      el.createEl("p", { text: "\u672C\u8BBE\u5907\u914D\u5BF9\u7801\uFF0810 \u5206\u949F\u6709\u6548\uFF09\uFF1A" + p.config.request });
-    }
-    if (p.config.anchor && !p.config.admin) {
-      button("\u91CD\u65B0\u7533\u8BF7\u914D\u5BF9", async () => ({ title: "\u65B0\u914D\u5BF9\u7801", value: await p.request(p.config.anchor) }));
-    }
-    if (p.config.integrity) el.createEl("p", { text: p.config.integrity });
-    if (p.config.anchor) {
-      button("\u7ACB\u5373\u540C\u6B65 / \u68C0\u67E5\u914D\u5BF9", async () => {
-        const r = await p.sync();
-        new Notice(r.route + " \xB7 \u4E0A\u4F20 " + r.sent + " \xB7 \u4E0B\u8F7D " + r.received);
-      });
-      if (p.config.admin) {
-        button("\u91CD\u65B0\u6821\u9A8C\u6062\u590D\u6570\u636E", () => p.verifyRecovery());
-        field("\u65B0\u8BBE\u5907\u663E\u793A\u7684\u914D\u5BF9\u7801", "", (v) => request = v);
-        button("\u6279\u51C6\u5DF2\u6838\u5BF9\u7684\u914D\u5BF9\u7801", () => p.approve(request.trim()));
-        for (const member of p.config.others || []) button("\u64A4\u9500\u8BBE\u5907 \xB7 " + member.name + " \xB7 " + member.id.slice(-8), async () => {
-          const modal = new Modal(this.app);
-          modal.setTitle("\u64A4\u9500 " + member.name + " \u5E76\u8F6E\u6362\u5E93\u5BC6\u94A5\uFF1F");
-          new Setting(modal.contentEl).addButton((b) => b.setButtonText("\u786E\u8BA4\u64A4\u9500").onClick(async () => {
-            try {
-              await p.exclusive(() => p.revoke(member.id));
-              modal.close();
-              this.display();
-            } catch (e) {
-              notice(e);
-            }
-          }));
-          modal.open();
-        });
+    var PqcMode2 = class {
+      constructor(app) {
+        this.app = app;
+        const saved = app.loadLocalStorage("homebound-webdav-pqc-config");
+        if (saved && saved.format !== 2) throw Error("\u65E0\u6CD5\u8BC6\u522B\u6B64\u8BBE\u5907\u7684 PQC \u914D\u7F6E\u3002");
+        this.config = { format: 2, home: "", away: "", witness: "", username: "", name: "\u6211\u7684\u8BBE\u5907", ...saved };
+        if (!this.config.local) {
+          this.config.local = core2.randomId();
+          this.saveData(this.config);
+        }
       }
-    }
-    field("\u79BB\u7EBF\u6062\u590D\u7801", "", (v) => recovery = v, true);
-    button("\u7528\u6062\u590D\u7801\u63A5\u7BA1\uFF0C\u64A4\u9500\u539F\u8BBE\u5907", async () => {
-      const saved = p.pendingRecovery(), replacement = saved || pq.freshSeed();
-      const kit = await p.replacementKit(recovery.trim(), replacement);
-      const modal = new Output(this.app, "\u5148\u79BB\u7EBF\u4FDD\u5B58\u65B0\u6062\u590D\u7801\u3002\u786E\u8BA4\u540E\u65E7\u7801\u3001\u539F\u8BBE\u5907\u5747\u4F1A\u5931\u6548\u3002", kit);
-      const open = modal.onOpen.bind(modal);
-      modal.onOpen = () => {
-        open();
-        new Setting(modal.contentEl).addButton((b) => b.setButtonText("\u786E\u8BA4\u6062\u590D").onClick(async () => {
-          try {
-            await p.exclusive(() => p.restore(recovery.trim(), replacement));
-            modal.close();
-            this.display();
-          } catch (e) {
-            notice(e);
+      saveData(data) {
+        this.app.saveLocalStorage("homebound-webdav-pqc-config", data);
+      }
+      display(el, redraw) {
+        displaySettings(el, this, this.app, redraw);
+      }
+      async exclusive(fn) {
+        if (this.closed) throw Error("PQC \u6A21\u5F0F\u5DF2\u5173\u95ED\u3002");
+        if (this.busy) throw Error("\u64CD\u4F5C\u8FDB\u884C\u4E2D\u3002");
+        this.busy = true;
+        try {
+          return await fn();
+        } finally {
+          this.busy = false;
+        }
+      }
+      secret(k, v) {
+        const s = this.app.secretStorage, id2 = "hbpqc-" + this.config.local + "-" + k;
+        if (v !== void 0) s.setSecret(id2, v);
+        return s.getSecret(id2);
+      }
+      async configure(c, password) {
+        const home = core2.endpoint(c.home), away = c.away ? core2.endpoint(c.away) : "";
+        const witness = core2.endpoint(c.witness);
+        if (!witness.startsWith("https://") || this.config.anchor && this.config.witness !== witness) throw Error("\u53EF\u4FE1\u63D0\u4EA4\u670D\u52A1\u9700\u4F7F\u7528\u5EFA\u5E93\u65F6\u6838\u5BF9\u7684 HTTPS \u5730\u5740\u3002");
+        Object.assign(this.config, { home, away, witness, name: c.name.trim(), username: c.username.trim() });
+        if (password) this.secret("dav", password);
+        await this.saveData(this.config);
+      }
+      async device() {
+        if (!this.keys) {
+          let seed = this.secret("device");
+          if (!seed) {
+            seed = pq.freshSeed();
+            this.secret("device", seed);
           }
-        }));
-      };
-      modal.open();
-    });
+          this.keys = await pq.identity(seed, "device");
+        }
+        return this.keys;
+      }
+      base(url) {
+        return new Dav2(core2.endpoint(url), credentials2(this.config.username, this.secret("dav")));
+      }
+      async route() {
+        const c = this.config;
+        for (const [i, url] of [c.home, c.away].entries()) {
+          const dav = this.base(url).child(folder).child(namespace2);
+          let timer;
+          try {
+            await Promise.race([dav.read("vault.json"), new Promise((_, reject) => {
+              timer = setTimeout(() => reject(Object.assign(Error("\u8FDE\u63A5\u8D85\u65F6"), { offline: true })), i === 0 && c.away ? 3e3 : 16e3);
+            })]);
+            return { dav, route: i ? "VPS/VPN" : "LAN" };
+          } catch (e) {
+            if (i || !e.offline || !c.away) throw e;
+          } finally {
+            clearTimeout(timer);
+          }
+        }
+      }
+      async create(seed, bootstrap) {
+        const rec = await pq.identity(seed, "recovery"), dev = await this.device(), home = this.base(this.config.home), dir = home.child(folder);
+        try {
+          await home.mkdir(folder);
+        } catch (e) {
+          if (e.status !== 405) throw e;
+        }
+        const known = await dir.list();
+        if (known.some((x) => x !== namespace2)) throw Error("\u65B0\u6D4B\u8BD5\u76EE\u5F55\u5305\u542B\u5176\u4ED6\u6587\u4EF6\u3002");
+        const dav = dir.child(namespace2);
+        if (!known.length) await dir.mkdir(namespace2);
+        for (const name of ["objects", "requests"]) try {
+          await dav.mkdir(name);
+        } catch (e) {
+          if (e.status !== 405) throw e;
+        }
+        let live;
+        try {
+          live = await pq.state(this.ledger.bind(this), rec.id);
+        } catch (e) {
+          if (e.status !== 404) throw e;
+        }
+        if (live) {
+          if (live.policies.length !== 1 || pq.latest(live).p.admin !== dev.id) throw Error("\u670D\u52A1\u5DF2\u7ED1\u5B9A\u5230\u53E6\u4E00\u7BA1\u7406\u5458\u3002");
+        } else await pq.genesis(this.ledger.bind(this), dev, this.config.name, rec, bootstrap);
+        await dav.put("vault.json", core2.jsonBytes({ format: 2, anchor: rec.id }).buffer);
+        this.config.anchor = rec.id;
+        await this.refresh();
+        return rec.id;
+      }
+      async ledger(method, data, token) {
+        const nonce = core2.randomId(), headers = { "Cache-Control": "no-store" };
+        if (token) headers.Authorization = "Bearer " + token;
+        const response = await requestUrl2({
+          url: this.config.witness + "/" + method,
+          method: "POST",
+          headers,
+          contentType: "application/json",
+          body: JSON.stringify({ ...data, transportNonce: nonce }),
+          throw: false
+        });
+        if (response.status !== 200) {
+          const msg = { 403: "\u672A\u83B7\u6388\u6743\u3001\u5DF2\u64A4\u9500\u6216\u6062\u590D\u7801\u5931\u6548", 404: "\u8BF7\u6C42\u4E0D\u5B58\u5728", 409: "\u6388\u6743\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u540C\u6B65\u6216\u914D\u5BF9" }[response.status] || "\u53EF\u4FE1\u63D0\u4EA4\u670D\u52A1\u4E0D\u53EF\u7528";
+          throw Object.assign(Error(msg + " (" + response.status + ")"), { status: response.status });
+        }
+        return response.json;
+      }
+      async snapshot(anchor = this.config.anchor, withRevisions = true) {
+        return pq.state(this.ledger.bind(this), anchor, this.config.pin, withRevisions);
+      }
+      async context(anchor = this.config.anchor) {
+        const [s, r] = await Promise.all([this.snapshot(anchor), this.route()]);
+        const marker = core2.parseBytes(await r.dav.read("vault.json"));
+        if (marker.format !== 2 || marker.anchor !== anchor) throw Error("WebDAV \u6307\u5411\u53E6\u4E00\u6D4B\u8BD5\u5E93\u3002");
+        return { ...r, s, device: await this.device() };
+      }
+      async refresh(snapshot) {
+        const s = snapshot || await this.snapshot(this.config.anchor, false), dev = await this.device(), { p, digest } = pq.latest(s);
+        this.config.pin = { n: p.n, digest };
+        this.config.admin = p.admin === dev.id;
+        this.config.others = Object.entries(p.members).filter(([id2]) => id2 !== dev.id).map(([id2, m]) => ({ id: id2, name: m.name }));
+        if (p.members[dev.id]) delete this.config.request;
+        await this.saveData(this.config);
+      }
+      async request(anchor) {
+        if (this.config.anchor && this.config.anchor !== anchor) throw Error("\u5E93\u6307\u7EB9\u4E0D\u5339\u914D\u3002");
+        const { dav, s, device } = await this.context(anchor);
+        if (pq.latest(s).p.members[device.id]) throw Error("\u8FD9\u53F0\u8BBE\u5907\u5DF2\u83B7\u6388\u6743\uFF0C\u53EF\u4EE5\u76F4\u63A5\u540C\u6B65\u3002");
+        const code = await pq.requestPair(dav, s, device, this.config.name);
+        Object.assign(this.config, { anchor, request: code });
+        await this.refresh();
+        return code;
+      }
+      async approve(code) {
+        const { dav, s, device } = await this.context();
+        const target = await pq.readRequest(dav, s, code);
+        await pq.nextPolicy(this.ledger.bind(this), s, device, "approve", target);
+        await this.refresh();
+        return target.id;
+      }
+      async sealHistory() {
+        await this.change("seal-history");
+      }
+      async revoke(id2) {
+        await this.change("revoke", id2);
+      }
+      async change(action, arg) {
+        await pq.nextPolicy(this.ledger.bind(this), await this.snapshot(this.config.anchor, false), await this.device(), action, arg);
+        await this.refresh();
+      }
+      pendingRecovery() {
+        return this.secret("pending-root") || "";
+      }
+      async recoveryKit(input) {
+        const fields = input.split(".");
+        if (fields.length > 2) throw Error("\u65E0\u6548\u7684\u6062\u590D\u5305\u3002");
+        const rec = await pq.identity(fields.at(-1), "recovery");
+        const anchor = fields.length === 1 ? rec.id : fields[0];
+        if (!/^[a-f0-9]{32}$/.test(anchor) || this.config.anchor && this.config.anchor !== anchor) throw Error("\u6062\u590D\u8EAB\u4EFD\u4E0E\u672C\u5E93\u4E0D\u7B26\u3002");
+        return { anchor, rec };
+      }
+      async replacementKit(input, seed) {
+        const { anchor } = await this.recoveryKit(input);
+        return anchor + "." + seed;
+      }
+      async restore(input, replacement) {
+        const { rec, anchor } = await this.recoveryKit(input), s = await this.snapshot(anchor, false);
+        if (!replacement || replacement === input.split(".").at(-1)) throw Error("\u8BF7\u79BB\u7EBF\u4FDD\u5B58\u65B0\u7684\u968F\u673A\u6062\u590D\u7801\u3002");
+        const newRoot = await pq.identity(replacement, "recovery");
+        const existing = this.pendingRecovery(), pending = this.secret("pending-device");
+        const resume = existing === replacement && pending && await pq.publicId(pq.latest(s).p.recovery) === newRoot.id;
+        if (!resume && await pq.publicId(pq.latest(s).p.recovery) !== rec.id) throw Error("\u6062\u590D\u8EAB\u4EFD\u5DF2\u5931\u6548\u3002");
+        const seed = existing === replacement && pending || pq.freshSeed();
+        const dev = await pq.identity(seed, "device");
+        this.secret("pending-device", seed);
+        this.secret("pending-root", replacement);
+        if (!resume) {
+          await pq.nextPolicy(this.ledger.bind(this), s, rec, "restore", { id: dev.id, pub: pq.publicDevice(dev, this.config.name), recovery: newRoot.pub });
+        } else if (pq.latest(s).p.admin !== dev.id) throw Error("\u6062\u590D\u4E8B\u52A1\u4E0E\u5F53\u524D\u7BA1\u7406\u5458\u4E0D\u7B26\u3002");
+        this.secret("device", seed);
+        this.keys = dev;
+        this.config.anchor = anchor;
+        this.config.integrity = "\u7BA1\u7406\u5458\u5DF2\u63A5\u7BA1\uFF0C\u5C1A\u672A\u5B8C\u6210\u6570\u636E\u6821\u9A8C\u3002";
+        await this.refresh();
+        this.secret("pending-root", "");
+        this.secret("pending-device", "");
+        return this.verifyRecovery();
+      }
+      async verifyRecovery() {
+        let report;
+        try {
+          const { s, dav, device } = await this.context();
+          const store = await pq.storeFor(this.ledger.bind(this), dav, s, device);
+          report = await pq.auditData(store);
+          this.config.integrity = report.faults.length ? "\u5DF2\u63A5\u7BA1\uFF0C\u6570\u636E\u4E0D\u5B8C\u6574\uFF1A" + report.faults.map((f) => f.path + " [" + f.id + "]").join("\uFF0C") : "\u5DF2\u6821\u9A8C " + report.checked + " \u6761\u5386\u53F2\u4FEE\u8BA2\u53CA\u5BF9\u5E94\u6B63\u6587\u3002";
+        } catch (e) {
+          this.config.integrity = "\u5DF2\u63A5\u7BA1\uFF0C\u6570\u636E\u6821\u9A8C\u5931\u8D25\uFF1A" + e.message;
+          report = { faults: [{ path: e.path, id: e.id, error: e.message }] };
+        }
+        await this.saveData(this.config);
+        return report;
+      }
+      async sync() {
+        const { dav, device, s, route } = await this.context(), last = pq.latest(s);
+        if (!last.p.members[device.id]) {
+          await this.refresh(s);
+          throw Error("\u6B64\u8BBE\u5907\u672A\u83B7\u6388\u6743\uFF0C\u6216\u5DF2\u88AB\u64A4\u9500\u3002\u8BF7\u5728\u8BBE\u7F6E\u4E2D\u91CD\u65B0\u7533\u8BF7\u914D\u5BF9\u3002");
+        }
+        const store = await pq.storeFor(this.ledger.bind(this), dav, s, device);
+        this.config.pin = { n: last.p.n, digest: last.digest };
+        delete this.config.request;
+        await this.saveData(this.config);
+        const id2 = "hbpqc-baseline-" + this.config.anchor;
+        const r = await core2.synchronize({
+          store,
+          local: new VaultFiles2(this.app),
+          baseline: new Map(this.app.loadLocalStorage(id2) || []),
+          cache: /* @__PURE__ */ new Map(),
+          checkpoint: (m) => this.app.saveLocalStorage(id2, [...m]),
+          active: () => !this.closed
+        });
+        return { route, sent: r.sent, received: r.received, conflicts: r.conflicts };
+      }
+    };
+    module2.exports = PqcMode2;
+  }
+});
+
+// src/plugin.cjs
+var { Plugin, PluginSettingTab, Setting, Modal, Notice, TFile, TFolder, requestUrl, getLanguage } = require("obsidian");
+var core = require_core();
+var tr = (en, zh) => getLanguage().startsWith("zh") ? zh : en;
+var namespace = "homebound-v1";
+var { Dav, VaultFiles, credentials } = require_adapter();
+var PqcMode = require_pqc_mode();
+var modeKey = "homebound-webdav-mode";
+async function probe(dav, milliseconds) {
+  let timer;
+  try {
+    return await Promise.race([dav.read("vault.json").then(core.parseBytes), new Promise((_, reject) => {
+      timer = setTimeout(() => reject(Object.assign(Error("WebDAV connection timed out."), { offline: true })), milliseconds);
+    })]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+async function connect(config, password, passphrase) {
+  const auth = credentials(config.username, password);
+  const addresses = [[config.home, "LAN"]];
+  if (config.away && config.away !== config.home) addresses.push([config.away, "VPS/VPN"]);
+  for (const [index, [address, route]] of addresses.entries()) {
+    const dav = new Dav(address, auth).child(config.folder).child(namespace);
+    let header;
+    try {
+      header = await probe(dav, index === 0 && addresses.length > 1 ? 2500 : 15e3);
+    } catch (error) {
+      if (error.offline && index + 1 < addresses.length) continue;
+      throw error;
+    }
+    const key = await core.unlock(header, passphrase, config.id);
+    return { store: new core.Store(dav, header.id, key), route };
+  }
+}
+var ConfirmFolder = class extends Modal {
+  constructor(app, config, create, done) {
+    super(app);
+    Object.assign(this, { config, create, done });
+  }
+  onOpen() {
+    this.setTitle(this.create ? tr("Create encrypted vault?", "\u521B\u5EFA\u52A0\u5BC6\u5E93\uFF1F") : tr("Use this remote folder?", "\u4F7F\u7528\u8FD9\u4E2A\u8FDC\u7AEF\u76EE\u5F55\uFF1F"));
+    this.contentEl.createEl("p", { text: this.config.home + "/" + core.encodePath(this.config.folder) });
+    if (this.config.away) this.contentEl.createEl("p", { text: this.config.away + "/" + core.encodePath(this.config.folder) });
+    this.contentEl.createEl("p", { text: this.create ? tr("Creates a new encrypted vault in an empty folder using the LAN address.", "\u901A\u8FC7\u5C40\u57DF\u7F51\u5730\u5740\uFF0C\u5728\u7A7A\u76EE\u5F55\u4E2D\u521B\u5EFA\u65B0\u52A0\u5BC6\u5E93\u3002") : tr("Verifies the passphrase and saves this vault on this device.", "\u9A8C\u8BC1\u52A0\u5BC6\u53E3\u4EE4\u540E\uFF0C\u5C06\u8FD9\u4E2A\u5E93\u7ED1\u5B9A\u5230\u5F53\u524D\u8BBE\u5907\u3002") });
+    new Setting(this.contentEl).addButton((b) => b.setButtonText(tr("Cancel", "\u53D6\u6D88")).onClick(() => this.close())).addButton((b) => b.setCta().setButtonText(tr("Confirm", "\u786E\u8BA4")).onClick(() => {
+      this.close();
+      this.done();
+    }));
+  }
+  onClose() {
+    this.contentEl.empty();
   }
 };
-module.exports = class Preview extends Plugin {
+var HomeboundSettings = class extends PluginSettingTab {
+  constructor(app, plugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+  display() {
+    const p = this.plugin, el = this.containerEl;
+    el.empty();
+    el.addClass("homebound-settings");
+    new Setting(el).setName(tr("Sync mode", "\u540C\u6B65\u6A21\u5F0F")).setDesc(tr("PQC uses a separate remote folder. Switching modes keeps the notes on this device.", "PQC \u4F7F\u7528\u72EC\u7ACB\u7684\u8FDC\u7AEF\u76EE\u5F55\u3002\u5207\u6362\u540E\u672C\u673A\u7B14\u8BB0\u4F1A\u4FDD\u7559\u3002")).addDropdown((d) => d.addOption("legacy", tr("Passphrase (0.1.1)", "\u53E3\u4EE4\u540C\u6B65\uFF080.1.1\uFF09")).addOption("pqc", tr("Post-quantum (PQC)", "\u540E\u91CF\u5B50\u52A0\u5BC6\uFF08PQC\uFF09")).setValue(p.mode).onChange((mode) => {
+      try {
+        p.selectMode(mode);
+      } catch (e) {
+        new Notice(e.message);
+      }
+      this.display();
+    }));
+    if (p.mode === "pqc") {
+      p.pqc.display(el, () => this.display());
+      return;
+    }
+    const draft = { ...p.config };
+    let password = "", passphrase = "";
+    const field = (label, key, hint, placeholder) => new Setting(el).setClass("homebound-field").setName(label).setDesc(hint).addText((t) => t.setValue(draft[key] || "").setPlaceholder(placeholder).onChange((v) => {
+      draft[key] = v;
+    }));
+    field(tr("LAN WebDAV address", "\u5C40\u57DF\u7F51 WebDAV \u5730\u5740"), "home", tr("Use the server\u2019s HTTPS address.", "\u586B\u5199\u670D\u52A1\u5668\u7684 HTTPS \u5730\u5740\u3002"), "https://nas.example.net/dav");
+    field(tr("Away WebDAV address", "\u5916\u7F51 WebDAV \u5730\u5740"), "away", tr("Optional HTTPS gateway to the same server.", "\u53EF\u9009\u3002\u586B\u5199\u8F6C\u53D1\u5230\u540C\u4E00\u53F0\u670D\u52A1\u5668\u7684 HTTPS \u5730\u5740\u3002"), "https://dav.example.net/dav");
+    field(tr("Remote folder", "\u8FDC\u7AEF\u76EE\u5F55"), "folder", tr("Type the folder name as written, including spaces or Chinese characters.", "\u53EF\u76F4\u63A5\u8F93\u5165\u4E2D\u6587\u3001\u7A7A\u683C\u548C\u591A\u7EA7\u76EE\u5F55\u3002"), "\u7B14\u8BB0/\u6211\u7684\u77E5\u8BC6\u5E93");
+    field(tr("WebDAV username", "WebDAV \u7528\u6237\u540D"), "username", "", "");
+    const secret = (label, cb) => new Setting(el).setClass("homebound-field").setName(label).setDesc(p.config.id ? tr("Leave empty to use the saved secret.", "\u7559\u7A7A\u53EF\u6CBF\u7528\u5DF2\u4FDD\u5B58\u7684\u5BC6\u7801\u3002") : "").addText((t) => {
+      t.inputEl.type = "password";
+      t.inputEl.autocomplete = "off";
+      t.onChange(cb);
+    });
+    secret(tr("WebDAV password", "WebDAV \u5BC6\u7801"), (value) => {
+      password = value;
+    });
+    secret(tr("Vault encryption passphrase", "\u7B14\u8BB0\u5E93\u52A0\u5BC6\u53E3\u4EE4"), (value) => {
+      passphrase = value;
+    });
+    const review = (create) => {
+      try {
+        const config = {
+          ...draft,
+          home: core.endpoint(draft.home),
+          away: draft.away.trim() ? core.endpoint(draft.away) : "",
+          folder: core.directory(draft.folder),
+          username: draft.username.trim()
+        };
+        const changedFolder = config.folder !== p.config.folder;
+        if (create || changedFolder) config.id = "";
+        new ConfirmFolder(this.app, config, create, () => p.bind(config, create, password, passphrase).then((ok) => {
+          if (ok) this.display();
+        })).open();
+      } catch (e) {
+        new Notice(e.message);
+      }
+    };
+    new Setting(el).addButton((b) => b.setButtonText(tr("Create new vault\u2026", "\u521B\u5EFA\u65B0\u5E93\u2026")).onClick(() => review(true))).addButton((b) => b.setCta().setButtonText(tr("Connect existing vault\u2026", "\u8FDE\u63A5\u5DF2\u6709\u5E93\u2026")).onClick(() => review(false)));
+    if (!p.config.id) return;
+    new Setting(el).setName(tr("Sync while open", "\u6253\u5F00\u671F\u95F4\u81EA\u52A8\u540C\u6B65")).setDesc(tr("Check for changes every five minutes.", "\u6BCF\u4E94\u5206\u949F\u68C0\u67E5\u4E00\u6B21\u53D8\u66F4\u3002")).addToggle((t) => t.setValue(Boolean(p.config.auto)).onChange(async (value) => {
+      p.config.auto = value;
+      await p.saveData(p.config);
+    }));
+    new Setting(el).addButton((b) => b.setButtonText(tr("Sync now", "\u7ACB\u5373\u540C\u6B65")).onClick(() => p.run()));
+    if (p.last) el.createEl("p", { text: p.last });
+  }
+};
+module.exports = class HomeboundPlugin extends Plugin {
   async onload() {
-    const saved = await this.loadData();
-    if (this.manifest.id !== "homebound-webdav-pqc-preview" || saved && ("secretId" in saved || "id" in saved)) {
-      throw Error("\u6B64\u5B89\u88C5\u4F4D\u7F6E\u6216\u914D\u7F6E\u5C5E\u4E8E\u6B63\u5F0F\u7248\u3002\u8BF7\u4FDD\u7559\u539F\u63D2\u4EF6\uFF0C\u5728\u72EC\u7ACB\u4F4D\u7F6E\u5B89\u88C5 PQC \u6D4B\u8BD5\u7248\u3002");
-    }
-    if (saved?.anchor && saved.format !== 2) throw Error("\u8BF7\u5728\u72EC\u7ACB beta.2 \u672C\u5730\u5E93\u542F\u7528\uFF0C\u65E7\u6D4B\u8BD5\u5E93\u4F7F\u7528\u539F\u7248\u672C\u3002");
-    this.config = { format: 2, home: "", away: "", witness: "", username: "", name: "\u6211\u7684\u8BBE\u5907", ...saved };
-    if (!this.config.local) {
-      this.config.local = core.randomId();
-      await this.saveData(this.config);
-    }
-    this.addSettingTab(new Settings(this.app, this));
-    this.addCommand({ id: "seal-history", name: "\u7BA1\u7406\u5458\uFF1A\u5C01\u5B58\u5F53\u524D\u5386\u53F2\u5E76\u8F6E\u6362\u5BC6\u94A5", checkCallback: (checking) => {
-      if (!this.config.admin) return false;
-      if (!checking) this.exclusive(() => this.sealHistory()).then(() => new Notice("\u5DF2\u5C01\u5B58\u5386\u53F2\u5E76\u8F6E\u6362\u5BC6\u94A5\u3002")).catch(notice);
+    this.closed = false;
+    this.cache = /* @__PURE__ */ new Map();
+    this.config = {
+      home: "",
+      away: "",
+      folder: this.app.vault.getName(),
+      username: "",
+      id: "",
+      auto: false,
+      ...await this.loadData()
+    };
+    if (this.manifest.id !== "homebound-webdav") throw Error("Install this candidate as Homebound WebDAV.");
+    const savedMode = this.app.loadLocalStorage(modeKey);
+    if (savedMode != null && savedMode !== "legacy" && savedMode !== "pqc") throw Error("Unknown Homebound sync mode.");
+    this.mode = savedMode || "legacy";
+    if (this.mode === "pqc") this.pqc = new PqcMode(this.app);
+    this.settingsTab = new HomeboundSettings(this.app, this);
+    this.addSettingTab(this.settingsTab);
+    this.addCommand({ id: "sync", name: tr("Sync now", "\u7ACB\u5373\u540C\u6B65"), callback: () => this.run() });
+    this.addCommand({ id: "resolve", name: tr("Resolve conflict using the active file", "\u4F7F\u7528\u5F53\u524D\u6587\u4EF6\u89E3\u51B3\u51B2\u7A81"), checkCallback: (checking) => {
+      const file = this.app.workspace.getActiveFile();
+      if (this.mode !== "legacy" || !file || !this.conflicts?.includes(file.path)) return false;
+      if (!checking) this.run(file.path);
       return true;
     } });
-    this.addCommand({ id: "sync", name: "\u7ACB\u5373\u540C\u6B65", callback: () => this.exclusive(() => this.sync()).then((r) => new Notice(r.route + " \xB7 \u4E0A\u4F20 " + r.sent + " \xB7 \u4E0B\u8F7D " + r.received)).catch(notice) });
+    this.addCommand({ id: "seal-history", name: tr("Rotate PQC vault keys", "\u8F6E\u6362 PQC \u5E93\u5BC6\u94A5"), checkCallback: (checking) => {
+      const q = this.pqc;
+      if (this.mode !== "pqc" || !q?.config.admin) return false;
+      if (!checking) q.exclusive(() => q.sealHistory()).then(() => new Notice(tr("Keys rotated.", "\u5BC6\u94A5\u5DF2\u8F6E\u6362\u3002"))).catch((e) => new Notice(e.message));
+      return true;
+    } });
+    const syncIfEnabled = () => {
+      if (this.mode === "legacy" && !this.closed && this.config.auto && !this.busy && document.visibilityState === "visible") this.run(null, true);
+    };
+    this.app.workspace.onLayoutReady(syncIfEnabled);
+    this.registerDomEvent(document, "visibilitychange", syncIfEnabled);
+    this.registerDomEvent(window, "online", syncIfEnabled);
+    this.registerInterval(window.setInterval(syncIfEnabled, 3e5));
   }
-  async exclusive(fn) {
-    if (this.busy) throw Error("\u64CD\u4F5C\u8FDB\u884C\u4E2D\u3002");
+  selectMode(mode) {
+    if (mode !== "legacy" && mode !== "pqc") throw Error("Unknown sync mode.");
+    if (this.mode === mode) return;
+    if (this.closed || this.busy || this.pqc?.busy) throw Error(tr("Finish the current sync first.", "\u8BF7\u7B49\u5F53\u524D\u64CD\u4F5C\u5B8C\u6210\u540E\u518D\u5207\u6362\u3002"));
+    const next = mode === "pqc" ? new PqcMode(this.app) : null;
+    this.app.saveLocalStorage(modeKey, mode);
+    if (this.pqc) this.pqc.closed = true;
+    this.pqc = next;
+    this.mode = mode;
+  }
+  onunload() {
+    this.closed = true;
+    if (this.pqc) this.pqc.closed = true;
+  }
+  secret(kind, config = this.config) {
+    return config.secretId ? this.app.secretStorage.getSecret("homebound-" + config.secretId + "-" + kind) || "" : "";
+  }
+  async bind(config, create, enteredPassword, enteredPhrase) {
+    if (this.closed || this.mode !== "legacy") return false;
+    if (this.busy) {
+      new Notice(tr("Sync is busy.", "\u540C\u6B65\u8FDB\u884C\u4E2D\u3002"));
+      return false;
+    }
     this.busy = true;
     try {
-      return await fn();
+      const password = config.username ? enteredPassword || this.secret("dav") : "";
+      const phrase = enteredPhrase || this.secret("vault");
+      if (!phrase || create && phrase.length < 12) throw Error(tr("Use a vault passphrase of at least 12 characters when creating a vault.", "\u521B\u5EFA\u65B0\u5E93\u8BF7\u4F7F\u7528\u81F3\u5C11 12 \u4E2A\u5B57\u7B26\u7684\u52A0\u5BC6\u53E3\u4EE4\u3002"));
+      if (create) {
+        const header = await core.createVault(new Dav(config.home, credentials(config.username, password)), config.folder, phrase, namespace);
+        config.id = header.id;
+      }
+      const { store } = await connect(config, password, phrase);
+      config.id = store.id;
+      config.secretId = config.secretId || core.randomId();
+      this.app.secretStorage.setSecret("homebound-" + config.secretId + "-vault", phrase);
+      if (password) this.app.secretStorage.setSecret("homebound-" + config.secretId + "-dav", password);
+      config.auto = false;
+      await this.saveData(config);
+      this.config = config;
+      this.cache.clear();
+      this.conflicts = [];
+      new Notice(tr("Vault connected.", "\u5DF2\u8FDE\u63A5\u7B14\u8BB0\u5E93\u3002"));
+      return true;
+    } catch (e) {
+      this.last = e.message;
+      new Notice(this.last, 1e4);
+      return false;
     } finally {
       this.busy = false;
     }
   }
-  secret(k, v) {
-    const s = this.app.secretStorage, id2 = "hbpqc-" + this.config.local + "-" + k;
-    if (v !== void 0) s.setSecret(id2, v);
-    return s.getSecret(id2);
-  }
-  async configure(c, password) {
-    const home = core.endpoint(c.home), away = c.away ? core.endpoint(c.away) : "";
-    const witness = core.endpoint(c.witness);
-    if (!witness.startsWith("https://") || this.config.anchor && this.config.witness !== witness) throw Error("\u53EF\u4FE1\u63D0\u4EA4\u670D\u52A1\u9700\u4F7F\u7528\u5EFA\u5E93\u65F6\u6838\u5BF9\u7684 HTTPS \u5730\u5740\u3002");
-    Object.assign(this.config, { home, away, witness, name: c.name.trim(), username: c.username.trim() });
-    if (password) this.secret("dav", password);
-    await this.saveData(this.config);
-  }
-  async device() {
-    if (!this.keys) {
-      let seed = this.secret("device");
-      if (!seed) {
-        seed = pq.freshSeed();
-        this.secret("device", seed);
-      }
-      this.keys = await pq.identity(seed, "device");
-    }
-    return this.keys;
-  }
-  base(url) {
-    return new Dav(core.endpoint(url), credentials(this.config.username, this.secret("dav")));
-  }
-  async route() {
-    const c = this.config;
-    for (const [i, url] of [c.home, c.away].entries()) {
-      const dav = this.base(url).child(folder).child(namespace);
-      let timer;
+  async run(resolve = null, quiet = false) {
+    if (this.closed || this.busy) return;
+    if (this.mode === "pqc") {
+      const q = this.pqc;
       try {
-        await Promise.race([dav.read("vault.json"), new Promise((_, reject) => {
-          timer = setTimeout(() => reject(Object.assign(Error("\u8FDE\u63A5\u8D85\u65F6"), { offline: true })), i === 0 && c.away ? 3e3 : 16e3);
-        })]);
-        return { dav, route: i ? "VPS/VPN" : "LAN" };
+        const result = await q.exclusive(() => q.sync());
+        new Notice(result.route + tr(" \xB7 uploaded ", " \xB7 \u5DF2\u4E0A\u4F20 ") + result.sent + tr(" \xB7 received ", " \xB7 \u5DF2\u63A5\u6536 ") + result.received);
+        return result;
       } catch (e) {
-        if (i || !e.offline || !c.away) throw e;
-      } finally {
-        clearTimeout(timer);
+        new Notice(e.message);
+        return;
       }
     }
-  }
-  async create(seed, bootstrap) {
-    const rec = await pq.identity(seed, "recovery"), dev = await this.device(), home = this.base(this.config.home), dir = home.child(folder);
+    this.busy = true;
     try {
-      await home.mkdir(folder);
+      const c = this.config;
+      if (!c.id) throw Error(tr("Connect a vault in settings first.", "\u8BF7\u5148\u5230\u8BBE\u7F6E\u4E2D\u8FDE\u63A5\u7B14\u8BB0\u5E93\u3002"));
+      const { store, route } = await connect(c, c.username ? this.secret("dav") : "", this.secret("vault"));
+      const key = "homebound-webdav-baseline-" + c.id;
+      const baseline = new Map(this.app.loadLocalStorage(key) || []);
+      const result = await core.synchronize({
+        store,
+        local: new VaultFiles(this.app),
+        cache: this.cache,
+        baseline,
+        resolve,
+        active: () => !this.closed,
+        checkpoint: (data) => this.app.saveLocalStorage(key, Array.from(data))
+      });
+      this.cache = result.history;
+      this.conflicts = result.conflicts;
+      this.last = route + tr(" \xB7 uploaded ", " \xB7 \u5DF2\u4E0A\u4F20 ") + result.sent + tr(" \xB7 received ", " \xB7 \u5DF2\u63A5\u6536 ") + result.received;
+      if (result.conflicts.length) this.last += "\n" + tr("Conflicts: ", "\u51B2\u7A81\u6587\u4EF6\uFF1A") + result.conflicts.join(", ") + "\n" + tr("Compare copies in Homebound conflicts, then resolve from the original file.", "\u8BF7\u6BD4\u8F83 Homebound conflicts \u4E2D\u7684\u526F\u672C\uFF0C\u518D\u6253\u5F00\u539F\u6587\u4EF6\u5E76\u8FD0\u884C\u89E3\u51B3\u51B2\u7A81\u547D\u4EE4\u3002");
+      if (!quiet || result.conflicts.length) new Notice(this.last, 9e3);
+      return result;
     } catch (e) {
-      if (e.status !== 405) throw e;
+      this.last = tr("Sync stopped: ", "\u540C\u6B65\u5DF2\u505C\u6B62\uFF1A") + e.message;
+      if (!quiet) new Notice(this.last, 1e4);
+    } finally {
+      this.busy = false;
     }
-    const known = await dir.list();
-    if (known.some((x) => x !== namespace)) throw Error("\u65B0\u6D4B\u8BD5\u76EE\u5F55\u5305\u542B\u5176\u4ED6\u6587\u4EF6\u3002");
-    const dav = dir.child(namespace);
-    if (!known.length) await dir.mkdir(namespace);
-    for (const name of ["objects", "requests"]) try {
-      await dav.mkdir(name);
-    } catch (e) {
-      if (e.status !== 405) throw e;
-    }
-    let live;
-    try {
-      live = await pq.state(this.ledger.bind(this), rec.id);
-    } catch (e) {
-      if (e.status !== 404) throw e;
-    }
-    if (live) {
-      if (live.policies.length !== 1 || pq.latest(live).p.admin !== dev.id) throw Error("\u670D\u52A1\u5DF2\u7ED1\u5B9A\u5230\u53E6\u4E00\u7BA1\u7406\u5458\u3002");
-    } else await pq.genesis(this.ledger.bind(this), dev, this.config.name, rec, bootstrap);
-    await dav.put("vault.json", core.jsonBytes({ format: 2, anchor: rec.id }).buffer);
-    this.config.anchor = rec.id;
-    await this.refresh();
-    return rec.id;
-  }
-  async ledger(method, data, token) {
-    const nonce = core.randomId(), headers = { "Cache-Control": "no-store" };
-    if (token) headers.Authorization = "Bearer " + token;
-    const response = await requestUrl({
-      url: this.config.witness + "/" + method,
-      method: "POST",
-      headers,
-      contentType: "application/json",
-      body: JSON.stringify({ ...data, transportNonce: nonce }),
-      throw: false
-    });
-    if (response.status !== 200) {
-      const msg = { 403: "\u672A\u83B7\u6388\u6743\u3001\u5DF2\u64A4\u9500\u6216\u6062\u590D\u7801\u5931\u6548", 404: "\u8BF7\u6C42\u4E0D\u5B58\u5728", 409: "\u6388\u6743\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u540C\u6B65\u6216\u914D\u5BF9" }[response.status] || "\u53EF\u4FE1\u63D0\u4EA4\u670D\u52A1\u4E0D\u53EF\u7528";
-      throw Object.assign(Error(msg + " (" + response.status + ")"), { status: response.status });
-    }
-    return response.json;
-  }
-  async snapshot(anchor = this.config.anchor, withRevisions = true) {
-    return pq.state(this.ledger.bind(this), anchor, this.config.pin, withRevisions);
-  }
-  async context(anchor = this.config.anchor) {
-    const [s, r] = await Promise.all([this.snapshot(anchor), this.route()]);
-    const marker = core.parseBytes(await r.dav.read("vault.json"));
-    if (marker.format !== 2 || marker.anchor !== anchor) throw Error("WebDAV \u6307\u5411\u53E6\u4E00\u6D4B\u8BD5\u5E93\u3002");
-    return { ...r, s, device: await this.device() };
-  }
-  async refresh(snapshot) {
-    const s = snapshot || await this.snapshot(this.config.anchor, false), dev = await this.device(), { p, digest } = pq.latest(s);
-    this.config.pin = { n: p.n, digest };
-    this.config.admin = p.admin === dev.id;
-    this.config.others = Object.entries(p.members).filter(([id2]) => id2 !== dev.id).map(([id2, m]) => ({ id: id2, name: m.name }));
-    if (p.members[dev.id]) delete this.config.request;
-    await this.saveData(this.config);
-  }
-  async request(anchor) {
-    if (this.config.anchor && this.config.anchor !== anchor) throw Error("\u5E93\u6307\u7EB9\u4E0D\u5339\u914D\u3002");
-    const { dav, s, device } = await this.context(anchor);
-    if (pq.latest(s).p.members[device.id]) throw Error("\u8FD9\u53F0\u8BBE\u5907\u5DF2\u83B7\u6388\u6743\uFF0C\u53EF\u4EE5\u76F4\u63A5\u540C\u6B65\u3002");
-    const code = await pq.requestPair(dav, s, device, this.config.name);
-    Object.assign(this.config, { anchor, request: code });
-    await this.refresh();
-    return code;
-  }
-  async approve(code) {
-    const { dav, s, device } = await this.context();
-    const target = await pq.readRequest(dav, s, code);
-    await pq.nextPolicy(this.ledger.bind(this), s, device, "approve", target);
-    await this.refresh();
-    return target.id;
-  }
-  async sealHistory() {
-    await this.change("seal-history");
-  }
-  async revoke(id2) {
-    await this.change("revoke", id2);
-  }
-  async change(action, arg) {
-    await pq.nextPolicy(this.ledger.bind(this), await this.snapshot(this.config.anchor, false), await this.device(), action, arg);
-    await this.refresh();
-  }
-  pendingRecovery() {
-    return this.secret("pending-root") || "";
-  }
-  async recoveryKit(input) {
-    const fields = input.split(".");
-    if (fields.length > 2) throw Error("\u65E0\u6548\u7684\u6062\u590D\u5305\u3002");
-    const rec = await pq.identity(fields.at(-1), "recovery");
-    const anchor = fields.length === 1 ? rec.id : fields[0];
-    if (!/^[a-f0-9]{32}$/.test(anchor) || this.config.anchor && this.config.anchor !== anchor) throw Error("\u6062\u590D\u8EAB\u4EFD\u4E0E\u672C\u5E93\u4E0D\u7B26\u3002");
-    return { anchor, rec };
-  }
-  async replacementKit(input, seed) {
-    const { anchor } = await this.recoveryKit(input);
-    return anchor + "." + seed;
-  }
-  async restore(input, replacement) {
-    const { rec, anchor } = await this.recoveryKit(input), s = await this.snapshot(anchor, false);
-    if (!replacement || replacement === input.split(".").at(-1)) throw Error("\u8BF7\u79BB\u7EBF\u4FDD\u5B58\u65B0\u7684\u968F\u673A\u6062\u590D\u7801\u3002");
-    const newRoot = await pq.identity(replacement, "recovery");
-    const existing = this.pendingRecovery(), pending = this.secret("pending-device");
-    const resume = existing === replacement && pending && await pq.publicId(pq.latest(s).p.recovery) === newRoot.id;
-    if (!resume && await pq.publicId(pq.latest(s).p.recovery) !== rec.id) throw Error("\u6062\u590D\u8EAB\u4EFD\u5DF2\u5931\u6548\u3002");
-    const seed = existing === replacement && pending || pq.freshSeed();
-    const dev = await pq.identity(seed, "device");
-    this.secret("pending-device", seed);
-    this.secret("pending-root", replacement);
-    if (!resume) {
-      await pq.nextPolicy(this.ledger.bind(this), s, rec, "restore", { id: dev.id, pub: pq.publicDevice(dev, this.config.name), recovery: newRoot.pub });
-    } else if (pq.latest(s).p.admin !== dev.id) throw Error("\u6062\u590D\u4E8B\u52A1\u4E0E\u5F53\u524D\u7BA1\u7406\u5458\u4E0D\u7B26\u3002");
-    this.secret("device", seed);
-    this.keys = dev;
-    this.config.anchor = anchor;
-    this.config.integrity = "\u7BA1\u7406\u5458\u5DF2\u63A5\u7BA1\uFF0C\u5C1A\u672A\u5B8C\u6210\u6570\u636E\u6821\u9A8C\u3002";
-    await this.refresh();
-    this.secret("pending-root", "");
-    this.secret("pending-device", "");
-    return this.verifyRecovery();
-  }
-  async verifyRecovery() {
-    let report;
-    try {
-      const { s, dav, device } = await this.context();
-      const store = await pq.storeFor(this.ledger.bind(this), dav, s, device);
-      report = await pq.auditData(store);
-      this.config.integrity = report.faults.length ? "\u5DF2\u63A5\u7BA1\uFF0C\u6570\u636E\u4E0D\u5B8C\u6574\uFF1A" + report.faults.map((f) => f.path + " [" + f.id + "]").join("\uFF0C") : "\u5DF2\u6821\u9A8C " + report.checked + " \u6761\u5386\u53F2\u4FEE\u8BA2\u53CA\u5BF9\u5E94\u6B63\u6587\u3002";
-    } catch (e) {
-      this.config.integrity = "\u5DF2\u63A5\u7BA1\uFF0C\u6570\u636E\u6821\u9A8C\u5931\u8D25\uFF1A" + e.message;
-      report = { faults: [{ path: e.path, id: e.id, error: e.message }] };
-    }
-    await this.saveData(this.config);
-    return report;
-  }
-  async sync() {
-    const { dav, device, s, route } = await this.context(), last = pq.latest(s);
-    if (!last.p.members[device.id]) {
-      await this.refresh(s);
-      throw Error("\u6B64\u8BBE\u5907\u672A\u83B7\u6388\u6743\uFF0C\u6216\u5DF2\u88AB\u64A4\u9500\u3002\u8BF7\u5728\u8BBE\u7F6E\u4E2D\u91CD\u65B0\u7533\u8BF7\u914D\u5BF9\u3002");
-    }
-    const store = await pq.storeFor(this.ledger.bind(this), dav, s, device);
-    this.config.pin = { n: last.p.n, digest: last.digest };
-    delete this.config.request;
-    await this.saveData(this.config);
-    const id2 = "hbpqc-baseline-" + this.config.anchor;
-    const r = await core.synchronize({
-      store,
-      local: new VaultFiles(this.app),
-      baseline: new Map(this.app.loadLocalStorage(id2) || []),
-      cache: /* @__PURE__ */ new Map(),
-      checkpoint: (m) => this.app.saveLocalStorage(id2, [...m]),
-      active: () => !this.closed
-    });
-    return { route, sent: r.sent, received: r.received, conflicts: r.conflicts };
-  }
-  onunload() {
-    this.closed = true;
   }
 };
 /*! Bundled license information:

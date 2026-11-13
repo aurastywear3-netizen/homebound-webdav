@@ -156,7 +156,10 @@ test("11: recovery can resume on the same device after an accepted rotation lose
     await pq.genesis(isolated.ledger,f.owner,"Original",rec,isolated.bootstrap);
     const secrets=new Map();
     const instance=drop=>{
-        const p=new mockModule.exports();
+        const host=new mockModule.exports();
+        host.app={loadLocalStorage:()=>null,saveLocalStorage(){}};
+        host.mode="legacy";host.selectMode("pqc");
+        const p=host.pqc;
         p.config={name:"Replacement",anchor:rec.id};
         p.secret=(key,value)=>{if(value!==undefined)secrets.set(key,value);return secrets.get(key);};
         p.saveData=async()=>{};
@@ -262,14 +265,29 @@ test("14: full 32-member roster still permits revocation and recovery, compact r
     assert.deepEqual((await pq.auditData(await pq.storeFor(f.ledger,f.dav,s,device))).faults,[]);
 });
 
-test("15: misplaced preview refuses the stable plugin ID and stable settings before any write",async()=>{
+test("15: official-ID candidate preserves legacy settings and opens PQC only after an explicit selection",async()=>{
     const bundle=await fs.readFile(require.resolve("../main.js"),"utf8");
     const mock={exports:{}};
-    new Function("module","require",bundle)(mock,()=>({Plugin:class{},PluginSettingTab:class{},Modal:class{}}));
-    for(const [id,data] of [["homebound-webdav",null],["homebound-webdav-pqc-preview",{id:"old",secretId:"legacy-binding"}]]){
-        const plugin=new mock.exports();
-        plugin.manifest={id};plugin.loadData=async()=>data;
-        plugin.saveData=async()=>assert.fail("modified legacy settings");
-        await assert.rejects(plugin.onload(),/正式版/);
-    }
+    new Function("module","require",bundle)(mock,()=>({Plugin:class{},PluginSettingTab:class{},Modal:class{},getLanguage:()=>"en"}));
+    const values=new Map(), legacy={id:"legacy-id",secretId:"key",auto:true,folder:"notes"};
+    const plugin=new mock.exports();plugin.manifest={id:"homebound-webdav"};
+    plugin.loadData=async()=>({...legacy});plugin.saveData=async()=>assert.fail("rewrote 0.1.1 settings");
+    plugin.app={vault:{getName:()=>"vault"},workspace:{onLayoutReady(){}},loadLocalStorage:k=>values.get(k),
+        saveLocalStorage:(k,v)=>values.set(k,v)};
+    plugin.addCommand=plugin.addSettingTab=plugin.registerDomEvent=plugin.registerInterval=()=>{};
+    const globals={window:global.window,document:global.document};
+    global.window={setInterval:()=>0};global.document={};
+    try{
+        await plugin.onload();
+        assert.equal(plugin.mode,"legacy");assert.equal(plugin.config.secretId,"key");
+        assert.equal(values.size,0);assert.equal(plugin.pqc,undefined);
+        plugin.busy=true;assert.throws(()=>plugin.selectMode("pqc"),/Finish/);plugin.busy=false;
+        plugin.selectMode("pqc");
+        const identity=plugin.pqc.config.local;
+        assert.ok(identity);assert.equal(plugin.pqc.config.request,undefined);assert.equal(plugin.pqc.config.anchor,undefined);
+        const previous=plugin.pqc;plugin.selectMode("legacy");
+        await assert.rejects(previous.exclusive(async()=>{}),/关闭/);
+        plugin.selectMode("pqc");assert.equal(plugin.pqc.config.local,identity);
+        assert.equal(plugin.config.id,legacy.id);assert.equal(plugin.config.auto,true);
+    }finally{Object.assign(global,globals);}
 });

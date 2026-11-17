@@ -1,6 +1,6 @@
 # 在外网连回自己的 WebDAV
 
-手机或 iPad 在外面时访问自己的 HTTPS 域名。VPS 上的 Caddy 把请求交给一条反向 SSH 隧道，隧道从 WebDAV 所在网络主动建立。家里无需公网 IP，也无需打开路由器的入站端口。局域网客户端直接连接 WebDAV。两条路径需要指向相同的 WebDAV 根目录。
+手机或 iPad 在外面时访问自己的 HTTPS 域名。VPS 上的 Caddy 把请求交给一条反向 SSH 隧道，隧道从 WebDAV 所在网络主动建立。家里无需公网 IP，也无需打开路由器的入站端口。家庭 Wi-Fi 和蜂窝网络上的客户端均通过同一 VPS 域名访问。
 
 ## 所需设备
 
@@ -51,13 +51,13 @@ SSH_TARGET=homebound-tunnel@vps.example.net
 
 将签发 WebDAV 证书的 CA **公钥证书**放在 VPS 的 `/etc/caddy/webdav-ca.pem`，让 Caddy 有读取权限。使用同目录的 `Caddyfile` 站点配置。在 Caddy 服务环境中设置 `DAV_PUBLIC_HOST` 为公网域名，`DAV_TLS_NAME` 为 WebDAV 证书中有效的 DNS 名或 IP。域名解析到 VPS，并允许 Caddy 接收公网 HTTPS 流量及完成证书签发。
 
-检查配置，再用现有 Caddy 服务加载站点。使用本示例时，两端 URL 中的 WebDAV 路径前缀保持一致。VPS 上不要将 `30443` 直接发布到公网。公网入口以家庭 WebDAV 的账号规则鉴权，部署前请确认匿名访问会返回 401 或 403。
+使用 PQC 时，为每个库运行独立的 `witness/server.py` 实例。示例把 POST 请求按固定路径交给监听回环地址的提交服务。若客户端填写 `https://dav.example.net/personal`，请设置 `PQC_LEDGER_PATH=/personal/homebound-pqc-ledger`、`PQC_LEDGER_PORT` 为该库的服务端口，并在 WebDAV 根下准备好 `personal` 目录。WebDAV 的 Basic 登录凭据和提交服务的 Bearer 授权分别转交对应的服务。检查配置，再用现有 Caddy 服务加载站点。使用本示例时，两端 URL 中的 WebDAV 路径前缀保持一致。VPS 上不要将 `30443` 直接发布到公网。公网入口以家庭 WebDAV 的账号规则鉴权，部署前请确认匿名访问会返回 401 或 403。
 
 ## 4. 用测试库确认来回同步
 
-1. 连上家庭网络，在插件中填写局域网地址与外网地址，在空目录创建加密库。
-2. 在家创建一条测试笔记并点“立即同步”，结果应显示 LAN。
-3. 手机切换为蜂窝网络，再次同步，结果应显示 VPS/VPN。在手机修改笔记并同步。
+1. 连上家庭网络，在插件中填写 VPS 的 WebDAV 地址，在空目录创建加密库。
+2. 在家创建一条测试笔记并点“立即同步”，结果应显示 WebDAV。
+3. 手机切换为蜂窝网络，再次同步，结果也应显示 WebDAV。在手机修改笔记并同步。
 4. 回到家，在另一台设备同步，核对修改已出现。
 5. 临时断开隧道时，在外网的同步应报错。恢复后再同步，已有库保持同一身份。笔记内容、标题、附件均以客户端加密格式经过 VPS，连接时间、数据量及 WebDAV 登录信息对 HTTPS 网关可见。
 

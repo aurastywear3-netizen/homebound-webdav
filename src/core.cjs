@@ -24,6 +24,18 @@ function directory(input) {
     return path;
 }
 
+function gatewayAddress(config) {
+    return config.address ?? config.away ?? "";
+}
+
+function gatewayUrl(input) {
+    if (typeof input !== "string" || !input.trim()) throw Error("请填写 WebDAV 地址（VPS 的 HTTPS 地址）。");
+    let url;
+    try { url = endpoint(input); } catch { throw Error("WebDAV 地址无效，请填写完整的 HTTPS 地址。"); }
+    if (!url.startsWith("https://")) throw Error("WebDAV 地址必须使用 HTTPS。");
+    return url;
+}
+
 function endpoint(input) {
     const url = new URL(input.trim());
     const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
@@ -70,7 +82,7 @@ async function newHeader(passphrase) {
 async function unlock(header, passphrase, pinned) {
     if (header?.format !== 1 || !idPattern.test(header.id) || !idPattern.test(header.salt) ||
         !/^[0-9a-f]{66}$/.test(header.proof)) throw Error("Unrecognized WebDAV vault header.");
-    if (pinned && pinned !== header.id) throw Error("This address leads to a different vault. Check both routes.");
+    if (pinned && pinned !== header.id) throw Error("This address leads to a different vault. Check the WebDAV address.");
     const key = await derive(passphrase, header.salt);
     try {
         const proof = Uint8Array.from(header.proof.match(/../g), pair => parseInt(pair, 16));
@@ -304,5 +316,5 @@ async function createVault(home, folder, passphrase, namespace) {
     return header;
 }
 
-module.exports = { createVault, Store, synchronize, headsByPath, safePath, isRecovery, conflictFolder, directory, endpoint, encodePath,
+module.exports = { createVault, Store, synchronize, headsByPath, safePath, isRecovery, conflictFolder, directory, endpoint, gatewayAddress, gatewayUrl, encodePath,
     newHeader, unlock, randomId, sha, jsonBytes, parseBytes, seal, unseal };

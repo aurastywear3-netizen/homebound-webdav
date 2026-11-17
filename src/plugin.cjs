@@ -20,28 +20,18 @@ async function probe(dav, milliseconds) {
 
 async function connect(config, password, passphrase, transfer) {
     const auth = credentials(config.username, password);
-    const addresses = [[config.home, "LAN"]];
-    if (config.away && config.away !== config.home) addresses.push([config.away, "VPS/VPN"]);
-    for (const [index, [address, route]] of addresses.entries()) {
-        const dav = new Dav(address, auth).child(config.folder).child(namespace);
-        let header;
-        try { header = await probe(dav, index === 0 && addresses.length > 1 ? 2500 : 15000); }
-        catch (error) {
-            if (error.offline && index + 1 < addresses.length) continue;
-            throw error;
-        }
-        const key = await core.unlock(header, passphrase, config.id);
-        return { store: new core.Store(dav, header.id, key, transfer), route };
-    }
+    const dav = new Dav(core.gatewayUrl(config.address), auth).child(config.folder).child(namespace);
+    const header = await probe(dav, 15000);
+    const key = await core.unlock(header, passphrase, config.id);
+    return { store: new core.Store(dav, header.id, key, transfer), route: "WebDAV" };
 }
 
 class ConfirmFolder extends Modal {
     constructor(app, config, create, done) { super(app); Object.assign(this, { config, create, done }); }
     onOpen() {
         this.setTitle(this.create ? tr("Create encrypted vault?", "创建加密库？") : tr("Use this remote folder?", "使用这个远端目录？"));
-        this.contentEl.createEl("p", { text: this.config.home + "/" + core.encodePath(this.config.folder) });
-        if (this.config.away) this.contentEl.createEl("p", { text: this.config.away + "/" + core.encodePath(this.config.folder) });
-        this.contentEl.createEl("p", { text: this.create ? tr("Creates a new encrypted vault in an empty folder using the LAN address.", "通过局域网地址，在空目录中创建新加密库。") :
+        this.contentEl.createEl("p", { text: this.config.address + "/" + core.encodePath(this.config.folder) });
+        this.contentEl.createEl("p", { text: this.create ? tr("Creates a new encrypted vault in an empty folder through the WebDAV gateway.", "通过 WebDAV 网关，在空目录中创建新加密库。") :
             tr("Verifies the passphrase and saves this vault on this device.", "验证加密口令后，将这个库绑定到当前设备。") });
         new Setting(this.contentEl)
             .addButton(b => b.setButtonText(tr("Cancel", "取消")).onClick(() => this.close()))
@@ -78,8 +68,7 @@ class HomeboundSettings extends PluginSettingTab {
         let password = "", passphrase = "";
         const field = (label, key, hint, placeholder) => new Setting(el).setClass("homebound-field").setName(label).setDesc(hint)
             .addText(t => t.setValue(draft[key] || "").setPlaceholder(placeholder).onChange(v => { draft[key] = v; }));
-        field(tr("LAN WebDAV address", "局域网 WebDAV 地址"), "home", tr("Use the server’s HTTPS address.", "填写服务器的 HTTPS 地址。"), "https://nas.example.net/dav");
-        field(tr("Away WebDAV address", "外网 WebDAV 地址"), "away", tr("Optional HTTPS gateway to the same server.", "可选。填写转发到同一台服务器的 HTTPS 地址。"), "https://dav.example.net/dav");
+        field(tr("WebDAV address", "WebDAV 地址"), "address", tr("Use the same HTTPS gateway on every network.", "在家和外出都使用这个 HTTPS 网关。"), "https://dav.example.net");
         field(tr("Remote folder", "远端目录"), "folder", tr("Type the folder name as written, including spaces or Chinese characters.", "可直接输入中文、空格和多级目录。"), "笔记/我的知识库");
         field(tr("WebDAV username", "WebDAV 用户名"), "username", "", "");
         const secret = (label, cb) => new Setting(el).setClass("homebound-field").setName(label)
@@ -89,7 +78,8 @@ class HomeboundSettings extends PluginSettingTab {
         secret(tr("Vault encryption passphrase", "笔记库加密口令"), value => { passphrase = value; });
         const review = create => {
             try {
-                const config = { ...draft, home: core.endpoint(draft.home), away: draft.away.trim() ? core.endpoint(draft.away) : "",
+                const address = core.gatewayUrl(draft.address);
+                const config = { ...draft, address, home: address, away: address,
                     folder: core.directory(draft.folder), username: draft.username.trim() };
                 const changedFolder = config.folder !== p.config.folder;
                 if (create || changedFolder) config.id = "";
@@ -115,6 +105,7 @@ module.exports = class HomeboundPlugin extends Plugin {
         this.cache = new Map();
         this.config = { home: "", away: "", folder: this.app.vault.getName(), username: "", id: "", auto: false,
             ...await this.loadData() };
+        this.config.address = core.gatewayAddress(this.config);
         if (this.manifest.id !== "homebound-webdav") throw Error("Install this candidate as Homebound WebDAV.");
         this.transfer = new ChunkTransfer(new TransferCache(this.app.appId), {
             enabled: this.app.loadLocalStorage("homebound-chunk-upload") === true,
@@ -190,7 +181,7 @@ module.exports = class HomeboundPlugin extends Plugin {
             const phrase = enteredPhrase || this.secret("vault");
             if (!phrase || (create && phrase.length < 12)) throw Error(tr("Use a vault passphrase of at least 12 characters when creating a vault.", "创建新库请使用至少 12 个字符的加密口令。"));
             if (create) {
-                const header = await core.createVault(new Dav(config.home, credentials(config.username, password)), config.folder, phrase, namespace);
+                const header = await core.createVault(new Dav(config.address, credentials(config.username, password)), config.folder, phrase, namespace);
                 config.id = header.id;
             }
             const { store } = await connect(config, password, phrase);

@@ -26,9 +26,7 @@ function displaySettings(el,p,app,redraw){
             catch(e){redraw();notice(e);}
         }));
         el.createEl("p",{text:"PQC 远端目录："+folder});
-        field("局域网 WebDAV 地址",c.home,v=>c.home=v);
-        field("外网 WebDAV 地址",c.away,v=>c.away=v);
-        field("可信提交服务 HTTPS 地址",c.witness,v=>c.witness=v);
+        field("WebDAV 地址",c.address,v=>c.address=v);
         field("WebDAV 用户名",c.username,v=>c.username=v);
         field("WebDAV 密码（留空沿用）","",v=>password=v,true);
         field("这台设备的名称",c.name,v=>c.name=v);
@@ -36,7 +34,8 @@ function displaySettings(el,p,app,redraw){
         if(p.config.anchor)el.createEl("p",{text:"库指纹："+p.config.anchor});
         if(!p.config.anchor){
             field("建库授权（服务部署者提供）","",v=>bootstrap=v,true);
-            button("在局域网创建 PQC 库",async()=>{
+            button("创建 PQC 库",async()=>{
+                await p.configure(c,password);
                 const seed=pq.freshSeed();
                 // Save the recovery material before creating the remote vault.
                 const out=new Output(app,"先离线保存恢复码，然后确认创建",seed);
@@ -92,6 +91,7 @@ class PqcMode{
         const saved=app.loadLocalStorage("homebound-webdav-pqc-config");
         if(saved && saved.format!==2)throw Error("无法识别此设备的 PQC 配置。");
         this.config={format:2,home:"",away:"",witness:"",username:"",name:"我的设备",...saved};
+        this.config.address=core.gatewayAddress(this.config);
         if(!this.config.local){this.config.local=core.randomId();this.saveData(this.config);}
     }
     saveData(data){this.app.saveLocalStorage("homebound-webdav-pqc-config",data);}
@@ -102,52 +102,86 @@ class PqcMode{
         if(v!==undefined)s.setSecret(id,v);
         return s.getSecret(id);
     }
+    ledgerAddress(address){
+        const base=core.gatewayUrl(address);
+        if(this.config.anchor){
+            // Existing devices trust a particular service. Keep its exact URL and trust boundary.
+            const pinned=core.gatewayUrl(this.config.witness);
+            if(new URL(base).origin!==new URL(pinned).origin)
+                throw Error("此库已绑定可信提交服务。请使用该服务所在的 HTTPS 网关，并在同一网关转发 WebDAV。");
+            return pinned;
+        }
+        return base+"/homebound-pqc-ledger";
+    }
+    bindAnchor(anchor){
+        if(this.config.anchor===anchor)return;
+        if(this.config.anchor)throw Error("库指纹不匹配。");
+        this.config.witness=this.ledgerAddress(this.config.address);
+        this.config.anchor=anchor;
+    }
     async configure(c,password){
-        const home=core.endpoint(c.home),away=c.away?core.endpoint(c.away):"";
-        const witness=core.endpoint(c.witness);
-        if(!witness.startsWith("https://") || (this.config.anchor&&this.config.witness!==witness))throw Error("可信提交服务需使用建库时核对的 HTTPS 地址。");
-        Object.assign(this.config,{home,away,witness,name:c.name.trim(),username:c.username.trim()});
+        const address=core.gatewayUrl(c.address), witness=this.ledgerAddress(address);
+        // Older plugin versions can open the same gateway and use their original secret IDs.
+        Object.assign(this.config,{address,home:address,away:address,witness,name:c.name.trim(),username:c.username.trim()});
         if(password)this.secret("dav",password);await this.saveData(this.config);
     }
     async device(){
         if(!this.keys){let seed=this.secret("device");if(!seed){seed=pq.freshSeed();this.secret("device",seed);}this.keys=await pq.identity(seed,"device");}
         return this.keys;
     }
-    base(url){return new Dav(core.endpoint(url),credentials(this.config.username,this.secret("dav")));}
+    base(){
+        const address=core.gatewayUrl(this.config.address);
+        this.ledgerAddress(address);
+        return new Dav(address,credentials(this.config.username,this.secret("dav")));
+    }
     async route(){
-        const c=this.config;
-        for(const [i,url] of [c.home,c.away].entries()){
-            const dav=this.base(url).child(folder).child(namespace);
-            let timer;
-            try{
-                await Promise.race([dav.read("vault.json"),new Promise((_,reject)=>{
-                    timer=setTimeout(()=>reject(Object.assign(Error("连接超时"),{offline:true})),i===0&&c.away?3000:16000);
-                })]);return {dav,route:i?"VPS/VPN":"LAN"};
-            }catch(e){if(i||!e.offline||!c.away)throw e;}finally{clearTimeout(timer);}
-        }
+        const dav=this.base().child(folder).child(namespace);
+        let timer;
+        try{
+            const bytes=await Promise.race([dav.read("vault.json"),new Promise((_,reject)=>{
+                timer=setTimeout(()=>reject(Error("WebDAV 网关连接超时。")),16000);
+            })]);
+            return {dav,marker:core.parseBytes(bytes),route:"WebDAV"};
+        }finally{clearTimeout(timer);}
     }
     async create(seed,bootstrap){
-        const rec=await pq.identity(seed,"recovery"), dev=await this.device(), home=this.base(this.config.home), dir=home.child(folder);
+        const rec=await pq.identity(seed,"recovery"), dev=await this.device(), home=this.base(), dir=home.child(folder);
         try{await home.mkdir(folder);}catch(e){if(e.status!==405)throw e;}
         const known=await dir.list();
         if(known.some(x=>x!==namespace))throw Error("新测试目录包含其他文件。");
         const dav=dir.child(namespace);
         if(!known.length)await dir.mkdir(namespace);
+        try{
+            const marker=core.parseBytes(await dav.read("vault.json"));
+            if(marker.format!==2||marker.anchor!==rec.id)throw Error("此 WebDAV 目录已有 PQC 库，请用库指纹配对或选择新库地址。");
+        }catch(e){if(e.status!==404)throw e;}
         for(const name of ["objects","requests"])try{await dav.mkdir(name);}catch(e){if(e.status!==405)throw e;}
         let live;
-        try{live=await pq.state(this.ledger.bind(this),rec.id);}catch(e){if(e.status!==404)throw e;}
+        try{live=await pq.state(this.ledger.bind(this),rec.id);}catch(e){if(!e.uninitialized)throw e;}
         if(live){
             if(live.policies.length!==1||pq.latest(live).p.admin!==dev.id)throw Error("服务已绑定到另一管理员。");
         }else await pq.genesis(this.ledger.bind(this),dev,this.config.name,rec,bootstrap);
-        await dav.put("vault.json",core.jsonBytes({format:2,anchor:rec.id}).buffer);
-        this.config.anchor=rec.id;await this.refresh();return rec.id;
+        const marker=core.jsonBytes({format:2,anchor:rec.id}).buffer;
+        try{
+            await dav.call("PUT","vault.json",[200,201,204],{body:marker,contentType:"application/octet-stream",headers:{"If-None-Match":"*"}});
+        }catch(e){
+            if(e.status!==412)throw e;
+            const current=core.parseBytes(await dav.read("vault.json"));
+            if(current.format!==2||current.anchor!==rec.id)throw Error("此 WebDAV 目录已绑定其他 PQC 库。");
+        }
+        this.bindAnchor(rec.id);await this.refresh();return rec.id;
     }
     async ledger(method,data,token){
         const nonce=core.randomId(), headers={"Cache-Control":"no-store"};
         if(token)headers.Authorization="Bearer "+token;
-        const response=await requestUrl({url:this.config.witness+"/"+method,method:"POST",headers,
+        const response=await requestUrl({url:this.ledgerAddress(this.config.address)+"/"+method,method:"POST",headers,
             contentType:"application/json",body:JSON.stringify({...data,transportNonce:nonce}),throw:false});
         if(response.status!==200){
+            if(method==="state" && response.status===404){
+                let detail;try{detail=response.json;}catch{}
+                if(detail?.error==="Uninitialized")throw Object.assign(Error("此提交服务尚未建库。"),{status:404,uninitialized:true});
+                throw Error("此 WebDAV 地址尚未配置 PQC 提交服务，请检查网关路径。");
+            }
             const msg=({403:"未获授权、已撤销或恢复码失效",404:"请求不存在",409:"授权已变化，请重新同步或配对",426:"管理员逐修订换钥需要升级插件和可信提交服务"})[response.status]||"可信提交服务不可用";
             throw Object.assign(Error(msg+" ("+response.status+")"),{status:response.status});
         }
@@ -156,8 +190,8 @@ class PqcMode{
     async snapshot(anchor=this.config.anchor,withRevisions=true){return pq.state(this.ledger.bind(this),anchor,this.config.pin,withRevisions);}
     async context(anchor=this.config.anchor){
         const [s,r]=await Promise.all([this.snapshot(anchor),this.route()]);
-        const marker=core.parseBytes(await r.dav.read("vault.json"));
-        if(marker.format!==2||marker.anchor!==anchor)throw Error("WebDAV 指向另一测试库。");
+        const marker=r.marker;
+        if(marker.format!==2||marker.anchor!==anchor)throw Error("WebDAV 地址指向另一个库。");
         return {...r,s,device:await this.device()};
     }
     async refresh(snapshot){
@@ -172,7 +206,7 @@ class PqcMode{
         const {dav,s,device}=await this.context(anchor);
         if(pq.latest(s).p.members[device.id])throw Error("这台设备已获授权，可以直接同步。");
         const code=await pq.requestPair(dav,s,device,this.config.name);
-        Object.assign(this.config,{anchor,request:code});await this.refresh();return code;
+        this.bindAnchor(anchor);this.config.request=code;await this.refresh();return code;
     }
     async approve(code){
         const {dav,s,device}=await this.context();
@@ -208,7 +242,7 @@ class PqcMode{
         if(!resume){
             await pq.nextPolicy(this.ledger.bind(this),s,rec,"restore",{id:dev.id,pub:pq.publicDevice(dev,this.config.name),recovery:newRoot.pub});
         }else if(pq.latest(s).p.admin!==dev.id)throw Error("恢复事务与当前管理员不符。");
-        this.secret("device",seed);this.keys=dev;this.config.anchor=anchor;
+        this.secret("device",seed);this.keys=dev;this.bindAnchor(anchor);
         this.config.integrity="管理员已接管，尚未完成数据校验。";
         await this.refresh();this.secret("pending-root","");this.secret("pending-device","");
         return this.verifyRecovery();

@@ -1,11 +1,26 @@
 # Public HTTPS endpoint on the VPS. Set DAV_PUBLIC_HOST and DAV_TLS_NAME
 # in the Caddy service environment. DAV_TLS_NAME must match the LAN certificate.
 {$DAV_PUBLIC_HOST} {
-    reverse_proxy https://127.0.0.1:30443 {
-        header_up Host {$DAV_TLS_NAME}
-        transport http {
-            tls_server_name {$DAV_TLS_NAME}
-            tls_trust_pool file /etc/caddy/webdav-ca.pem
+    # Set PQC_LEDGER_PATH to the WebDAV base path plus /homebound-pqc-ledger.
+    handle_path {$PQC_LEDGER_PATH:/homebound-pqc-ledger}/* {
+        @ledger {
+            method POST
+            path /state /policy /commit
+        }
+        handle @ledger {
+            reverse_proxy 127.0.0.1:{$PQC_LEDGER_PORT:30447}
+        }
+        handle {
+            respond 404
+        }
+    }
+    handle {
+        reverse_proxy https://127.0.0.1:30443 {
+            header_up Host {$DAV_TLS_NAME}
+            transport http {
+                tls_server_name {$DAV_TLS_NAME}
+                tls_trust_pool file /etc/caddy/webdav-ca.pem
+            }
         }
     }
 }

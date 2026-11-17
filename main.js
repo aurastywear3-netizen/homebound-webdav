@@ -146,6 +146,20 @@ var require_core = __commonJS({
       if (!safePath(path)) throw Error("Enter a folder such as Notes/\u6211\u7684\u7B14\u8BB0. Use / between folder names.");
       return path;
     }
+    function gatewayAddress(config) {
+      return config.address ?? config.away ?? "";
+    }
+    function gatewayUrl(input) {
+      if (typeof input !== "string" || !input.trim()) throw Error("\u8BF7\u586B\u5199 WebDAV \u5730\u5740\uFF08VPS \u7684 HTTPS \u5730\u5740\uFF09\u3002");
+      let url;
+      try {
+        url = endpoint(input);
+      } catch {
+        throw Error("WebDAV \u5730\u5740\u65E0\u6548\uFF0C\u8BF7\u586B\u5199\u5B8C\u6574\u7684 HTTPS \u5730\u5740\u3002");
+      }
+      if (!url.startsWith("https://")) throw Error("WebDAV \u5730\u5740\u5FC5\u987B\u4F7F\u7528 HTTPS\u3002");
+      return url;
+    }
     function endpoint(input) {
       const url = new URL(input.trim());
       const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
@@ -192,7 +206,7 @@ var require_core = __commonJS({
     }
     async function unlock(header, passphrase, pinned) {
       if (header?.format !== 1 || !idPattern.test(header.id) || !idPattern.test(header.salt) || !/^[0-9a-f]{66}$/.test(header.proof)) throw Error("Unrecognized WebDAV vault header.");
-      if (pinned && pinned !== header.id) throw Error("This address leads to a different vault. Check both routes.");
+      if (pinned && pinned !== header.id) throw Error("This address leads to a different vault. Check the WebDAV address.");
       const key = await derive(passphrase, header.salt);
       try {
         const proof = Uint8Array.from(header.proof.match(/../g), (pair) => parseInt(pair, 16));
@@ -431,6 +445,8 @@ var require_core = __commonJS({
       conflictFolder,
       directory,
       endpoint,
+      gatewayAddress,
+      gatewayUrl,
       encodePath,
       newHeader,
       unlock,
@@ -2983,9 +2999,7 @@ var require_pqc_mode = __commonJS({
         }
       }));
       el.createEl("p", { text: "PQC \u8FDC\u7AEF\u76EE\u5F55\uFF1A" + folder });
-      field("\u5C40\u57DF\u7F51 WebDAV \u5730\u5740", c.home, (v) => c.home = v);
-      field("\u5916\u7F51 WebDAV \u5730\u5740", c.away, (v) => c.away = v);
-      field("\u53EF\u4FE1\u63D0\u4EA4\u670D\u52A1 HTTPS \u5730\u5740", c.witness, (v) => c.witness = v);
+      field("WebDAV \u5730\u5740", c.address, (v) => c.address = v);
       field("WebDAV \u7528\u6237\u540D", c.username, (v) => c.username = v);
       field("WebDAV \u5BC6\u7801\uFF08\u7559\u7A7A\u6CBF\u7528\uFF09", "", (v) => password = v, true);
       field("\u8FD9\u53F0\u8BBE\u5907\u7684\u540D\u79F0", c.name, (v) => c.name = v);
@@ -2993,7 +3007,8 @@ var require_pqc_mode = __commonJS({
       if (p.config.anchor) el.createEl("p", { text: "\u5E93\u6307\u7EB9\uFF1A" + p.config.anchor });
       if (!p.config.anchor) {
         field("\u5EFA\u5E93\u6388\u6743\uFF08\u670D\u52A1\u90E8\u7F72\u8005\u63D0\u4F9B\uFF09", "", (v) => bootstrap = v, true);
-        button("\u5728\u5C40\u57DF\u7F51\u521B\u5EFA PQC \u5E93", async () => {
+        button("\u521B\u5EFA PQC \u5E93", async () => {
+          await p.configure(c, password);
           const seed = pq.freshSeed();
           const out = new Output(app, "\u5148\u79BB\u7EBF\u4FDD\u5B58\u6062\u590D\u7801\uFF0C\u7136\u540E\u786E\u8BA4\u521B\u5EFA", seed);
           const previous = out.onOpen.bind(out);
@@ -3078,6 +3093,7 @@ var require_pqc_mode = __commonJS({
         const saved = app.loadLocalStorage("homebound-webdav-pqc-config");
         if (saved && saved.format !== 2) throw Error("\u65E0\u6CD5\u8BC6\u522B\u6B64\u8BBE\u5907\u7684 PQC \u914D\u7F6E\u3002");
         this.config = { format: 2, home: "", away: "", witness: "", username: "", name: "\u6211\u7684\u8BBE\u5907", ...saved };
+        this.config.address = core2.gatewayAddress(this.config);
         if (!this.config.local) {
           this.config.local = core2.randomId();
           this.saveData(this.config);
@@ -3105,11 +3121,25 @@ var require_pqc_mode = __commonJS({
         if (v !== void 0) s.setSecret(id2, v);
         return s.getSecret(id2);
       }
+      ledgerAddress(address) {
+        const base = core2.gatewayUrl(address);
+        if (this.config.anchor) {
+          const pinned = core2.gatewayUrl(this.config.witness);
+          if (new URL(base).origin !== new URL(pinned).origin)
+            throw Error("\u6B64\u5E93\u5DF2\u7ED1\u5B9A\u53EF\u4FE1\u63D0\u4EA4\u670D\u52A1\u3002\u8BF7\u4F7F\u7528\u8BE5\u670D\u52A1\u6240\u5728\u7684 HTTPS \u7F51\u5173\uFF0C\u5E76\u5728\u540C\u4E00\u7F51\u5173\u8F6C\u53D1 WebDAV\u3002");
+          return pinned;
+        }
+        return base + "/homebound-pqc-ledger";
+      }
+      bindAnchor(anchor) {
+        if (this.config.anchor === anchor) return;
+        if (this.config.anchor) throw Error("\u5E93\u6307\u7EB9\u4E0D\u5339\u914D\u3002");
+        this.config.witness = this.ledgerAddress(this.config.address);
+        this.config.anchor = anchor;
+      }
       async configure(c, password) {
-        const home = core2.endpoint(c.home), away = c.away ? core2.endpoint(c.away) : "";
-        const witness = core2.endpoint(c.witness);
-        if (!witness.startsWith("https://") || this.config.anchor && this.config.witness !== witness) throw Error("\u53EF\u4FE1\u63D0\u4EA4\u670D\u52A1\u9700\u4F7F\u7528\u5EFA\u5E93\u65F6\u6838\u5BF9\u7684 HTTPS \u5730\u5740\u3002");
-        Object.assign(this.config, { home, away, witness, name: c.name.trim(), username: c.username.trim() });
+        const address = core2.gatewayUrl(c.address), witness = this.ledgerAddress(address);
+        Object.assign(this.config, { address, home: address, away: address, witness, name: c.name.trim(), username: c.username.trim() });
         if (password) this.secret("dav", password);
         await this.saveData(this.config);
       }
@@ -3124,28 +3154,25 @@ var require_pqc_mode = __commonJS({
         }
         return this.keys;
       }
-      base(url) {
-        return new Dav2(core2.endpoint(url), credentials2(this.config.username, this.secret("dav")));
+      base() {
+        const address = core2.gatewayUrl(this.config.address);
+        this.ledgerAddress(address);
+        return new Dav2(address, credentials2(this.config.username, this.secret("dav")));
       }
       async route() {
-        const c = this.config;
-        for (const [i, url] of [c.home, c.away].entries()) {
-          const dav = this.base(url).child(folder).child(namespace2);
-          let timer;
-          try {
-            await Promise.race([dav.read("vault.json"), new Promise((_, reject) => {
-              timer = setTimeout(() => reject(Object.assign(Error("\u8FDE\u63A5\u8D85\u65F6"), { offline: true })), i === 0 && c.away ? 3e3 : 16e3);
-            })]);
-            return { dav, route: i ? "VPS/VPN" : "LAN" };
-          } catch (e) {
-            if (i || !e.offline || !c.away) throw e;
-          } finally {
-            clearTimeout(timer);
-          }
+        const dav = this.base().child(folder).child(namespace2);
+        let timer;
+        try {
+          const bytes = await Promise.race([dav.read("vault.json"), new Promise((_, reject) => {
+            timer = setTimeout(() => reject(Error("WebDAV \u7F51\u5173\u8FDE\u63A5\u8D85\u65F6\u3002")), 16e3);
+          })]);
+          return { dav, marker: core2.parseBytes(bytes), route: "WebDAV" };
+        } finally {
+          clearTimeout(timer);
         }
       }
       async create(seed, bootstrap) {
-        const rec = await pq.identity(seed, "recovery"), dev = await this.device(), home = this.base(this.config.home), dir = home.child(folder);
+        const rec = await pq.identity(seed, "recovery"), dev = await this.device(), home = this.base(), dir = home.child(folder);
         try {
           await home.mkdir(folder);
         } catch (e) {
@@ -3155,6 +3182,12 @@ var require_pqc_mode = __commonJS({
         if (known.some((x) => x !== namespace2)) throw Error("\u65B0\u6D4B\u8BD5\u76EE\u5F55\u5305\u542B\u5176\u4ED6\u6587\u4EF6\u3002");
         const dav = dir.child(namespace2);
         if (!known.length) await dir.mkdir(namespace2);
+        try {
+          const marker2 = core2.parseBytes(await dav.read("vault.json"));
+          if (marker2.format !== 2 || marker2.anchor !== rec.id) throw Error("\u6B64 WebDAV \u76EE\u5F55\u5DF2\u6709 PQC \u5E93\uFF0C\u8BF7\u7528\u5E93\u6307\u7EB9\u914D\u5BF9\u6216\u9009\u62E9\u65B0\u5E93\u5730\u5740\u3002");
+        } catch (e) {
+          if (e.status !== 404) throw e;
+        }
         for (const name of ["objects", "requests"]) try {
           await dav.mkdir(name);
         } catch (e) {
@@ -3164,13 +3197,20 @@ var require_pqc_mode = __commonJS({
         try {
           live = await pq.state(this.ledger.bind(this), rec.id);
         } catch (e) {
-          if (e.status !== 404) throw e;
+          if (!e.uninitialized) throw e;
         }
         if (live) {
           if (live.policies.length !== 1 || pq.latest(live).p.admin !== dev.id) throw Error("\u670D\u52A1\u5DF2\u7ED1\u5B9A\u5230\u53E6\u4E00\u7BA1\u7406\u5458\u3002");
         } else await pq.genesis(this.ledger.bind(this), dev, this.config.name, rec, bootstrap);
-        await dav.put("vault.json", core2.jsonBytes({ format: 2, anchor: rec.id }).buffer);
-        this.config.anchor = rec.id;
+        const marker = core2.jsonBytes({ format: 2, anchor: rec.id }).buffer;
+        try {
+          await dav.call("PUT", "vault.json", [200, 201, 204], { body: marker, contentType: "application/octet-stream", headers: { "If-None-Match": "*" } });
+        } catch (e) {
+          if (e.status !== 412) throw e;
+          const current = core2.parseBytes(await dav.read("vault.json"));
+          if (current.format !== 2 || current.anchor !== rec.id) throw Error("\u6B64 WebDAV \u76EE\u5F55\u5DF2\u7ED1\u5B9A\u5176\u4ED6 PQC \u5E93\u3002");
+        }
+        this.bindAnchor(rec.id);
         await this.refresh();
         return rec.id;
       }
@@ -3178,7 +3218,7 @@ var require_pqc_mode = __commonJS({
         const nonce = core2.randomId(), headers = { "Cache-Control": "no-store" };
         if (token) headers.Authorization = "Bearer " + token;
         const response = await requestUrl2({
-          url: this.config.witness + "/" + method,
+          url: this.ledgerAddress(this.config.address) + "/" + method,
           method: "POST",
           headers,
           contentType: "application/json",
@@ -3186,6 +3226,15 @@ var require_pqc_mode = __commonJS({
           throw: false
         });
         if (response.status !== 200) {
+          if (method === "state" && response.status === 404) {
+            let detail;
+            try {
+              detail = response.json;
+            } catch {
+            }
+            if (detail?.error === "Uninitialized") throw Object.assign(Error("\u6B64\u63D0\u4EA4\u670D\u52A1\u5C1A\u672A\u5EFA\u5E93\u3002"), { status: 404, uninitialized: true });
+            throw Error("\u6B64 WebDAV \u5730\u5740\u5C1A\u672A\u914D\u7F6E PQC \u63D0\u4EA4\u670D\u52A1\uFF0C\u8BF7\u68C0\u67E5\u7F51\u5173\u8DEF\u5F84\u3002");
+          }
           const msg = { 403: "\u672A\u83B7\u6388\u6743\u3001\u5DF2\u64A4\u9500\u6216\u6062\u590D\u7801\u5931\u6548", 404: "\u8BF7\u6C42\u4E0D\u5B58\u5728", 409: "\u6388\u6743\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u540C\u6B65\u6216\u914D\u5BF9", 426: "\u7BA1\u7406\u5458\u9010\u4FEE\u8BA2\u6362\u94A5\u9700\u8981\u5347\u7EA7\u63D2\u4EF6\u548C\u53EF\u4FE1\u63D0\u4EA4\u670D\u52A1" }[response.status] || "\u53EF\u4FE1\u63D0\u4EA4\u670D\u52A1\u4E0D\u53EF\u7528";
           throw Object.assign(Error(msg + " (" + response.status + ")"), { status: response.status });
         }
@@ -3196,8 +3245,8 @@ var require_pqc_mode = __commonJS({
       }
       async context(anchor = this.config.anchor) {
         const [s, r] = await Promise.all([this.snapshot(anchor), this.route()]);
-        const marker = core2.parseBytes(await r.dav.read("vault.json"));
-        if (marker.format !== 2 || marker.anchor !== anchor) throw Error("WebDAV \u6307\u5411\u53E6\u4E00\u6D4B\u8BD5\u5E93\u3002");
+        const marker = r.marker;
+        if (marker.format !== 2 || marker.anchor !== anchor) throw Error("WebDAV \u5730\u5740\u6307\u5411\u53E6\u4E00\u4E2A\u5E93\u3002");
         return { ...r, s, device: await this.device() };
       }
       async refresh(snapshot) {
@@ -3213,7 +3262,8 @@ var require_pqc_mode = __commonJS({
         const { dav, s, device } = await this.context(anchor);
         if (pq.latest(s).p.members[device.id]) throw Error("\u8FD9\u53F0\u8BBE\u5907\u5DF2\u83B7\u6388\u6743\uFF0C\u53EF\u4EE5\u76F4\u63A5\u540C\u6B65\u3002");
         const code = await pq.requestPair(dav, s, device, this.config.name);
-        Object.assign(this.config, { anchor, request: code });
+        this.bindAnchor(anchor);
+        this.config.request = code;
         await this.refresh();
         return code;
       }
@@ -3265,7 +3315,7 @@ var require_pqc_mode = __commonJS({
         } else if (pq.latest(s).p.admin !== dev.id) throw Error("\u6062\u590D\u4E8B\u52A1\u4E0E\u5F53\u524D\u7BA1\u7406\u5458\u4E0D\u7B26\u3002");
         this.secret("device", seed);
         this.keys = dev;
-        this.config.anchor = anchor;
+        this.bindAnchor(anchor);
         this.config.integrity = "\u7BA1\u7406\u5458\u5DF2\u63A5\u7BA1\uFF0C\u5C1A\u672A\u5B8C\u6210\u6570\u636E\u6821\u9A8C\u3002";
         await this.refresh();
         this.secret("pending-root", "");
@@ -3603,20 +3653,10 @@ async function probe(dav, milliseconds) {
 }
 async function connect(config, password, passphrase, transfer) {
   const auth = credentials(config.username, password);
-  const addresses = [[config.home, "LAN"]];
-  if (config.away && config.away !== config.home) addresses.push([config.away, "VPS/VPN"]);
-  for (const [index, [address, route]] of addresses.entries()) {
-    const dav = new Dav(address, auth).child(config.folder).child(namespace);
-    let header;
-    try {
-      header = await probe(dav, index === 0 && addresses.length > 1 ? 2500 : 15e3);
-    } catch (error) {
-      if (error.offline && index + 1 < addresses.length) continue;
-      throw error;
-    }
-    const key = await core.unlock(header, passphrase, config.id);
-    return { store: new core.Store(dav, header.id, key, transfer), route };
-  }
+  const dav = new Dav(core.gatewayUrl(config.address), auth).child(config.folder).child(namespace);
+  const header = await probe(dav, 15e3);
+  const key = await core.unlock(header, passphrase, config.id);
+  return { store: new core.Store(dav, header.id, key, transfer), route: "WebDAV" };
 }
 var ConfirmFolder = class extends Modal {
   constructor(app, config, create, done) {
@@ -3625,9 +3665,8 @@ var ConfirmFolder = class extends Modal {
   }
   onOpen() {
     this.setTitle(this.create ? tr("Create encrypted vault?", "\u521B\u5EFA\u52A0\u5BC6\u5E93\uFF1F") : tr("Use this remote folder?", "\u4F7F\u7528\u8FD9\u4E2A\u8FDC\u7AEF\u76EE\u5F55\uFF1F"));
-    this.contentEl.createEl("p", { text: this.config.home + "/" + core.encodePath(this.config.folder) });
-    if (this.config.away) this.contentEl.createEl("p", { text: this.config.away + "/" + core.encodePath(this.config.folder) });
-    this.contentEl.createEl("p", { text: this.create ? tr("Creates a new encrypted vault in an empty folder using the LAN address.", "\u901A\u8FC7\u5C40\u57DF\u7F51\u5730\u5740\uFF0C\u5728\u7A7A\u76EE\u5F55\u4E2D\u521B\u5EFA\u65B0\u52A0\u5BC6\u5E93\u3002") : tr("Verifies the passphrase and saves this vault on this device.", "\u9A8C\u8BC1\u52A0\u5BC6\u53E3\u4EE4\u540E\uFF0C\u5C06\u8FD9\u4E2A\u5E93\u7ED1\u5B9A\u5230\u5F53\u524D\u8BBE\u5907\u3002") });
+    this.contentEl.createEl("p", { text: this.config.address + "/" + core.encodePath(this.config.folder) });
+    this.contentEl.createEl("p", { text: this.create ? tr("Creates a new encrypted vault in an empty folder through the WebDAV gateway.", "\u901A\u8FC7 WebDAV \u7F51\u5173\uFF0C\u5728\u7A7A\u76EE\u5F55\u4E2D\u521B\u5EFA\u65B0\u52A0\u5BC6\u5E93\u3002") : tr("Verifies the passphrase and saves this vault on this device.", "\u9A8C\u8BC1\u52A0\u5BC6\u53E3\u4EE4\u540E\uFF0C\u5C06\u8FD9\u4E2A\u5E93\u7ED1\u5B9A\u5230\u5F53\u524D\u8BBE\u5907\u3002") });
     new Setting(this.contentEl).addButton((b) => b.setButtonText(tr("Cancel", "\u53D6\u6D88")).onClick(() => this.close())).addButton((b) => b.setCta().setButtonText(tr("Confirm", "\u786E\u8BA4")).onClick(() => {
       this.close();
       this.done();
@@ -3667,8 +3706,7 @@ var HomeboundSettings = class extends PluginSettingTab {
     const field = (label, key, hint, placeholder) => new Setting(el).setClass("homebound-field").setName(label).setDesc(hint).addText((t) => t.setValue(draft[key] || "").setPlaceholder(placeholder).onChange((v) => {
       draft[key] = v;
     }));
-    field(tr("LAN WebDAV address", "\u5C40\u57DF\u7F51 WebDAV \u5730\u5740"), "home", tr("Use the server\u2019s HTTPS address.", "\u586B\u5199\u670D\u52A1\u5668\u7684 HTTPS \u5730\u5740\u3002"), "https://nas.example.net/dav");
-    field(tr("Away WebDAV address", "\u5916\u7F51 WebDAV \u5730\u5740"), "away", tr("Optional HTTPS gateway to the same server.", "\u53EF\u9009\u3002\u586B\u5199\u8F6C\u53D1\u5230\u540C\u4E00\u53F0\u670D\u52A1\u5668\u7684 HTTPS \u5730\u5740\u3002"), "https://dav.example.net/dav");
+    field(tr("WebDAV address", "WebDAV \u5730\u5740"), "address", tr("Use the same HTTPS gateway on every network.", "\u5728\u5BB6\u548C\u5916\u51FA\u90FD\u4F7F\u7528\u8FD9\u4E2A HTTPS \u7F51\u5173\u3002"), "https://dav.example.net");
     field(tr("Remote folder", "\u8FDC\u7AEF\u76EE\u5F55"), "folder", tr("Type the folder name as written, including spaces or Chinese characters.", "\u53EF\u76F4\u63A5\u8F93\u5165\u4E2D\u6587\u3001\u7A7A\u683C\u548C\u591A\u7EA7\u76EE\u5F55\u3002"), "\u7B14\u8BB0/\u6211\u7684\u77E5\u8BC6\u5E93");
     field(tr("WebDAV username", "WebDAV \u7528\u6237\u540D"), "username", "", "");
     const secret = (label, cb) => new Setting(el).setClass("homebound-field").setName(label).setDesc(p.config.id ? tr("Leave empty to use the saved secret.", "\u7559\u7A7A\u53EF\u6CBF\u7528\u5DF2\u4FDD\u5B58\u7684\u5BC6\u7801\u3002") : "").addText((t) => {
@@ -3684,10 +3722,12 @@ var HomeboundSettings = class extends PluginSettingTab {
     });
     const review = (create) => {
       try {
+        const address = core.gatewayUrl(draft.address);
         const config = {
           ...draft,
-          home: core.endpoint(draft.home),
-          away: draft.away.trim() ? core.endpoint(draft.away) : "",
+          address,
+          home: address,
+          away: address,
           folder: core.directory(draft.folder),
           username: draft.username.trim()
         };
@@ -3723,6 +3763,7 @@ module.exports = class HomeboundPlugin extends Plugin {
       auto: false,
       ...await this.loadData()
     };
+    this.config.address = core.gatewayAddress(this.config);
     if (this.manifest.id !== "homebound-webdav") throw Error("Install this candidate as Homebound WebDAV.");
     this.transfer = new ChunkTransfer(new TransferCache(this.app.appId), {
       enabled: this.app.loadLocalStorage("homebound-chunk-upload") === true,
@@ -3805,7 +3846,7 @@ module.exports = class HomeboundPlugin extends Plugin {
       const phrase = enteredPhrase || this.secret("vault");
       if (!phrase || create && phrase.length < 12) throw Error(tr("Use a vault passphrase of at least 12 characters when creating a vault.", "\u521B\u5EFA\u65B0\u5E93\u8BF7\u4F7F\u7528\u81F3\u5C11 12 \u4E2A\u5B57\u7B26\u7684\u52A0\u5BC6\u53E3\u4EE4\u3002"));
       if (create) {
-        const header = await core.createVault(new Dav(config.home, credentials(config.username, password)), config.folder, phrase, namespace);
+        const header = await core.createVault(new Dav(config.address, credentials(config.username, password)), config.folder, phrase, namespace);
         config.id = header.id;
       }
       const { store } = await connect(config, password, phrase);

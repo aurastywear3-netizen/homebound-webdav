@@ -21,29 +21,53 @@ function displaySettings(el,p,app,redraw){
         const field=(label,value,change,secret=false)=>new Setting(el).setName(label).addText(t=>{
             t.setValue(value).onChange(change);if(secret)t.inputEl.type="password";
         });
-        const button=(label,fn)=>new Setting(el).addButton(b=>b.setButtonText(label).onClick(async()=>{
-            try{const result=await p.exclusive(fn);redraw();if(result?.title)new Output(app,result.title,result.value).open();}
-            catch(e){redraw();notice(e);}
+        const button=(label,fn,refresh=true)=>new Setting(el).addButton(b=>b.setButtonText(label).onClick(async()=>{
+            try{const result=await p.exclusive(fn);if(refresh)redraw();if(result?.title)new Output(app,result.title,result.value).open();}
+            catch(e){if(refresh)redraw();notice(e);}
         }));
         el.createEl("p",{text:"PQC 远端目录："+folder});
         field("WebDAV 地址",c.address,v=>c.address=v);
         field("WebDAV 用户名",c.username,v=>c.username=v);
         field("WebDAV 密码（留空沿用）","",v=>password=v,true);
         field("这台设备的名称",c.name,v=>c.name=v);
-        button("保存连接设置",()=>p.configure(c,password));
+        button("保存连接设置",async()=>{
+            await p.configure(c,password);
+            new Notice("连接设置已保存。");
+        },false);
         if(p.config.anchor)el.createEl("p",{text:"库指纹："+p.config.anchor});
         if(!p.config.anchor){
             field("建库授权（服务部署者提供）","",v=>bootstrap=v,true);
             button("创建 PQC 库",async()=>{
+                let token=bootstrap.trim();
+                if(!token)throw Error("请先填写此库的建库授权，再点创建 PQC 库。");
                 await p.configure(c,password);
                 const seed=pq.freshSeed();
                 // Save the recovery material before creating the remote vault.
                 const out=new Output(app,"先离线保存恢复码，然后确认创建",seed);
                 const previous=out.onOpen.bind(out);
-                out.onOpen=()=>{previous();new Setting(out.contentEl).addButton(b=>b.setButtonText("我已保存，创建").onClick(async()=>{
-                    try{await p.exclusive(()=>p.create(seed,bootstrap));out.close();redraw();}catch(e){notice(e);}
-                }));};out.open();
-            });
+                out.onOpen=()=>{
+                    previous();
+                    let correction;
+                    const confirm=new Setting(out.contentEl);
+                    confirm.addButton(b=>b.setButtonText("我已保存，创建").onClick(async()=>{
+                        try{
+                            await p.exclusive(()=>p.create(seed,token));
+                            out.close();redraw();
+                        }catch(e){
+                            if(e.code==="bootstrap-denied" && !correction){
+                                correction=new Setting(out.contentEl).setName("重新填写建库授权").addText(t=>{
+                                    t.inputEl.type="password";t.inputEl.autocomplete="off";
+                                    t.onChange(value=>{token=value.trim();});
+                                    t.inputEl.focus();
+                                });
+                                confirm.settingEl.before(correction.settingEl);
+                            }
+                            notice(e);
+                        }
+                    }));
+                };
+                out.open();
+            },false);
             field("从管理员 Mac 核对的库指纹","",v=>code=v);
             button("申请配对",async()=>({title:"请在管理员 Mac 输入此配对码",value:await p.request(code.trim())}));
         }
@@ -160,7 +184,11 @@ class PqcMode{
         try{live=await pq.state(this.ledger.bind(this),rec.id);}catch(e){if(!e.uninitialized)throw e;}
         if(live){
             if(live.policies.length!==1||pq.latest(live).p.admin!==dev.id)throw Error("服务已绑定到另一管理员。");
-        }else await pq.genesis(this.ledger.bind(this),dev,this.config.name,rec,bootstrap);
+        }else{
+            const token=(bootstrap||"").trim();
+            if(!token)throw Object.assign(Error("请填写此库的建库授权后再确认创建。"),{code:"bootstrap-denied"});
+            await pq.genesis(this.ledger.bind(this),dev,this.config.name,rec,token);
+        }
         const marker=core.jsonBytes({format:2,anchor:rec.id}).buffer;
         try{
             await dav.call("PUT","vault.json",[200,201,204],{body:marker,contentType:"application/octet-stream",headers:{"If-None-Match":"*"}});
@@ -177,8 +205,14 @@ class PqcMode{
         const response=await requestUrl({url:this.ledgerAddress(this.config.address)+"/"+method,method:"POST",headers,
             contentType:"application/json",body:JSON.stringify({...data,transportNonce:nonce}),throw:false});
         if(response.status!==200){
+            let detail;try{detail=response.json;}catch{}
+            if(response.status===403 && method==="policy" && detail?.error==="Bootstrap denied"){
+                throw Object.assign(Error("建库授权不正确。请重新粘贴此库的建库授权，再点确认创建。"),{status:403,code:"bootstrap-denied"});
+            }
+            if(response.status===403 && method==="state" && detail?.error==="Wrong vault"){
+                throw Object.assign(Error("此提交服务已绑定其他库指纹。请核对 WebDAV 地址中的库路径。"),{status:403});
+            }
             if(method==="state" && response.status===404){
-                let detail;try{detail=response.json;}catch{}
                 if(detail?.error==="Uninitialized")throw Object.assign(Error("此提交服务尚未建库。"),{status:404,uninitialized:true});
                 throw Error("此 WebDAV 地址尚未配置 PQC 提交服务，请检查网关路径。");
             }

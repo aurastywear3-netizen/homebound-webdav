@@ -2988,13 +2988,13 @@ var require_pqc_mode = __commonJS({
         t.setValue(value).onChange(change);
         if (secret) t.inputEl.type = "password";
       });
-      const button = (label, fn) => new Setting2(el).addButton((b) => b.setButtonText(label).onClick(async () => {
+      const button = (label, fn, refresh = true) => new Setting2(el).addButton((b) => b.setButtonText(label).onClick(async () => {
         try {
           const result = await p.exclusive(fn);
-          redraw();
+          if (refresh) redraw();
           if (result?.title) new Output(app, result.title, result.value).open();
         } catch (e) {
-          redraw();
+          if (refresh) redraw();
           notice(e);
         }
       }));
@@ -3003,29 +3003,47 @@ var require_pqc_mode = __commonJS({
       field("WebDAV \u7528\u6237\u540D", c.username, (v) => c.username = v);
       field("WebDAV \u5BC6\u7801\uFF08\u7559\u7A7A\u6CBF\u7528\uFF09", "", (v) => password = v, true);
       field("\u8FD9\u53F0\u8BBE\u5907\u7684\u540D\u79F0", c.name, (v) => c.name = v);
-      button("\u4FDD\u5B58\u8FDE\u63A5\u8BBE\u7F6E", () => p.configure(c, password));
+      button("\u4FDD\u5B58\u8FDE\u63A5\u8BBE\u7F6E", async () => {
+        await p.configure(c, password);
+        new Notice2("\u8FDE\u63A5\u8BBE\u7F6E\u5DF2\u4FDD\u5B58\u3002");
+      }, false);
       if (p.config.anchor) el.createEl("p", { text: "\u5E93\u6307\u7EB9\uFF1A" + p.config.anchor });
       if (!p.config.anchor) {
         field("\u5EFA\u5E93\u6388\u6743\uFF08\u670D\u52A1\u90E8\u7F72\u8005\u63D0\u4F9B\uFF09", "", (v) => bootstrap = v, true);
         button("\u521B\u5EFA PQC \u5E93", async () => {
+          let token = bootstrap.trim();
+          if (!token) throw Error("\u8BF7\u5148\u586B\u5199\u6B64\u5E93\u7684\u5EFA\u5E93\u6388\u6743\uFF0C\u518D\u70B9\u521B\u5EFA PQC \u5E93\u3002");
           await p.configure(c, password);
           const seed = pq.freshSeed();
           const out = new Output(app, "\u5148\u79BB\u7EBF\u4FDD\u5B58\u6062\u590D\u7801\uFF0C\u7136\u540E\u786E\u8BA4\u521B\u5EFA", seed);
           const previous = out.onOpen.bind(out);
           out.onOpen = () => {
             previous();
-            new Setting2(out.contentEl).addButton((b) => b.setButtonText("\u6211\u5DF2\u4FDD\u5B58\uFF0C\u521B\u5EFA").onClick(async () => {
+            let correction;
+            const confirm = new Setting2(out.contentEl);
+            confirm.addButton((b) => b.setButtonText("\u6211\u5DF2\u4FDD\u5B58\uFF0C\u521B\u5EFA").onClick(async () => {
               try {
-                await p.exclusive(() => p.create(seed, bootstrap));
+                await p.exclusive(() => p.create(seed, token));
                 out.close();
                 redraw();
               } catch (e) {
+                if (e.code === "bootstrap-denied" && !correction) {
+                  correction = new Setting2(out.contentEl).setName("\u91CD\u65B0\u586B\u5199\u5EFA\u5E93\u6388\u6743").addText((t) => {
+                    t.inputEl.type = "password";
+                    t.inputEl.autocomplete = "off";
+                    t.onChange((value) => {
+                      token = value.trim();
+                    });
+                    t.inputEl.focus();
+                  });
+                  confirm.settingEl.before(correction.settingEl);
+                }
                 notice(e);
               }
             }));
           };
           out.open();
-        });
+        }, false);
         field("\u4ECE\u7BA1\u7406\u5458 Mac \u6838\u5BF9\u7684\u5E93\u6307\u7EB9", "", (v) => code = v);
         button("\u7533\u8BF7\u914D\u5BF9", async () => ({ title: "\u8BF7\u5728\u7BA1\u7406\u5458 Mac \u8F93\u5165\u6B64\u914D\u5BF9\u7801", value: await p.request(code.trim()) }));
       }
@@ -3201,7 +3219,11 @@ var require_pqc_mode = __commonJS({
         }
         if (live) {
           if (live.policies.length !== 1 || pq.latest(live).p.admin !== dev.id) throw Error("\u670D\u52A1\u5DF2\u7ED1\u5B9A\u5230\u53E6\u4E00\u7BA1\u7406\u5458\u3002");
-        } else await pq.genesis(this.ledger.bind(this), dev, this.config.name, rec, bootstrap);
+        } else {
+          const token = (bootstrap || "").trim();
+          if (!token) throw Object.assign(Error("\u8BF7\u586B\u5199\u6B64\u5E93\u7684\u5EFA\u5E93\u6388\u6743\u540E\u518D\u786E\u8BA4\u521B\u5EFA\u3002"), { code: "bootstrap-denied" });
+          await pq.genesis(this.ledger.bind(this), dev, this.config.name, rec, token);
+        }
         const marker = core2.jsonBytes({ format: 2, anchor: rec.id }).buffer;
         try {
           await dav.call("PUT", "vault.json", [200, 201, 204], { body: marker, contentType: "application/octet-stream", headers: { "If-None-Match": "*" } });
@@ -3226,12 +3248,18 @@ var require_pqc_mode = __commonJS({
           throw: false
         });
         if (response.status !== 200) {
+          let detail;
+          try {
+            detail = response.json;
+          } catch {
+          }
+          if (response.status === 403 && method === "policy" && detail?.error === "Bootstrap denied") {
+            throw Object.assign(Error("\u5EFA\u5E93\u6388\u6743\u4E0D\u6B63\u786E\u3002\u8BF7\u91CD\u65B0\u7C98\u8D34\u6B64\u5E93\u7684\u5EFA\u5E93\u6388\u6743\uFF0C\u518D\u70B9\u786E\u8BA4\u521B\u5EFA\u3002"), { status: 403, code: "bootstrap-denied" });
+          }
+          if (response.status === 403 && method === "state" && detail?.error === "Wrong vault") {
+            throw Object.assign(Error("\u6B64\u63D0\u4EA4\u670D\u52A1\u5DF2\u7ED1\u5B9A\u5176\u4ED6\u5E93\u6307\u7EB9\u3002\u8BF7\u6838\u5BF9 WebDAV \u5730\u5740\u4E2D\u7684\u5E93\u8DEF\u5F84\u3002"), { status: 403 });
+          }
           if (method === "state" && response.status === 404) {
-            let detail;
-            try {
-              detail = response.json;
-            } catch {
-            }
             if (detail?.error === "Uninitialized") throw Object.assign(Error("\u6B64\u63D0\u4EA4\u670D\u52A1\u5C1A\u672A\u5EFA\u5E93\u3002"), { status: 404, uninitialized: true });
             throw Error("\u6B64 WebDAV \u5730\u5740\u5C1A\u672A\u914D\u7F6E PQC \u63D0\u4EA4\u670D\u52A1\uFF0C\u8BF7\u68C0\u67E5\u7F51\u5173\u8DEF\u5F84\u3002");
           }

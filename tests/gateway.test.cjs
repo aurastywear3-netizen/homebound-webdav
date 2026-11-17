@@ -27,6 +27,8 @@ test("upgraded devices keep their identity and send DAV and ledger requests only
         requestUrl:async req => {
             calls.push(req);
             if (req.method === "GET") throw Error("offline");
+            if (req.url.endsWith("/policy")) return {status:403,json:{error:"Bootstrap denied"}};
+            if (req.url.endsWith("/state")) return {status:403,json:{error:"Wrong vault"}};
             return {status:200, json:{}};
         }
     }));
@@ -56,5 +58,8 @@ test("upgraded devices keep their identity and send DAV and ledger requests only
         assert.equal(q.config.home,away);
         assert.equal(q.config.away,away);
         assert.equal(q.config.witness,witness);
+        await assert.rejects(q.ledger("policy",{},"bad-token"),e=>
+            e.status===403 && e.code==="bootstrap-denied" && e.message.includes("建库授权不正确"));
+        await assert.rejects(q.ledger("state",{}),/核对 WebDAV 地址中的库路径/);
     } finally {Object.assign(global,previous);}
 });

@@ -126,7 +126,7 @@ module.exports = class HomeboundPlugin extends Plugin {
                     if(saved?.anchor && saved.anchor!==invite.anchor)throw Error("请打开要加入此远端库的独立本地库。");
                     this.selectMode("pqc");
                     return this.pqc.exclusive(()=>this.pqc.joinInvite(invite,fields));
-                },()=>{this.app.setting.open();this.app.setting.openTabById(this.manifest.id);});
+                },()=>{this.app.setting.open();this.app.setting.openTabById(this.manifest.id);},this.mode!=="pqc");
             }catch(e){new Notice(e.message,10000);}
         });
         this.addCommand({ id: "sync", name: tr("Sync now", "立即同步"), callback: () => this.run() });

@@ -17,7 +17,7 @@ function scanButton(el, received) {
     new Setting(el).addButton(b => b.setButtonText("扫码加入（拍照或选图）").onClick(()=>picker.click()));
 }
 
-function join(app, invite, submit, redraw) {
+function join(app, invite, submit, redraw, confirmMode=false) {
     const modal = new Modal(app);
     modal.setTitle("申请加入 PQC 库");
     modal.contentEl.createEl("p",{text:"本地库："+app.vault.getName()});
@@ -25,25 +25,25 @@ function join(app, invite, submit, redraw) {
     if (invite.ledger !== invite.address+"/homebound-pqc-ledger")
         modal.contentEl.createEl("p",{text:"提交服务："+invite.ledger});
     modal.contentEl.createEl("p",{text:"请核对管理员展示的地址和库指纹："+invite.anchor});
-    const fields = {name:"",username:"",password:""};
-    for (const [key,label] of [["name","本设备名称"],["username","本设备的 WebDAV 用户名"],["password","WebDAV 密码"]]) {
-        new Setting(modal.contentEl).setName(label).addText(t=>{
-            if(key==="password"){t.inputEl.type="password";t.inputEl.autocomplete="off";}
-            t.onChange(value=>{fields[key]=value;});
-        });
+    async function apply(fields){
+        const code=await submit(fields);
+        modal.contentEl.empty();modal.setTitle("等待管理员批准");
+        modal.contentEl.createEl("p",{text:"请与管理员屏幕核对："+matchCode(code)});
+        modal.contentEl.createEl("p",{text:"批准后在插件设置中点「刷新设备列表」。"});
+        redraw();
     }
-    new Setting(modal.contentEl).addButton(b=>b.setCta().setButtonText("使用 PQC 并申请加入").onClick(async()=>{
-        b.setDisabled(true);
-        try{
-            const code = await submit(fields);
-            fields.password="";
-            modal.contentEl.empty();modal.setTitle("等待管理员批准");
-            modal.contentEl.createEl("p",{text:"请与管理员屏幕核对："+matchCode(code)});
-            modal.contentEl.createEl("p",{text:"批准后在插件设置中点「刷新设备列表」。"});
-            redraw();
-        }catch(e){errorNotice(e);}finally{b.setDisabled(false);}
-    }));
+    if(!invite.automatic){
+        modal.setTitle("这个二维码需要更新");
+        modal.contentEl.empty();
+        modal.contentEl.createEl("p",{text:"请让管理员启用免填扫码，重新显示二维码。旧网关可在插件设置中使用手动配对码。"});
+        modal.open();return;
+    }
+    const run=async()=>{
+        try{await apply();}catch(e){modal.setTitle("未能申请加入");modal.contentEl.empty();modal.contentEl.createEl("p",{text:e.message});}
+    };
     modal.open();
+    if(confirmMode)new Setting(modal.contentEl).addButton(b=>b.setCta().setButtonText("在此本地库使用 PQC 并申请").onClick(()=>{b.setDisabled(true);return run();}));
+    else {modal.setTitle("正在申请加入");void run();}
 }
 
 class InviteModal extends Modal {

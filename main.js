@@ -2830,7 +2830,9 @@ var require_pqc = __commonJS({
       const token = b64(await derive("ledger-capability", 32));
       const pub = { kem: b64(enc.publicKey), sig: b64(sig.publicKey), cap: await sha(new TextEncoder().encode(token)) };
       const stagingKey = label === "device" ? await aes(await derive("local-upload-checkpoint", 32)) : void 0;
-      return { pub, token, stagingKey, id: await fingerprint([pub.kem, pub.sig, pub.cap]), enc: enc.secretKey, sign: sig.secretKey };
+      const davToken = label === "device" ? b64(await derive("webdav-read-write", 32)) : void 0;
+      const davCap = davToken && await sha(new TextEncoder().encode(davToken));
+      return { pub, token, stagingKey, davToken, davCap, id: await fingerprint([pub.kem, pub.sig, pub.cap]), enc: enc.secretKey, sign: sig.secretKey };
     }
     var freshSeed = () => b64(random(32));
     var aes = (raw) => crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]);
@@ -2850,7 +2852,7 @@ var require_pqc = __commonJS({
     var latest = (state2) => state2.policies.at(-1);
     function publicDevice(device, name) {
       check(typeof name === "string" && name.trim() && name.length <= 64, "\u8BF7\u8F93\u5165\u8BBE\u5907\u540D\u79F0\uFF081 \u81F3 64 \u5B57\uFF09\u3002");
-      return { ...device.pub, name: name.trim() };
+      return { ...device.pub, name: name.trim(), davCap: device.davCap };
     }
     async function state(ledger, anchor, pin, withRevisions = true) {
       check(idPattern.test(anchor), "\u5E93\u6307\u7EB9\u65E0\u6548\u3002");
@@ -2878,7 +2880,7 @@ var require_pqc = __commonJS({
         policies.push({ p, digest });
       }
       check(!pin || pin.n < policies.length, "\u6388\u6743\u8BB0\u5F55\u56DE\u9000\u3002");
-      return { policies, rows: snapshot.revisions, canRotate: snapshot.adminRevisionRotation === 1, canInvite: snapshot.qrPairing === 1 };
+      return { policies, rows: snapshot.revisions, canRotate: snapshot.adminRevisionRotation === 1, canInvite: snapshot.qrPairing === 1, deviceDav: snapshot.deviceDav === 1 };
     }
     async function preparePolicy(p, actor, key) {
       p.boxes = {};
@@ -2910,7 +2912,7 @@ var require_pqc = __commonJS({
     }
     var lifetime = 10 * 60 * 1e3;
     var deviceLimit = 10;
-    async function requestPair(dav, s, device, name, invite) {
+    async function signedRequest(s, device, name, invite) {
       const { p, digest } = latest(s), pub = publicDevice(device, name);
       const request = { anchor: p.anchor, head: digest, nonce: randomId(), expires: Date.now() + lifetime, pub };
       if (invite) {
@@ -2919,12 +2921,18 @@ var require_pqc = __commonJS({
         request.expires = Math.min(request.expires, invite.expires);
       }
       const code = await fingerprint([request]);
-      await dav.child("requests").put(code, jsonBytes({ request, sig: signed("join", [request], device.sign) }).buffer);
+      return { code, envelope: { request, sig: signed("join", [request], device.sign) } };
+    }
+    async function requestPair(dav, s, device, name, invite) {
+      const { code, envelope: envelope2 } = await signedRequest(s, device, name, invite);
+      await dav.child("requests").put(code, jsonBytes(envelope2).buffer);
       return code;
     }
     async function readRequest(dav, s, code) {
       check(idPattern.test(code), "\u914D\u5BF9\u7801\u683C\u5F0F\u9519\u8BEF\u3002");
-      const { request, sig } = parseBytes(await dav.child("requests").read(code));
+      return checkRequest(s, code, parseBytes(await dav.child("requests").read(code)));
+    }
+    async function checkRequest(s, code, { request, sig }) {
       const { p } = latest(s);
       check(request.anchor === p.anchor && currentPairingHead(s, request.head), "\u914D\u5BF9\u7533\u8BF7\u5DF2\u8FC7\u671F\u6216\u5DF2\u4F7F\u7528\u3002");
       check(Number.isSafeInteger(request.expires) && request.expires >= Date.now() && request.expires <= Date.now() + lifetime + 6e4, "\u914D\u5BF9\u7533\u8BF7\u5DF2\u8FC7\u671F\u3002");
@@ -3118,7 +3126,7 @@ var require_pqc = __commonJS({
       }
       return { checked: history.size, faults };
     }
-    module2.exports = { deviceLimit, membershipHead, lifetime, identity, freshSeed, publicDevice, publicId, genesis, state, latest, requestPair, readRequest, nextPolicy, storeFor, auditData, validateGraph };
+    module2.exports = { deviceLimit, membershipHead, lifetime, identity, freshSeed, publicDevice, publicId, genesis, state, latest, signedRequest, checkRequest, requestPair, readRequest, nextPolicy, storeFor, auditData, validateGraph };
   }
 });
 
@@ -14840,7 +14848,7 @@ var require_pairing_invite = __commonJS({
     var shortId = /^[0-9a-f]{32}$/;
     function validate(params, now = Date.now()) {
       const { v, address, anchor, slot, head, until, ledger } = params;
-      if (v !== "1" || !shortId.test(anchor) || !shortId.test(slot) || !/^[0-9a-f]{64}$/.test(head))
+      if (!["1", "2"].includes(v) || !shortId.test(anchor) || !shortId.test(slot) || !/^[0-9a-f]{64}$/.test(head))
         throw Error("\u65E0\u6548\u7684 Homebound \u8BBE\u5907\u9080\u8BF7\u3002");
       const expires = Number(until);
       if (!Number.isSafeInteger(expires) || expires <= now || expires > now + pq.lifetime + 6e4)
@@ -14848,11 +14856,11 @@ var require_pairing_invite = __commonJS({
       const gateway = core2.gatewayUrl(address);
       const service = ledger === void 0 ? gateway + "/homebound-pqc-ledger" : core2.gatewayUrl(ledger);
       if (new URL(service).origin !== new URL(gateway).origin) throw Error("\u9080\u8BF7\u4E2D\u7684\u63D0\u4EA4\u670D\u52A1\u5FC5\u987B\u4E0E\u7F51\u5173\u540C\u6E90\u3002");
-      return { address: gateway, ledger: service, anchor, slot, head, expires };
+      return { address: gateway, ledger: service, anchor, slot, head, expires, automatic: v === "2" };
     }
     function create(address, ledger, snapshot) {
       const { p, digest } = pq.membershipHead(snapshot);
-      const params = { v: "1", address, anchor: p.anchor, slot: core2.randomId(), head: digest, until: String(Date.now() + pq.lifetime) };
+      const params = { v: snapshot.deviceDav ? "2" : "1", address, anchor: p.anchor, slot: core2.randomId(), head: digest, until: String(Date.now() + pq.lifetime) };
       if (ledger !== address + "/homebound-pqc-ledger") params.ledger = ledger;
       const invite = validate(params);
       const url = "obsidian://" + action + "?" + new URLSearchParams(params);
@@ -14928,7 +14936,7 @@ var require_pairing_ui = __commonJS({
       };
       new Setting2(el).addButton((b) => b.setButtonText("\u626B\u7801\u52A0\u5165\uFF08\u62CD\u7167\u6216\u9009\u56FE\uFF09").onClick(() => picker.click()));
     }
-    function join(app, invite, submit, redraw) {
+    function join(app, invite, submit, redraw, confirmMode = false) {
       const modal = new Modal2(app);
       modal.setTitle("\u7533\u8BF7\u52A0\u5165 PQC \u5E93");
       modal.contentEl.createEl("p", { text: "\u672C\u5730\u5E93\uFF1A" + app.vault.getName() });
@@ -14936,35 +14944,39 @@ var require_pairing_ui = __commonJS({
       if (invite.ledger !== invite.address + "/homebound-pqc-ledger")
         modal.contentEl.createEl("p", { text: "\u63D0\u4EA4\u670D\u52A1\uFF1A" + invite.ledger });
       modal.contentEl.createEl("p", { text: "\u8BF7\u6838\u5BF9\u7BA1\u7406\u5458\u5C55\u793A\u7684\u5730\u5740\u548C\u5E93\u6307\u7EB9\uFF1A" + invite.anchor });
-      const fields = { name: "", username: "", password: "" };
-      for (const [key, label] of [["name", "\u672C\u8BBE\u5907\u540D\u79F0"], ["username", "\u672C\u8BBE\u5907\u7684 WebDAV \u7528\u6237\u540D"], ["password", "WebDAV \u5BC6\u7801"]]) {
-        new Setting2(modal.contentEl).setName(label).addText((t) => {
-          if (key === "password") {
-            t.inputEl.type = "password";
-            t.inputEl.autocomplete = "off";
-          }
-          t.onChange((value) => {
-            fields[key] = value;
-          });
-        });
+      async function apply(fields) {
+        const code = await submit(fields);
+        modal.contentEl.empty();
+        modal.setTitle("\u7B49\u5F85\u7BA1\u7406\u5458\u6279\u51C6");
+        modal.contentEl.createEl("p", { text: "\u8BF7\u4E0E\u7BA1\u7406\u5458\u5C4F\u5E55\u6838\u5BF9\uFF1A" + matchCode(code) });
+        modal.contentEl.createEl("p", { text: "\u6279\u51C6\u540E\u5728\u63D2\u4EF6\u8BBE\u7F6E\u4E2D\u70B9\u300C\u5237\u65B0\u8BBE\u5907\u5217\u8868\u300D\u3002" });
+        redraw();
       }
-      new Setting2(modal.contentEl).addButton((b) => b.setCta().setButtonText("\u4F7F\u7528 PQC \u5E76\u7533\u8BF7\u52A0\u5165").onClick(async () => {
-        b.setDisabled(true);
+      if (!invite.automatic) {
+        modal.setTitle("\u8FD9\u4E2A\u4E8C\u7EF4\u7801\u9700\u8981\u66F4\u65B0");
+        modal.contentEl.empty();
+        modal.contentEl.createEl("p", { text: "\u8BF7\u8BA9\u7BA1\u7406\u5458\u542F\u7528\u514D\u586B\u626B\u7801\uFF0C\u91CD\u65B0\u663E\u793A\u4E8C\u7EF4\u7801\u3002\u65E7\u7F51\u5173\u53EF\u5728\u63D2\u4EF6\u8BBE\u7F6E\u4E2D\u4F7F\u7528\u624B\u52A8\u914D\u5BF9\u7801\u3002" });
+        modal.open();
+        return;
+      }
+      const run = async () => {
         try {
-          const code = await submit(fields);
-          fields.password = "";
-          modal.contentEl.empty();
-          modal.setTitle("\u7B49\u5F85\u7BA1\u7406\u5458\u6279\u51C6");
-          modal.contentEl.createEl("p", { text: "\u8BF7\u4E0E\u7BA1\u7406\u5458\u5C4F\u5E55\u6838\u5BF9\uFF1A" + matchCode(code) });
-          modal.contentEl.createEl("p", { text: "\u6279\u51C6\u540E\u5728\u63D2\u4EF6\u8BBE\u7F6E\u4E2D\u70B9\u300C\u5237\u65B0\u8BBE\u5907\u5217\u8868\u300D\u3002" });
-          redraw();
+          await apply();
         } catch (e) {
-          errorNotice(e);
-        } finally {
-          b.setDisabled(false);
+          modal.setTitle("\u672A\u80FD\u7533\u8BF7\u52A0\u5165");
+          modal.contentEl.empty();
+          modal.contentEl.createEl("p", { text: e.message });
         }
-      }));
+      };
       modal.open();
+      if (confirmMode) new Setting2(modal.contentEl).addButton((b) => b.setCta().setButtonText("\u5728\u6B64\u672C\u5730\u5E93\u4F7F\u7528 PQC \u5E76\u7533\u8BF7").onClick(() => {
+        b.setDisabled(true);
+        return run();
+      }));
+      else {
+        modal.setTitle("\u6B63\u5728\u7533\u8BF7\u52A0\u5165");
+        void run();
+      }
     }
     var InviteModal = class extends Modal2 {
       constructor(app, p, invite, redraw) {
@@ -15144,7 +15156,7 @@ var require_pqc_conflict = __commonJS({
 var require_pqc_mode = __commonJS({
   "src/pqc-mode.cjs"(exports2, module2) {
     "use strict";
-    var { Setting: Setting2, Modal: Modal2, Notice: Notice2, requestUrl: requestUrl2 } = require("obsidian");
+    var { Setting: Setting2, Modal: Modal2, Notice: Notice2, Platform, requestUrl: requestUrl2 } = require("obsidian");
     var core2 = require_core();
     var pq = require_pqc();
     var { Dav: Dav2, VaultFiles: VaultFiles2, credentials: credentials2 } = require_adapter();
@@ -15193,8 +15205,10 @@ var require_pqc_mode = __commonJS({
       }));
       el.createEl("p", { text: "PQC \u8FDC\u7AEF\u76EE\u5F55\uFF1A" + folder });
       field("WebDAV \u5730\u5740", c.address, (v) => c.address = v);
-      field("WebDAV \u7528\u6237\u540D", c.username, (v) => c.username = v);
-      field("WebDAV \u5BC6\u7801\uFF08\u7559\u7A7A\u6CBF\u7528\uFF09", "", (v) => password = v, true);
+      if (!c.deviceDav) {
+        field("WebDAV \u7528\u6237\u540D", c.username, (v) => c.username = v);
+        field("WebDAV \u5BC6\u7801\uFF08\u7559\u7A7A\u6CBF\u7528\uFF09", "", (v) => password = v, true);
+      }
       field("\u8FD9\u53F0\u8BBE\u5907\u7684\u540D\u79F0", c.name, (v) => c.name = v);
       button("\u4FDD\u5B58\u8FDE\u63A5\u8BBE\u7F6E", async () => {
         await p.configure(c, password);
@@ -15243,9 +15257,12 @@ var require_pqc_mode = __commonJS({
       }
       if (p.config.request) {
         el.createEl("p", { text: "\u672C\u8BBE\u5907\u914D\u5BF9\u7801\uFF0810 \u5206\u949F\u6709\u6548\uFF09\uFF1A" + p.config.request });
+        if (p.config.firstApplication) button("\u653E\u5F03\u672C\u673A\u5F85\u6279\u7533\u8BF7", () => p.forgetApplication());
       }
       if (p.config.anchor && !p.config.admin) {
-        button("\u91CD\u65B0\u7533\u8BF7\u914D\u5BF9", async () => ({ title: "\u65B0\u914D\u5BF9\u7801", value: await p.request(p.config.anchor) }));
+        if (p.config.deviceDav && !p.config.roster?.length)
+          pairingUI.scanButton(el, (invite) => pairingUI.join(app, invite, (fields) => p.exclusive(() => p.joinInvite(invite, fields)), redraw));
+        if (!p.config.deviceDav) button("\u91CD\u65B0\u7533\u8BF7\u914D\u5BF9", async () => ({ title: "\u65B0\u914D\u5BF9\u7801", value: await p.request(p.config.anchor) }));
       }
       if (p.config.integrity) el.createEl("p", { text: p.config.integrity });
       if (p.config.anchor) {
@@ -15361,7 +15378,11 @@ var require_pqc_mode = __commonJS({
         return new Dav2(address, credentials2(this.config.username, this.secret("dav")));
       }
       async route() {
-        const dav = this.base().child(folder).child(namespace2);
+        let dav;
+        if (this.config.deviceDav) {
+          const device = await this.device();
+          dav = new Dav2(this.ledgerAddress(this.config.address) + "/dav", "Bearer " + device.id + "." + device.davToken);
+        } else dav = this.base().child(folder).child(namespace2);
         let timer;
         try {
           const bytes = await Promise.race([dav.read("vault.json"), new Promise((_, reject) => {
@@ -15419,11 +15440,11 @@ var require_pqc_mode = __commonJS({
         await this.refresh();
         return rec.id;
       }
-      async ledger(method, data, token) {
+      async ledger(method, data, token, endpoint = this.ledgerAddress(this.config.address)) {
         const nonce = core2.randomId(), headers = { "Cache-Control": "no-store" };
         if (token) headers.Authorization = "Bearer " + token;
         const response = await requestUrl2({
-          url: this.ledgerAddress(this.config.address) + "/" + method,
+          url: endpoint + "/" + method,
           method: "POST",
           headers,
           contentType: "application/json",
@@ -15457,7 +15478,12 @@ var require_pqc_mode = __commonJS({
         return pq.state(this.ledger.bind(this), anchor, this.config.pin, withRevisions);
       }
       async context(anchor = this.config.anchor, withRevisions = true) {
-        const [s, r] = await Promise.all([this.snapshot(anchor, withRevisions), this.route()]);
+        const s = await this.snapshot(anchor, withRevisions);
+        if (this.config.deviceDav && !pq.latest(s).p.members[(await this.device()).id]) {
+          await this.refresh(s);
+          throw Error("\u6B64\u8BBE\u5907\u672A\u83B7\u6388\u6743\uFF0C\u6216\u5DF2\u88AB\u64A4\u9500\u3002\u8BF7\u5728\u8BBE\u7F6E\u4E2D\u91CD\u65B0\u7533\u8BF7\u914D\u5BF9\u3002");
+        }
+        const r = await this.route();
         const marker = r.marker;
         if (marker.format !== 2 || marker.anchor !== anchor) throw Error("WebDAV \u5730\u5740\u6307\u5411\u53E6\u4E00\u4E2A\u5E93\u3002");
         return { ...r, s, device: await this.device() };
@@ -15473,7 +15499,10 @@ var require_pqc_mode = __commonJS({
           admin: id2 === p.admin,
           self: id2 === dev.id
         })).sort((a, b) => Number(b.admin) - Number(a.admin)) : [];
-        if (p.members[dev.id]) delete this.config.request;
+        if (p.members[dev.id]) {
+          delete this.config.request;
+          delete this.config.firstApplication;
+        }
       }
       async refresh(snapshot) {
         const s = snapshot || await this.snapshot(this.config.anchor, false);
@@ -15494,7 +15523,7 @@ var require_pqc_mode = __commonJS({
         const { s, device } = await this.context(this.config.anchor, false), { p } = pq.latest(s);
         if (p.admin !== device.id) throw Error("\u53EA\u6709\u5F53\u524D\u7BA1\u7406\u5458\u53EF\u4EE5\u9080\u8BF7\u8BBE\u5907\u3002");
         if (Object.keys(p.members).length >= pq.deviceLimit) throw Error("\u8BBE\u5907\u5DF2\u6EE1\uFF0C\u8BF7\u5148\u64A4\u9500\u4E00\u53F0\u3002");
-        if (!s.canInvite) throw Error("\u8BF7\u5148\u5347\u7EA7\u672C\u5E93\u7684\u63D0\u4EA4\u670D\u52A1\u4EE5\u542F\u7528\u626B\u7801\u52A0\u5165\uFF0C\u6216\u4F7F\u7528\u624B\u52A8\u914D\u5BF9\u7801\u3002");
+        if (!s.canInvite || !s.deviceDav) throw Error("\u8BF7\u5148\u4E3A\u672C\u5E93\u542F\u7528\u514D\u586B\u626B\u7801\u670D\u52A1\uFF0C\u6216\u4F7F\u7528\u624B\u52A8\u914D\u5BF9\u7801\u3002");
         const address = this.config.address;
         const invite = invites.create(address, this.ledgerAddress(address), s);
         await this.ledger("policy", { pairing: { action: "open", slot: invite.slot, expires: invite.expires, head: pq.latest(s).digest } }, device.token);
@@ -15504,51 +15533,70 @@ var require_pqc_mode = __commonJS({
         if (Date.now() >= invite.expires || pq.membershipHead(s).digest !== invite.head)
           throw Error("\u9080\u8BF7\u5DF2\u8FC7\u671F\u6216\u6388\u6743\u540D\u5355\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u626B\u7801\u3002");
       }
-      async joinInvite(invite, credentials3) {
+      async joinInvite(invite) {
+        if (!invite.automatic) throw Error("\u8BF7\u8BA9\u7BA1\u7406\u5458\u91CD\u65B0\u663E\u793A\u514D\u586B\u4E8C\u7EF4\u7801\u3002");
         if (this.config.anchor && this.config.anchor !== invite.anchor) throw Error("\u6B64\u672C\u5730\u5E93\u5DF2\u7ED1\u5B9A\u5176\u4ED6 PQC \u5E93\u3002");
-        if (!credentials3.username.trim() || !credentials3.password || !credentials3.name.trim()) throw Error("\u8BF7\u586B\u5199\u8BBE\u5907\u540D\u79F0\u548C\u672C\u8BBE\u5907\u7684 WebDAV \u8D26\u53F7\u5BC6\u7801\u3002");
-        if (Date.now() >= invite.expires) throw Error("\u9080\u8BF7\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u91CD\u65B0\u626B\u7801\u3002");
-        if (this.config.anchor) {
-          if (this.config.address !== invite.address || this.ledgerAddress(invite.address) !== invite.ledger) throw Error("\u9080\u8BF7\u4E0E\u5DF2\u7ED1\u5B9A\u7684\u7F51\u5173\u4E0D\u7B26\u3002");
-          const existing = await this.snapshot(this.config.anchor, false);
-          if (pq.latest(existing).p.members[(await this.device()).id]) throw Error("\u672C\u673A\u5DF2\u7ECF\u83B7\u51C6\u52A0\u5165\u6B64\u5E93\u3002");
-        }
-        if (!this.config.anchor) {
-          this.config.address = invite.address;
-          this.config.inviteLedger = invite.ledger;
-        }
-        await this.configure({ address: invite.address, username: credentials3.username, name: credentials3.name }, credentials3.password);
-        const { dav, s, device } = await this.context(invite.anchor, false);
+        if (this.config.anchor && (this.config.address !== invite.address || this.config.witness !== invite.ledger))
+          throw Error("\u9080\u8BF7\u4E0E\u672C\u5730\u5E93\u5DF2\u7ED1\u5B9A\u7684\u670D\u52A1\u4E0D\u5339\u914D\u3002");
+        const ledger = (method, data) => this.ledger(method, data, void 0, invite.ledger);
+        const s = await pq.state(ledger, invite.anchor, this.config.anchor ? this.config.pin : void 0, false);
         this.checkInvite(invite, s);
-        const { p } = pq.latest(s);
-        if (p.members[device.id]) throw Error("\u672C\u673A\u5DF2\u7ECF\u83B7\u51C6\u52A0\u5165\u6B64\u5E93\u3002");
-        if (Object.keys(p.members).length >= pq.deviceLimit) throw Error("\u8BBE\u5907\u5DF2\u6EE1\uFF0C\u8BF7\u7BA1\u7406\u5458\u5148\u64A4\u9500\u4E00\u53F0\u3002");
-        const requested = await pq.requestPair(dav, s, device, this.config.name, invite);
-        const { code } = await this.ledger("policy", { pairing: { action: "claim", slot: invite.slot, code: requested } });
-        if (code !== requested) {
-          const target = await pq.readRequest(dav, s, code);
-          if (target.id !== device.id || target.invite !== invite.slot) throw Error("\u6B64\u9080\u8BF7\u5DF2\u88AB\u4F7F\u7528\uFF0C\u8BF7\u7BA1\u7406\u5458\u751F\u6210\u65B0\u7801\u3002");
-        }
-        this.bindAnchor(invite.anchor);
-        this.config.request = code;
+        if (!s.deviceDav) throw Error("\u6B64\u5E93\u7684\u7F51\u5173\u5C1A\u672A\u542F\u7528\u514D\u586B\u626B\u7801\u3002");
+        const device = await this.device(), policy = pq.latest(s).p;
+        if (policy.members[device.id]) throw Error("\u672C\u673A\u5DF2\u83B7\u6388\u6743\uFF0C\u53EF\u4EE5\u76F4\u63A5\u540C\u6B65\u3002");
+        if (Object.keys(policy.members).length >= pq.deviceLimit) throw Error("\u8BBE\u5907\u5DF2\u6EE1\uFF0C\u8BF7\u7BA1\u7406\u5458\u5148\u64A4\u9500\u4E00\u53F0\u3002");
+        const tablet = Platform.isIosApp && (/iPad/.test(navigator.userAgent) || navigator.maxTouchPoints > 1 && /Mac/.test(navigator.platform));
+        const platform = tablet ? "iPad" : Platform.isIosApp ? "iPhone" : Platform.isAndroidApp ? "Android" : Platform.isMacOS ? "Mac" : Platform.isWin ? "Windows" : "\u7535\u8111";
+        const name = platform + " \xB7 " + device.id.slice(-6);
+        const { code, envelope } = await pq.signedRequest(s, device, name, invite);
+        const receipt = await ledger("policy", { pairing: { action: "claim", slot: invite.slot, code, envelope } });
+        const target = receipt.envelope && await pq.checkRequest(s, receipt.code, receipt.envelope);
+        if (!target || target.id !== device.id || target.invite !== invite.slot || target.pub.davCap !== device.davCap)
+          throw Error("\u6B64\u9080\u8BF7\u5DF2\u88AB\u4F7F\u7528\uFF0C\u8BF7\u7BA1\u7406\u5458\u663E\u793A\u65B0\u7801\u3002");
+        if (!this.config.anchor) this.config.firstApplication = true;
+        Object.assign(this.config, {
+          address: invite.address,
+          home: invite.address,
+          away: invite.address,
+          witness: invite.ledger,
+          anchor: invite.anchor,
+          deviceDav: true,
+          name: target.pub.name,
+          request: receipt.code,
+          username: ""
+        });
+        delete this.config.inviteLedger;
         await this.refresh(s);
-        return code;
+        return receipt.code;
+      }
+      async forgetApplication() {
+        if (!this.config.firstApplication) return;
+        for (const key of ["firstApplication", "request", "anchor", "pin", "roster", "deviceDav"]) delete this.config[key];
+        this.secret("device", "");
+        this.config.local = core2.randomId();
+        this.keys = void 0;
+        Object.assign(this.config, { address: "", home: "", away: "", witness: "", admin: false });
+        await this.saveData(this.config);
       }
       async invitedRequest(invite) {
         if (Date.now() >= invite.expires) throw Error("\u9080\u8BF7\u5DF2\u8FC7\u671F\u3002");
         const device = await this.device();
-        const { code } = await this.ledger("policy", { pairing: { action: "poll", slot: invite.slot } }, device.token);
+        const { code, envelope } = await this.ledger("policy", { pairing: { action: "poll", slot: invite.slot } }, device.token);
         if (!code) return null;
-        const dav = this.base().child(folder).child(namespace2);
         const s = await this.snapshot(this.config.anchor, false);
         this.checkInvite(invite, s);
-        const target = await pq.readRequest(dav, s, code);
+        const target = invite.automatic ? await pq.checkRequest(s, code, envelope) : await pq.readRequest((await this.route()).dav, s, code);
         if (target.invite !== invite.slot) throw Error("\u7533\u8BF7\u4E0E\u8BE5\u4E8C\u7EF4\u7801\u4E0D\u5339\u914D\u3002");
         return { code, name: target.pub.name };
       }
       async approve(code, invite) {
         const { dav, s, device } = await this.context(this.config.anchor, false);
-        const target = await pq.readRequest(dav, s, code);
+        let target;
+        if (invite?.automatic) {
+          const receipt = await this.ledger("policy", { pairing: { action: "poll", slot: invite.slot } }, device.token);
+          if (receipt.code !== code || !receipt.envelope) throw Error("\u7533\u8BF7\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u6838\u5BF9\u3002");
+          target = await pq.checkRequest(s, code, receipt.envelope);
+        } else target = await pq.readRequest(dav, s, code);
         if (invite) {
           this.checkInvite(invite, s);
           if (target.invite !== invite.slot) throw Error("\u7533\u8BF7\u4E0E\u8BE5\u4E8C\u7EF4\u7801\u4E0D\u5339\u914D\u3002");
@@ -16070,7 +16118,7 @@ module.exports = class HomeboundPlugin extends Plugin {
         }, () => {
           this.app.setting.open();
           this.app.setting.openTabById(this.manifest.id);
-        });
+        }, this.mode !== "pqc");
       } catch (e) {
         new Notice(e.message, 1e4);
       }

@@ -31,7 +31,9 @@ async function identity(seed, label) {
     const token=b64(await derive("ledger-capability",32));
     const pub={kem:b64(enc.publicKey),sig:b64(sig.publicKey),cap:await sha(new TextEncoder().encode(token))};
     const stagingKey=label==="device" ? await aes(await derive("local-upload-checkpoint",32)) : undefined;
-    return {pub,token,stagingKey,id:await fingerprint([pub.kem,pub.sig,pub.cap]),enc:enc.secretKey,sign:sig.secretKey};
+    const davToken=label==="device" ? b64(await derive("webdav-read-write",32)) : undefined;
+    const davCap=davToken && await sha(new TextEncoder().encode(davToken));
+    return {pub,token,stagingKey,davToken,davCap,id:await fingerprint([pub.kem,pub.sig,pub.cap]),enc:enc.secretKey,sign:sig.secretKey};
 }
 const freshSeed=()=>b64(random(32));
 const aes=raw=>crypto.subtle.importKey("raw",raw,"AES-GCM",false,["encrypt","decrypt"]);
@@ -51,7 +53,7 @@ const publicId=pub=>fingerprint([pub.kem,pub.sig,pub.cap]);
 const latest=state=>state.policies.at(-1);
 function publicDevice(device,name){
     check(typeof name==="string" && name.trim() && name.length<=64,"请输入设备名称（1 至 64 字）。");
-    return {...device.pub,name:name.trim()};
+    return {...device.pub,name:name.trim(),davCap:device.davCap};
 }
 async function state(ledger,anchor,pin,withRevisions=true) {
     check(idPattern.test(anchor),"库指纹无效。");
@@ -81,7 +83,7 @@ async function state(ledger,anchor,pin,withRevisions=true) {
         policies.push({p,digest});
     }
     check(!pin||pin.n<policies.length,"授权记录回退。");
-    return {policies,rows:snapshot.revisions,canRotate:snapshot.adminRevisionRotation===1,canInvite:snapshot.qrPairing===1};
+    return {policies,rows:snapshot.revisions,canRotate:snapshot.adminRevisionRotation===1,canInvite:snapshot.qrPairing===1,deviceDav:snapshot.deviceDav===1};
 }
 async function preparePolicy(p,actor,key){
     p.boxes={};
@@ -114,7 +116,7 @@ function currentPairingHead(s,head){
 }
 const lifetime=10*60*1000;
 const deviceLimit=10;
-async function requestPair(dav,s,device,name,invite){
+async function signedRequest(s,device,name,invite){
     const {p,digest}=latest(s),pub=publicDevice(device,name);
     const request={anchor:p.anchor,head:digest,nonce:randomId(),expires:Date.now()+lifetime,pub};
     if(invite){
@@ -123,12 +125,18 @@ async function requestPair(dav,s,device,name,invite){
         request.expires=Math.min(request.expires,invite.expires);
     }
     const code=await fingerprint([request]);
-    await dav.child("requests").put(code,jsonBytes({request,sig:signed("join",[request],device.sign)}).buffer);
+    return {code,envelope:{request,sig:signed("join",[request],device.sign)}};
+}
+async function requestPair(dav,s,device,name,invite){
+    const {code,envelope}=await signedRequest(s,device,name,invite);
+    await dav.child("requests").put(code,jsonBytes(envelope).buffer);
     return code;
 }
 async function readRequest(dav,s,code){
     check(idPattern.test(code),"配对码格式错误。");
-    const {request,sig}=parseBytes(await dav.child("requests").read(code));
+    return checkRequest(s,code,parseBytes(await dav.child("requests").read(code)));
+}
+async function checkRequest(s,code,{request,sig}){
     const {p}=latest(s);
     check(request.anchor===p.anchor && currentPairingHead(s,request.head),"配对申请已过期或已使用。");
     check(Number.isSafeInteger(request.expires)&&request.expires>=Date.now()&&request.expires<=Date.now()+lifetime+60000,"配对申请已过期。");
@@ -295,4 +303,4 @@ async function auditData(store){
     }
     return {checked:history.size,faults};
 }
-module.exports={deviceLimit,membershipHead,lifetime,identity,freshSeed,publicDevice,publicId,genesis,state,latest,requestPair,readRequest,nextPolicy,storeFor,auditData,validateGraph};
+module.exports={deviceLimit,membershipHead,lifetime,identity,freshSeed,publicDevice,publicId,genesis,state,latest,signedRequest,checkRequest,requestPair,readRequest,nextPolicy,storeFor,auditData,validateGraph};

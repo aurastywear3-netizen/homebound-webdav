@@ -21,10 +21,14 @@ class Dav{
     async put(n,b){this.files.set(this.prefix+n,new Uint8Array(b));}
     async read(n){if(!this.files.has(this.prefix+n))throw Error("DAV missing");return this.files.get(this.prefix+n);}
 }
-async function service(t){
+async function service(t,storage){
     const bootstrap=b64(randomBytes(32)), unique=core.randomId(),verifier=path.join(dir,unique+".verifier");
     await fs.writeFile(verifier,createHash("sha256").update(bootstrap).digest("hex"));
-    const proc=spawn("python3",["-B","-u",path.join(__dirname,"../witness/server.py"),"--port","0","--db",path.join(dir,unique+".db"),"--bootstrap-verifier",verifier],{stdio:["ignore","pipe","inherit"]});
+    const args=["-B","-u",path.join(__dirname,"../witness/server.py"),"--port","0","--db",path.join(dir,unique+".db"),"--bootstrap-verifier",verifier];
+    if(storage){
+        const file=path.join(dir,unique+".json");await fs.writeFile(file,JSON.stringify(storage));args.push("--webdav-config",file);
+    }
+    const proc=spawn("python3",args,{stdio:["ignore","pipe","inherit"]});
     t.after(()=>proc.kill());
     const port=await new Promise((ok,fail)=>{proc.stdout.once("data",buf=>ok(Number(buf.toString().trim())));proc.once("error",fail);proc.once("exit",()=>fail(Error("ledger closed")));});
     async function ledger(method,data,token){
@@ -33,7 +37,7 @@ async function service(t){
         const r=await fetch("http://127.0.0.1:"+port+"/"+method,{method:"POST",headers,body:JSON.stringify(data)});
         const val=await r.json();if(!r.ok)throw Object.assign(Error(val.error),{status:r.status});return val;
     }
-    return {ledger,bootstrap};
+    return {ledger,bootstrap,base:"http://127.0.0.1:"+port};
 }
 async function setup(t){
     const {ledger,bootstrap}=await service(t),dav=new Dav(),owner=await seed(),guest=await seed(),rec=await root();
@@ -530,4 +534,70 @@ test("a guest resumes a legacy chunk checkpoint across an admin rotation, then v
     assert.equal(s.policies.length,f.s.policies.length+1);assert.equal(s.rows.length,2);
     const admin=await pq.storeFor(f.ledger,f.dav,s,f.owner,transfer);
     assert.deepEqual(new Uint8Array(await admin.readBody((await admin.history()).get(rev.id))),body);
+});
+
+test("passwordless QR signs and claims without WebDAV credentials, retries preserve the original applicant",async t=>{
+    const f=await setup(t),newDevice=await seed(),imposter=await seed();
+    const invite={slot:core.randomId(),head:pq.membershipHead(f.s).digest,anchor:f.rec.id,expires:Date.now()+pq.lifetime};
+    const call=(action,fields,token)=>f.ledger("policy",{pairing:{action,slot:invite.slot,...fields}},token);
+    await call("open",{head:pq.latest(f.s).digest,expires:invite.expires},f.owner.token);
+    const first=await pq.signedRequest(f.s,newDevice,"iPad",invite);
+    const claimed=await call("claim",first);
+    assert.equal(claimed.code,first.code);
+    assert.deepEqual((await call("claim",await pq.signedRequest(f.s,imposter,"other",invite))),claimed);
+    assert.notEqual(newDevice.davToken,newDevice.token);
+    assert.notEqual(newDevice.davCap,newDevice.pub.cap);
+    assert(!JSON.stringify(first).includes(newDevice.davToken));
+    assert(!JSON.stringify(first).includes(newDevice.token));
+    const changed=structuredClone(first.envelope);changed.request.pub.name="tamper";
+    await assert.rejects(pq.checkRequest(f.s,first.code,changed),/替换/);
+    const poll=await call("poll",{},f.owner.token);
+    const verified=await pq.checkRequest(f.s,poll.code,poll.envelope);
+    assert.equal(verified.id,newDevice.id);
+    await pq.nextPolicy(f.ledger,f.s,f.owner,"approve",verified);
+    const members=pq.latest(await f.state()).p.members;
+    assert.equal(members[newDevice.id].davCap,newDevice.davCap);
+    assert.equal(members[imposter.id],undefined);
+    await assert.rejects(call("claim",first),/expired/);
+});
+
+test("device WebDAV uses scoped server credentials and refuses pending, revoked and wrong-purpose tokens",async t=>{
+    const https=require("node:https"),{execFileSync}=require("node:child_process");
+    const name=core.randomId(),key=path.join(dir,name+".key"),cert=path.join(dir,name+".crt");
+    execFileSync("openssl",["req","-x509","-newkey","rsa:2048","-nodes","-days","1","-keyout",key,"-out",cert,
+        "-subj","/CN=localhost","-addext","subjectAltName=IP:127.0.0.1"],{stdio:"ignore"});
+    const objects=new Map(),calls=[];
+    const upstream=https.createServer({key:await fs.readFile(key),cert:await fs.readFile(cert)},async(req,res)=>{
+        calls.push([req.method,req.url,req.headers.authorization]);
+        if(req.method==="PUT"){
+            const chunks=[];for await(const chunk of req)chunks.push(chunk);
+            objects.set(req.url,Buffer.concat(chunks));res.writeHead(201);res.end();
+        }else if(objects.has(req.url))res.end(objects.get(req.url));
+        else {res.writeHead(404);res.end();}
+    });
+    await new Promise(resolve=>upstream.listen(0,"127.0.0.1",resolve));t.after(()=>upstream.close());
+    const backend={url:"https://127.0.0.1:"+upstream.address().port+"/only-this-vault",username:"storage",password:name,caFile:cert};
+    const {base,ledger,bootstrap}=await service(t,backend),owner=await seed(),guest=await seed(),recovery=await root(),dav=new Dav();
+    await pq.genesis(ledger,owner,"Mac",recovery,bootstrap);
+    let state=await pq.state(ledger,recovery.id);
+    assert.equal(state.deviceDav,true);
+    const object="objects/"+core.randomId(),body=randomBytes(150000);
+    const get=(path,token=guest.davToken,method="GET",contents)=>fetch(base+"/dav/"+path,{method,body:contents,headers:{Authorization:"Bearer "+guest.id+"."+token}});
+    assert.equal((await get(object)).status,403);
+    const code=await pq.requestPair(dav,state,guest,"iPad");
+    await pq.nextPolicy(ledger,state,owner,"approve",await pq.readRequest(dav,state,code));
+    assert.equal((await get(object,guest.token)).status,403);
+    assert.equal((await get("vault.json",guest.davToken,"PUT",body)).status,405);
+    assert.equal((await get("requests/"+code)).status,403);
+    assert.equal((await get("other-vault")).status,404);
+    assert.equal(calls.length,0);
+    assert.equal((await get(object,guest.davToken,"PUT",body)).status,201);
+    assert.deepEqual(Buffer.from(await (await get(object)).arrayBuffer()),body);
+    const auth="Basic "+Buffer.from("storage:"+name).toString("base64");
+    assert.deepEqual(calls,[["PUT","/only-this-vault/"+object,auth],["GET","/only-this-vault/"+object,auth]]);
+    state=await pq.state(ledger,recovery.id);
+    await pq.nextPolicy(ledger,state,owner,"revoke",guest.id);
+    assert.equal((await get(object)).status,403);
+    assert.equal((await get(object,guest.davToken,"PUT",body)).status,403);
+    assert.equal(calls.length,2);
 });

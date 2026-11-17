@@ -1,14 +1,18 @@
 """Single-lab trusted sequencer. Only encrypted revision manifests and signed policies live here."""
 import argparse
+import base64
 import hashlib
 import hmac
+import http.client
 import json
 import re
 import sqlite3
+import ssl
 import time
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 HEX = re.compile(r"[0-9a-f]{64}")
 DEVICE_LIMIT = 10
@@ -48,6 +52,7 @@ def init(db):
         CREATE TABLE IF NOT EXISTS pairing_invite (
             singleton INTEGER PRIMARY KEY CHECK(singleton=1), slot TEXT NOT NULL, expires INTEGER NOT NULL, code TEXT
         );
+        CREATE TABLE IF NOT EXISTS pairing_application (slot TEXT PRIMARY KEY, envelope TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS revisions (seq INTEGER PRIMARY KEY, id TEXT UNIQUE, epoch INTEGER, row TEXT NOT NULL);
         """)
 
@@ -101,6 +106,7 @@ def insert_policy(c,head,row,token,bootstrap_hash,rotation=False):
     c.execute("INSERT INTO policies VALUES(?,?,?)",(p["n"],digest,row))
     if not rotation:
         c.execute("DELETE FROM pairing_invite")
+        c.execute("DELETE FROM pairing_application")
     return p,digest
 
 def current_invite(c, slot):
@@ -124,16 +130,27 @@ def pair(c,head,data,token):
             require(type(expires) is int and now<expires<=now+11*60*1000,400,"Invalid expiration")
             active=c.execute("SELECT slot,expires FROM pairing_invite WHERE singleton=1").fetchone()
             if active!=(slot,expires):
+                c.execute("DELETE FROM pairing_application")
                 c.execute("INSERT OR REPLACE INTO pairing_invite VALUES(1,?,?,NULL)",(slot,expires))
             return {"opened":True}
-        return {"code":current_invite(c,slot)}
+        return application(c,slot,current_invite(c,slot))
     require(action=="claim",400,"Invalid invitation action")
     code=data["code"]
     require(isinstance(code,str) and ID.fullmatch(code),400,"Invalid request code")
     existing=current_invite(c,slot)
     if existing is None:
+        if "envelope" in data:
+            envelope=data["envelope"]
+            encoded=json.dumps(envelope,separators=(",",":"))
+            require(len(encoded)<32768 and envelope["request"]["invite"]==slot and
+                    HEX.fullmatch(envelope["request"]["pub"]["davCap"]),400,"Invalid device application")
+            c.execute("INSERT INTO pairing_application VALUES(?,?)",(slot,encoded))
         c.execute("UPDATE pairing_invite SET code=? WHERE singleton=1",(code,))
-    return {"code":existing or code}
+    return application(c,slot,existing or code)
+
+def application(c,slot,code):
+    row=c.execute("SELECT envelope FROM pairing_application WHERE slot=?",(slot,)).fetchone()
+    return {"code":code,"envelope":json.loads(row[0])} if row else {"code":code}
 
 def commit_revision(c,head,data,token,bootstrap_hash):
     require(head,403,"Uninitialized")
@@ -172,14 +189,14 @@ def commit_revision(c,head,data,token,bootstrap_hash):
     if rotation:result["policyDigest"]=previous
     return result
 
-def transact(db, bootstrap_hash, method, data, token):
+def transact(db, bootstrap_hash, method, data, token, device_dav=False):
     with closing(sqlite3.connect(db,timeout=10)) as c, c:
         c.execute("BEGIN" if method=="state" else "BEGIN IMMEDIATE")
         head=c.execute("SELECT n,digest,row FROM policies ORDER BY n DESC LIMIT 1").fetchone()
         if method=="state":
             require(head,404,"Uninitialized")
             require(json.loads(head[2])["policy"]["anchor"]==data["anchor"],403,"Wrong vault")
-            return {"nonce":data["nonce"],"adminRevisionRotation":1,"deviceLimit":DEVICE_LIMIT,"qrPairing":1,
+            return {"nonce":data["nonce"],"adminRevisionRotation":1,"deviceLimit":DEVICE_LIMIT,"qrPairing":1,"deviceDav":int(device_dav),
                     "policies":[r[0] for r in c.execute("SELECT row FROM policies ORDER BY n")],
                     "revisions":[r[0] for r in c.execute("SELECT row FROM revisions ORDER BY seq")] if data.get("withRevisions",True) else []}
         if method=="commit":return commit_revision(c,head,data,token,bootstrap_hash)
@@ -195,6 +212,56 @@ def transact(db, bootstrap_hash, method, data, token):
 
 class API(BaseHTTPRequestHandler):
     def log_message(self,*args): pass
+    def proxy_object(self):
+        upstream=getattr(self.server,"dav",None)
+        path=self.path.removeprefix("/dav/")
+        if not upstream or not self.path.startswith("/dav/") or not re.fullmatch(r"vault[.]json|(?:objects|requests)/[a-f0-9]{32}",path):
+            return self.send_error(404)
+        if self.command=="PUT" and not path.startswith("objects/"):
+            return self.send_error(405)
+        auth=self.headers.get("Authorization","")
+        match=re.fullmatch(r"Bearer ([0-9a-f]{32})[.]([A-Za-z0-9+/]{43}=)",auth)
+        if not match:return self.send_error(403)
+        with closing(sqlite3.connect(self.server.db,timeout=10)) as conn:
+            row=conn.execute("SELECT row FROM policies ORDER BY n DESC LIMIT 1").fetchone()
+        policy=json.loads(row[0])["policy"] if row else {}
+        member=policy.get("members",{}).get(match[1],{})
+        if not hmac.compare_digest(member.get("davCap",""),token_hash(match[2])):
+            return self.send_error(403)
+        if path.startswith("requests/") and policy.get("admin")!=match[1]:
+            return self.send_error(403)
+        length=self.headers.get("Content-Length","")
+        if self.command=="PUT" and (not length.isdecimal() or len(length)>12 or self.headers.get("Transfer-Encoding")):
+            return self.send_error(411)
+        endpoint,credentials,context=upstream
+        conn=http.client.HTTPSConnection(endpoint.hostname,endpoint.port,context=context,timeout=60)
+        headers_sent=False
+        try:
+            conn.putrequest(self.command,endpoint.path.rstrip("/")+"/"+path)
+            conn.putheader("Authorization",credentials)
+            if self.command=="PUT":
+                conn.putheader("Content-Length",length)
+                conn.putheader("Content-Type","application/octet-stream")
+            conn.endheaders()
+            remaining=int(length) if self.command=="PUT" else 0
+            while remaining:
+                chunk=self.rfile.read(min(remaining,65536))
+                if not chunk:raise OSError("Incomplete upload")
+                conn.send(chunk);remaining-=len(chunk)
+            response=conn.getresponse()
+            # Never redirect a device credential, or forward storage authentication details.
+            if response.status not in (200,201,204,404,409,412,413,423,507):
+                return self.send_error(502)
+            self.send_response(response.status);self.send_header("Cache-Control","no-store")
+            self.send_header("Content-Type","application/octet-stream")
+            if response.length is not None:self.send_header("Content-Length",str(response.length))
+            self.end_headers();headers_sent=True
+            while chunk:=response.read(65536):self.wfile.write(chunk)
+        except (OSError,http.client.HTTPException):
+            if not headers_sent:self.send_error(502)
+            self.close_connection=True
+        finally:conn.close()
+    do_GET=do_PUT=proxy_object
     def do_POST(self):
         try:
             n=int(self.headers.get("Content-Length","0"))
@@ -203,7 +270,7 @@ class API(BaseHTTPRequestHandler):
             require(0<n<=limit,413,"Request size")
             data=json.loads(self.rfile.read(n))
             token=self.headers.get("Authorization","").removeprefix("Bearer ")
-            result=transact(self.server.db,self.server.bootstrap_hash,self.path.removeprefix("/"),data,token)
+            result=transact(self.server.db,self.server.bootstrap_hash,self.path.removeprefix("/"),data,token,bool(self.server.dav))
             status=200
         except Denied as e:
             status=e.status;result={"error":str(e)}
@@ -223,11 +290,20 @@ if __name__=="__main__":
     parser=argparse.ArgumentParser()
     parser.add_argument("--db",required=True);parser.add_argument("--bootstrap-verifier",required=True)
     parser.add_argument("--port",type=int,default=30447)
+    parser.add_argument("--webdav-config",type=Path,help="Optional per-vault HTTPS storage configuration for passwordless QR enrollment")
     args=parser.parse_args()
     verifier=Path(args.bootstrap_verifier).read_text().strip()
     assert HEX.fullmatch(verifier)
     init(args.db)
     server=ThreadingHTTPServer(("127.0.0.1",args.port),API)
     server.db=args.db;server.bootstrap_hash=verifier
+    server.dav=None
+    if args.webdav_config:
+        cfg=json.loads(args.webdav_config.read_text())
+        endpoint=urlsplit(cfg["url"])
+        if endpoint.scheme!="https" or not endpoint.hostname or endpoint.username or endpoint.password or endpoint.query or endpoint.fragment:
+            parser.error("webdav-config requires a fixed HTTPS storage URL")
+        credentials=base64.b64encode((cfg["username"]+":"+cfg["password"]).encode()).decode()
+        server.dav=(endpoint,"Basic "+credentials,ssl.create_default_context(cafile=cfg.get("caFile")))
     print(server.server_address[1],flush=True)
     server.serve_forever()

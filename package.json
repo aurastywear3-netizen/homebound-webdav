@@ -1,6 +1,6 @@
 {
   "name": "homebound-webdav",
-  "version": "0.2.2-rc.3",
+  "version": "0.2.2-rc.4",
   "private": true,
   "scripts": {
     "build": "node build.mjs",

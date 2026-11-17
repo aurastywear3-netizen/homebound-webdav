@@ -9,7 +9,7 @@ const shortId = /^[0-9a-f]{32}$/;
 
 function validate(params, now = Date.now()) {
     const {v, address, anchor, slot, head, until, ledger} = params;
-    if (v !== "1" || !shortId.test(anchor) || !shortId.test(slot) || !/^[0-9a-f]{64}$/.test(head))
+    if (!["1","2"].includes(v) || !shortId.test(anchor) || !shortId.test(slot) || !/^[0-9a-f]{64}$/.test(head))
         throw Error("无效的 Homebound 设备邀请。");
     const expires = Number(until);
     if (!Number.isSafeInteger(expires) || expires <= now || expires > now + pq.lifetime + 60000)
@@ -17,12 +17,12 @@ function validate(params, now = Date.now()) {
     const gateway = core.gatewayUrl(address);
     const service = ledger === undefined ? gateway + "/homebound-pqc-ledger" : core.gatewayUrl(ledger);
     if (new URL(service).origin !== new URL(gateway).origin) throw Error("邀请中的提交服务必须与网关同源。");
-    return {address:gateway, ledger:service, anchor, slot, head, expires};
+    return {address:gateway, ledger:service, anchor, slot, head, expires, automatic:v==="2"};
 }
 
 function create(address, ledger, snapshot) {
     const {p,digest} = pq.membershipHead(snapshot);
-    const params = {v:"1", address, anchor:p.anchor, slot:core.randomId(), head:digest, until:String(Date.now()+pq.lifetime)};
+    const params = {v:snapshot.deviceDav?"2":"1", address, anchor:p.anchor, slot:core.randomId(), head:digest, until:String(Date.now()+pq.lifetime)};
     if (ledger !== address+"/homebound-pqc-ledger") params.ledger = ledger;
     const invite = validate(params);
     const url = "obsidian://"+action+"?"+new URLSearchParams(params);

@@ -16,3 +16,14 @@ test("invitation preserves the vault base path and discloses only public rendezv
     assert.throws(()=>invites.parse(url.href),/过期/);
     assert.throws(()=>invites.parse("https://untrusted.example/"),/管理员/);
 });
+
+test("passwordless QR uses a versioned invitation with no device or storage credential in its payload",()=>{
+    const base="https://example.org/independent";
+    const s={deviceDav:true,policies:[{p:{anchor:"1".repeat(32)},digest:"2".repeat(64)}]};
+    const made=invites.create(base,base+"/homebound-pqc-ledger",s);
+    const url=new URL(made.url);
+    assert.equal(url.searchParams.get("v"),"2");
+    assert.deepEqual([...url.searchParams.keys()].sort(),["address","anchor","head","slot","until","v"]);
+    assert.equal(invites.parse(made.url).automatic,true);
+    url.searchParams.set("v","1");assert.equal(invites.parse(url.href).automatic,false);
+});

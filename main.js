@@ -3654,7 +3654,7 @@ var HomeboundSettings = class extends PluginSettingTab {
       }
       this.display();
     }));
-    new Setting(el).setName(tr("Resumable large attachments", "\u5927\u9644\u4EF6\u5206\u5757\u7EED\u4F20")).setDesc(tr("Enable after updating every device in this remote vault to 0.2.1-rc.2 or later. Earlier versions cannot read chunked files.", "\u8BF7\u5148\u5C06\u6B64\u8FDC\u7AEF\u5E93\u7684\u6240\u6709\u8BBE\u5907\u5347\u7EA7\u81F3 0.2.1-rc.2 \u6216\u66F4\u9AD8\u7248\u672C\u3002\u65E7\u7248\u65E0\u6CD5\u8BFB\u53D6\u5206\u5757\u9644\u4EF6\u3002")).addToggle((t) => t.setValue(p.transfer.enabled).onChange((value) => {
+    new Setting(el).setName(tr("Resumable large attachments", "\u5927\u9644\u4EF6\u5206\u5757\u7EED\u4F20")).setDesc(tr("Use version 0.2.1 or later on every device in this remote vault before enabling this option. Earlier stable releases cannot read chunked files.", "\u8BF7\u5148\u5C06\u6B64\u8FDC\u7AEF\u5E93\u7684\u6240\u6709\u8BBE\u5907\u5347\u7EA7\u81F3 0.2.1 \u6216\u66F4\u9AD8\u7248\u672C\uFF0C\u518D\u542F\u7528\u6B64\u9009\u9879\u3002\u66F4\u65E9\u7684\u6B63\u5F0F\u7248\u65E0\u6CD5\u8BFB\u53D6\u5206\u5757\u9644\u4EF6\u3002")).addToggle((t) => t.setValue(p.transfer.enabled).onChange((value) => {
       p.transfer.enabled = value;
       p.app.saveLocalStorage("homebound-chunk-upload", value);
     }));

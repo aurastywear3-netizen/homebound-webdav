@@ -65,7 +65,7 @@ class HomeboundSettings extends PluginSettingTab {
                     this.display();
                 }));
         new Setting(el).setName(tr("Resumable large attachments", "大附件分块续传"))
-            .setDesc(tr("Enable after updating every device in this remote vault to 0.2.1-rc.2 or later. Earlier versions cannot read chunked files.", "请先将此远端库的所有设备升级至 0.2.1-rc.2 或更高版本。旧版无法读取分块附件。"))
+            .setDesc(tr("Use version 0.2.1 or later on every device in this remote vault before enabling this option. Earlier stable releases cannot read chunked files.", "请先将此远端库的所有设备升级至 0.2.1 或更高版本，再启用此选项。更早的正式版无法读取分块附件。"))
             .addToggle(t => t.setValue(p.transfer.enabled).onChange(value => {
                 p.transfer.enabled = value;
                 p.app.saveLocalStorage("homebound-chunk-upload",value);

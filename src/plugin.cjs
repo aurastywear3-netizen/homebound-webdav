@@ -117,6 +117,18 @@ module.exports = class HomeboundPlugin extends Plugin {
         if (this.mode === "pqc") this.pqc = new PqcMode(this.app,this.transfer);
         this.settingsTab = new HomeboundSettings(this.app, this);
         this.addSettingTab(this.settingsTab);
+        const invites = require("./pairing-invite.cjs");
+        this.registerObsidianProtocolHandler(invites.action, params => {
+            try {
+                const invite = invites.validate(params);
+                require("./pairing-ui.cjs").join(this.app,invite,fields=>{
+                    const saved=this.app.loadLocalStorage("homebound-webdav-pqc-config");
+                    if(saved?.anchor && saved.anchor!==invite.anchor)throw Error("请打开要加入此远端库的独立本地库。");
+                    this.selectMode("pqc");
+                    return this.pqc.exclusive(()=>this.pqc.joinInvite(invite,fields));
+                },()=>{this.app.setting.open();this.app.setting.openTabById(this.manifest.id);});
+            }catch(e){new Notice(e.message,10000);}
+        });
         this.addCommand({ id: "sync", name: tr("Sync now", "立即同步"), callback: () => this.run() });
         this.addCommand({ id: "resolve", name: tr("Resolve conflict using the active file", "使用当前文件解决冲突"), checkCallback: checking => {
             const file = this.app.workspace.getActiveFile();

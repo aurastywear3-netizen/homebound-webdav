@@ -37,7 +37,7 @@ test("upgraded devices keep their identity and send DAV and ledger requests only
     plugin.loadData = async () => ({home, away, id:"existing", secretId:"legacy-key"});
     plugin.app = {vault:{getName:()=>"test"},workspace:{onLayoutReady(){}}, loadLocalStorage:k=>saved.get(k),
         saveLocalStorage:(k,v)=>saved.set(k,v), secretStorage:{getSecret:()=>"dav-password", setSecret(){}}};
-    plugin.addCommand = plugin.addSettingTab = plugin.registerDomEvent = plugin.registerInterval = () => {};
+    plugin.registerObsidianProtocolHandler = plugin.addCommand = plugin.addSettingTab = plugin.registerDomEvent = plugin.registerInterval = () => {};
     const previous = {window:global.window, document:global.document};
     global.window = {setInterval:()=>0}; global.document = {};
     try {

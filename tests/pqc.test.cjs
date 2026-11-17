@@ -261,25 +261,72 @@ test("13: a genuine 256-record legacy vault can revoke, recover repeatedly and d
     await assert.rejects(pq.storeFor(ledger,dav,again.s,recovered.device),/撤销/);
     await assert.rejects(takeover({ledger,state:latestState,rec}),/恢复身份/);
 });
-test("14: full 32-member roster still permits revocation and recovery, compact rows stay bounded",async t=>{
+test("QR invitation reserves one signed request atomically and expires on replacement or a change in members",async t=>{
+    const f=await setup(t);
+    const pair=(action,slot,fields,token)=>f.ledger("policy",{pairing:{action,slot,...fields}},token);
+    const open=async(slot,token=f.owner.token,expires=Date.now()+pq.lifetime)=>{
+        await pair("open",slot,{head:pq.latest(await f.state()).digest,expires},token);
+    };
+    const slot=core.randomId();
+    await assert.rejects(open(slot,f.guest.token),/Management denied/);
+    await assert.rejects(open(slot,f.owner.token,Date.now()-1),/Invalid expiration/);
+    const until=Date.now()+pq.lifetime;
+    await open(slot,f.owner.token,until);
+    await assert.rejects(pair("poll",slot,{},f.guest.token),/Management denied/);
+    const invite={anchor:f.rec.id,head:pq.membershipHead(f.s).digest,slot,expires:until};
+    const users=await Promise.all([seed(),seed()]);
+    const codes=await Promise.all(users.map(d=>pq.requestPair(f.dav,f.s,d,"new device",invite)));
+    const claims=await Promise.all(codes.map(code=>pair("claim",slot,{code})));
+    assert.equal(claims[0].code,claims[1].code);
+    const winner=claims[0].code,loser=codes.find(c=>c!==winner);
+    await open(slot,f.owner.token,until);
+    assert.equal((await pair("poll",slot,{},f.owner.token)).code,winner);
+    await assert.rejects(pq.nextPolicy(f.ledger,f.s,f.owner,"approve",await pq.readRequest(f.dav,f.s,loser)),/Different pairing request/);
+    const next=core.randomId();
+    await open(next);
+    await assert.rejects(pq.nextPolicy(f.ledger,f.s,f.owner,"approve",await pq.readRequest(f.dav,f.s,winner)),/Invitation expired/);
+    await f.revoke();
+    await assert.rejects(pair("claim",next,{code:winner}),/Invitation expired/);
+});
+
+test("14: full 10-member roster still permits revocation and recovery, compact rows stay bounded",async t=>{
     const f=await setup(t);
     let current=f.s;
     const guests=[];
-    for(let i=2;i<=32;i++){
-        const device=await seed(),code=await pq.requestPair(f.dav,current,device,"Guest "+i);
-        const request=await pq.readRequest(f.dav,current,code);
-        const add=()=>pq.nextPolicy(f.ledger,current,f.owner,"approve",request);
-        if(i===32){await assert.rejects(add(),/membership/);break;}
-        const committed=await add();guests.push(device);current.policies.push(committed);
+    async function candidate(name){
+        const device=await seed(), code=await pq.requestPair(f.dav,current,device,name);
+        return {device,request:await pq.readRequest(f.dav,current,code)};
     }
-    assert.equal(Object.keys(pq.latest(current).p.members).length,32);
+    while(Object.keys(pq.latest(current).p.members).length<9){
+        const {device,request}=await candidate("Guest");
+        const committed=await pq.nextPolicy(f.ledger,current,f.owner,"approve",request);
+        guests.push(device);current.policies.push(committed);
+    }
+    const contenders=await Promise.all([candidate("A"),candidate("B")]);
+    const race=await Promise.allSettled(contenders.map(c=>pq.nextPolicy(f.ledger,current,f.owner,"approve",c.request)));
+    assert.equal(race.filter(r=>r.status==="fulfilled").length,1);
+    assert.equal(race.find(r=>r.status==="rejected").reason.status,409);
+    current=await f.state();
+    const {request}=await candidate("Too many");
+    await assert.rejects(pq.nextPolicy(f.ledger,current,f.owner,"approve",request),/最多授权 10/);
+    assert.equal(Object.keys(pq.latest(current).p.members).length,10);
     const head=pq.latest(current);
+    // A client bypassing the local check must also be rejected by the sequencer.
+    const excess={...head.p,n:head.p.n+1,parent:head.digest,by:f.owner.id,members:{...head.p.members,[request.id]:request.pub}};
+    const update={head:head.digest,row:JSON.stringify({policy:excess})};
+    await assert.rejects(f.ledger("policy",update,f.owner.token),/Device limit reached/);
+    await assert.rejects(f.ledger("policy",update,f.guest.token),/Management denied/);
+    const transfer={...excess,members:head.p.members,admin:f.guest.id};
+    await assert.rejects(f.ledger("policy",{head:head.digest,row:JSON.stringify({policy:transfer})},f.owner.token),/Only recovery/);
+    await assert.rejects(pq.nextPolicy(f.ledger,current,f.guest,"revoke",f.owner.id),/管理员不匹配/);
+    await assert.rejects(pq.nextPolicy(f.ledger,current,f.owner,"revoke",f.owner.id),/无法撤销/);
+
     assert.ok(Buffer.byteLength(JSON.stringify(head.p))<300*1024);
     const memberLimitWriter=await pq.storeFor(f.ledger,f.dav,current,f.owner);
-    const rev=await memberLimitWriter.publish("all-members.md",[],buffer("32 members"));
+    const rev=await memberLimitWriter.publish("all-members.md",[],buffer("10 members"));
     current=await f.state();
     assert.equal(pq.latest(current).p.revisionId,rev.id);
-    assert.equal(Object.keys(pq.latest(current).p.boxes).length,32);
+    assert.equal(Object.keys(pq.latest(current).p.boxes).length,10);
     await pq.nextPolicy(f.ledger,current,f.owner,"revoke",guests.at(-1).id);
     const {device,s}=await takeover({...f,state:f.state});
     assert.equal(Object.keys(pq.latest(s).p.members).length,1);
@@ -295,7 +342,7 @@ test("15: official-ID candidate preserves legacy settings and opens PQC only aft
     plugin.loadData=async()=>({...legacy});plugin.saveData=async()=>assert.fail("rewrote 0.1.1 settings");
     plugin.app={vault:{getName:()=>"vault"},workspace:{onLayoutReady(){}},loadLocalStorage:k=>values.get(k),
         saveLocalStorage:(k,v)=>values.set(k,v)};
-    plugin.addCommand=plugin.addSettingTab=plugin.registerDomEvent=plugin.registerInterval=()=>{};
+    plugin.registerObsidianProtocolHandler=plugin.addCommand=plugin.addSettingTab=plugin.registerDomEvent=plugin.registerInterval=()=>{};
     const globals={window:global.window,document:global.document};
     global.window={setInterval:()=>0};global.document={};
     try{

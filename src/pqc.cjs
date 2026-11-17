@@ -81,7 +81,7 @@ async function state(ledger,anchor,pin,withRevisions=true) {
         policies.push({p,digest});
     }
     check(!pin||pin.n<policies.length,"授权记录回退。");
-    return {policies,rows:snapshot.revisions,canRotate:snapshot.adminRevisionRotation===1};
+    return {policies,rows:snapshot.revisions,canRotate:snapshot.adminRevisionRotation===1,canInvite:snapshot.qrPairing===1};
 }
 async function preparePolicy(p,actor,key){
     p.boxes={};
@@ -90,8 +90,8 @@ async function preparePolicy(p,actor,key){
     const row=JSON.stringify({policy:p,sig:signed("policy",[p],actor.sign)});
     return {p,row,digest:await digestOf(row)};
 }
-async function commitPolicy(ledger,next,token){
-    const receipt=await ledger("policy",{head:next.p.parent,row:next.row},token);
+async function commitPolicy(ledger,next,token,invitation){
+    const receipt=await ledger("policy",{head:next.p.parent,row:next.row,invitation},token);
     check(receipt.digest===next.digest,"提交服务返回了不同的授权摘要。");
     return {p:next.p,digest:next.digest};
 }
@@ -113,9 +113,15 @@ function currentPairingHead(s,head){
     return false;
 }
 const lifetime=10*60*1000;
-async function requestPair(dav,s,device,name){
+const deviceLimit=10;
+async function requestPair(dav,s,device,name,invite){
     const {p,digest}=latest(s),pub=publicDevice(device,name);
     const request={anchor:p.anchor,head:digest,nonce:randomId(),expires:Date.now()+lifetime,pub};
+    if(invite){
+        check(invite.anchor===p.anchor && invite.head===membershipHead(s).digest && invite.expires>Date.now(),"邀请已过期，请管理员重新生成二维码。");
+        request.invite=invite.slot;
+        request.expires=Math.min(request.expires,invite.expires);
+    }
     const code=await fingerprint([request]);
     await dav.child("requests").put(code,jsonBytes({request,sig:signed("join",[request],device.sign)}).buffer);
     return code;
@@ -128,7 +134,7 @@ async function readRequest(dav,s,code){
     check(Number.isSafeInteger(request.expires)&&request.expires>=Date.now()&&request.expires<=Date.now()+lifetime+60000,"配对申请已过期。");
     check(idPattern.test(request.nonce)&&await fingerprint([request])===code,"配对码被替换。");
     verify("join",[request],sig,request.pub.sig);
-    return {id:await publicId(request.pub),pub:request.pub,expires:request.expires,head:request.head};
+    return {id:await publicId(request.pub),pub:request.pub,expires:request.expires,head:request.head,invite:request.invite,code};
 }
 async function nextPolicy(ledger,s,actor,action,arg){
     const {p,digest}=latest(s),restoring=action==="restore";
@@ -143,10 +149,12 @@ async function nextPolicy(ledger,s,actor,action,arg){
     }else if(action==="revoke"){
         check(arg!==admin&&members[arg],"无法撤销该设备。");delete members[arg];
     }else if(action==="approve"){
+        check(Object.keys(members).length<deviceLimit,"此库最多授权 10 台设备（含管理员），请先撤销一台。");
         check(!members[arg.id] && arg.expires>=Date.now() && currentPairingHead(s,arg.head),"配对申请失效。");members[arg.id]=arg.pub;
     }else check(action==="seal-history","未知操作。");
     const next=await prepareSuccessor({p,digest},actor,keys,{by:restoring?"recovery":actor.id,recovery,admin,members});
-    return commitPolicy(ledger,next.policy,actor.token);
+    const invitation=action==="approve" && arg.invite ? {slot:arg.invite,code:arg.code} : undefined;
+    return commitPolicy(ledger,next.policy,actor.token,invitation);
 }
 async function prepareSuccessor({p,digest},actor,keys,fields){
     const next={suite,n:p.n+1,parent:digest,anchor:p.anchor,...fields};
@@ -287,4 +295,4 @@ async function auditData(store){
     }
     return {checked:history.size,faults};
 }
-module.exports={identity,freshSeed,publicDevice,publicId,genesis,state,latest,requestPair,readRequest,nextPolicy,storeFor,auditData,validateGraph};
+module.exports={deviceLimit,membershipHead,lifetime,identity,freshSeed,publicDevice,publicId,genesis,state,latest,requestPair,readRequest,nextPolicy,storeFor,auditData,validateGraph};

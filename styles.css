@@ -45,3 +45,11 @@
     overflow: auto;
     user-select: text;
 }
+
+.homebound-invite-qr {
+    display: block;
+    width: min(100%, 23rem);
+    height: auto;
+    margin-inline: auto;
+    image-rendering: pixelated;
+}

@@ -1,6 +1,6 @@
 {
   "name": "homebound-webdav",
-  "version": "0.2.2-rc.2",
+  "version": "0.2.2-rc.3",
   "private": true,
   "scripts": {
     "build": "node build.mjs",
@@ -8,6 +8,8 @@
   },
   "dependencies": {
     "@noble/post-quantum": "0.7.1",
-    "esbuild": "0.28.2"
+    "esbuild": "0.28.2",
+    "jsqr": "1.4.0",
+    "qrcode-generator": "2.0.4"
   }
 }

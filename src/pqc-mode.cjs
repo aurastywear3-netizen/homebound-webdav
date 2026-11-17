@@ -6,6 +6,8 @@ const {Dav,VaultFiles,credentials}=require("./adapter.cjs");
 const folder="Homebound-PQC";
 const namespace="pqc-preview-2";
 const notice=e=>new Notice(e.message||String(e),10000);
+const invites=require("./pairing-invite.cjs");
+const pairingUI=require("./pairing-ui.cjs");
 const { ConflictModal } = require("./pqc-conflict.cjs");
 class Output extends Modal {
     constructor(app,title,value){super(app);this.title=title;this.value=value;}
@@ -36,6 +38,7 @@ function displaySettings(el,p,app,redraw){
         },false);
         if(p.config.anchor)el.createEl("p",{text:"库指纹："+p.config.anchor});
         if(!p.config.anchor){
+            pairingUI.scanButton(el,invite=>pairingUI.join(app,invite,fields=>p.exclusive(()=>p.joinInvite(invite,fields)),redraw));
             field("建库授权（服务部署者提供）","",v=>bootstrap=v,true);
             button("创建 PQC 库",async()=>{
                 let token=bootstrap.trim();
@@ -68,8 +71,8 @@ function displaySettings(el,p,app,redraw){
                 };
                 out.open();
             },false);
-            field("从管理员 Mac 核对的库指纹","",v=>code=v);
-            button("申请配对",async()=>({title:"请在管理员 Mac 输入此配对码",value:await p.request(code.trim())}));
+            field("从管理员设备 核对的库指纹","",v=>code=v);
+            button("申请配对",async()=>({title:"请在管理员设备 输入此配对码",value:await p.request(code.trim())}));
         }
         if(p.config.request){
             el.createEl("p",{text:"本设备配对码（10 分钟有效）："+p.config.request});
@@ -79,6 +82,7 @@ function displaySettings(el,p,app,redraw){
         }
         if(p.config.integrity)el.createEl("p",{text:p.config.integrity});
         if(p.config.anchor){
+            pairingUI.devices(el,p,app,redraw);
             button("立即同步 / 检查配对",async()=>{const r=await p.sync();new Notice(p.syncSummary(r));});
             for (const path of p.conflicts) {
                 new Setting(el).setName(path).addButton(b => b.setButtonText("比较冲突副本").onClick(() => p.compare(path, redraw)));
@@ -87,12 +91,7 @@ function displaySettings(el,p,app,redraw){
                 button("重新校验恢复数据",()=>p.verifyRecovery());
                 field("新设备显示的配对码","",v=>request=v);
                 button("批准已核对的配对码",()=>p.approve(request.trim()));
-                for(const member of p.config.others||[])button("撤销设备 · "+member.name+" · "+member.id.slice(-8),async()=>{
-                    const modal=new Modal(app);modal.setTitle("撤销 "+member.name+" 并轮换库密钥？");
-                    new Setting(modal.contentEl).addButton(b=>b.setButtonText("确认撤销").onClick(async()=>{
-                        try{await p.exclusive(()=>p.revoke(member.id));modal.close();redraw();}catch(e){notice(e);}
-                    }));modal.open();
-                });
+
             }
         }
         field("离线恢复码","",v=>recovery=v,true);
@@ -135,18 +134,20 @@ class PqcMode{
                 throw Error("此库已绑定可信提交服务。请使用该服务所在的 HTTPS 网关，并在同一网关转发 WebDAV。");
             return pinned;
         }
-        return base+"/homebound-pqc-ledger";
+        return this.config.inviteLedger && this.config.address===base ? this.config.inviteLedger : base+"/homebound-pqc-ledger";
     }
     bindAnchor(anchor){
         if(this.config.anchor===anchor)return;
         if(this.config.anchor)throw Error("库指纹不匹配。");
         this.config.witness=this.ledgerAddress(this.config.address);
+        delete this.config.inviteLedger;
         this.config.anchor=anchor;
     }
     async configure(c,password){
         const address=core.gatewayUrl(c.address), witness=this.ledgerAddress(address);
         // Older plugin versions can open the same gateway and use their original secret IDs.
         Object.assign(this.config,{address,home:address,away:address,witness,name:c.name.trim(),username:c.username.trim()});
+        if(this.config.inviteLedger && this.config.inviteLedger!==witness)delete this.config.inviteLedger;
         if(password)this.secret("dav",password);await this.saveData(this.config);
     }
     async device(){
@@ -216,35 +217,102 @@ class PqcMode{
                 if(detail?.error==="Uninitialized")throw Object.assign(Error("此提交服务尚未建库。"),{status:404,uninitialized:true});
                 throw Error("此 WebDAV 地址尚未配置 PQC 提交服务，请检查网关路径。");
             }
+            if(response.status===409 && detail?.error==="Device limit reached")throw Error("此库最多授权 10 台设备（含管理员），请先撤销一台。");
+            if(response.status===410)throw Error("邀请已过期或已被新二维码替换，请管理员重新显示二维码。");
             const msg=({403:"未获授权、已撤销或恢复码失效",404:"请求不存在",409:"授权已变化，请重新同步或配对",426:"管理员逐修订换钥需要升级插件和可信提交服务"})[response.status]||"可信提交服务不可用";
             throw Object.assign(Error(msg+" ("+response.status+")"),{status:response.status});
         }
         return response.json;
     }
     async snapshot(anchor=this.config.anchor,withRevisions=true){return pq.state(this.ledger.bind(this),anchor,this.config.pin,withRevisions);}
-    async context(anchor=this.config.anchor){
-        const [s,r]=await Promise.all([this.snapshot(anchor),this.route()]);
+    async context(anchor=this.config.anchor,withRevisions=true){
+        const [s,r]=await Promise.all([this.snapshot(anchor,withRevisions),this.route()]);
         const marker=r.marker;
         if(marker.format!==2||marker.anchor!==anchor)throw Error("WebDAV 地址指向另一个库。");
         return {...r,s,device:await this.device()};
     }
-    async refresh(snapshot){
-        const s=snapshot||await this.snapshot(this.config.anchor,false),dev=await this.device(),{p,digest}=pq.latest(s);
+    rememberDevices(s,dev){
+        const {p,digest}=pq.latest(s);
         this.config.pin={n:p.n,digest};this.config.admin=p.admin===dev.id;
-        this.config.others=Object.entries(p.members).filter(([id])=>id!==dev.id).map(([id,m])=>({id,name:m.name}));
+        delete this.config.others;
+        this.config.roster=p.members[dev.id] ? Object.entries(p.members).map(([id,m])=>({
+            id,name:m.name,admin:id===p.admin,self:id===dev.id
+        })).sort((a,b)=>Number(b.admin)-Number(a.admin)) : [];
         if(p.members[dev.id])delete this.config.request;
+    }
+    async refresh(snapshot){
+        const s=snapshot||await this.snapshot(this.config.anchor,false);
+        this.rememberDevices(s,await this.device());
         await this.saveData(this.config);
     }
     async request(anchor){
         if(this.config.anchor&&this.config.anchor!==anchor)throw Error("库指纹不匹配。");
-        const {dav,s,device}=await this.context(anchor);
+        const {dav,s,device}=await this.context(anchor,false);
         if(pq.latest(s).p.members[device.id])throw Error("这台设备已获授权，可以直接同步。");
         const code=await pq.requestPair(dav,s,device,this.config.name);
         this.bindAnchor(anchor);this.config.request=code;await this.refresh();return code;
     }
-    async approve(code){
-        const {dav,s,device}=await this.context();
+    async inviteDevice(){
+        const {s,device}=await this.context(this.config.anchor,false), {p}=pq.latest(s);
+        if(p.admin!==device.id)throw Error("只有当前管理员可以邀请设备。");
+        if(Object.keys(p.members).length>=pq.deviceLimit)throw Error("设备已满，请先撤销一台。");
+        if(!s.canInvite)throw Error("请先升级本库的提交服务以启用扫码加入，或使用手动配对码。");
+        const address=this.config.address;
+        const invite=invites.create(address,this.ledgerAddress(address),s);
+        await this.ledger("policy",{pairing:{action:"open",slot:invite.slot,expires:invite.expires,head:pq.latest(s).digest}},device.token);
+        return invite;
+    }
+    checkInvite(invite,s){
+        if(Date.now()>=invite.expires || pq.membershipHead(s).digest!==invite.head)
+            throw Error("邀请已过期或授权名单已变化，请重新扫码。");
+    }
+    async joinInvite(invite,credentials){
+        if(this.config.anchor && this.config.anchor!==invite.anchor)throw Error("此本地库已绑定其他 PQC 库。");
+        if(!credentials.username.trim() || !credentials.password || !credentials.name.trim())throw Error("请填写设备名称和本设备的 WebDAV 账号密码。");
+        if(Date.now()>=invite.expires)throw Error("邀请已过期，请重新扫码。");
+        if(this.config.anchor){
+            if(this.config.address!==invite.address || this.ledgerAddress(invite.address)!==invite.ledger)throw Error("邀请与已绑定的网关不符。");
+            const existing=await this.snapshot(this.config.anchor,false);
+            if(pq.latest(existing).p.members[(await this.device()).id])throw Error("本机已经获准加入此库。");
+        }
+        if(!this.config.anchor){
+            this.config.address=invite.address;
+            this.config.inviteLedger=invite.ledger;
+        }
+        await this.configure({address:invite.address,username:credentials.username,name:credentials.name},credentials.password);
+        const {dav,s,device}=await this.context(invite.anchor,false);
+        this.checkInvite(invite,s);
+        const {p}=pq.latest(s);
+        if(p.members[device.id])throw Error("本机已经获准加入此库。");
+        if(Object.keys(p.members).length>=pq.deviceLimit)throw Error("设备已满，请管理员先撤销一台。");
+        const requested=await pq.requestPair(dav,s,device,this.config.name,invite);
+        const {code}=await this.ledger("policy",{pairing:{action:"claim",slot:invite.slot,code:requested}});
+        if(code!==requested){
+            const target=await pq.readRequest(dav,s,code);
+            if(target.id!==device.id || target.invite!==invite.slot)throw Error("此邀请已被使用，请管理员生成新码。");
+        }
+        this.bindAnchor(invite.anchor);this.config.request=code;await this.refresh(s);
+        return code;
+    }
+    async invitedRequest(invite){
+        if(Date.now()>=invite.expires)throw Error("邀请已过期。");
+        const device=await this.device();
+        const {code}=await this.ledger("policy",{pairing:{action:"poll",slot:invite.slot}},device.token);
+        if(!code)return null;
+        const dav=this.base().child(folder).child(namespace);
+        const s=await this.snapshot(this.config.anchor,false);
+        this.checkInvite(invite,s);
         const target=await pq.readRequest(dav,s,code);
+        if(target.invite!==invite.slot)throw Error("申请与该二维码不匹配。");
+        return {code,name:target.pub.name};
+    }
+    async approve(code,invite){
+        const {dav,s,device}=await this.context(this.config.anchor,false);
+        const target=await pq.readRequest(dav,s,code);
+        if(invite){
+            this.checkInvite(invite,s);
+            if(target.invite!==invite.slot)throw Error("申请与该二维码不匹配。");
+        }
         await pq.nextPolicy(this.ledger.bind(this),s,device,"approve",target);await this.refresh();return target.id;
     }
     async sealHistory(){await this.change("seal-history");}
@@ -335,7 +403,7 @@ class PqcMode{
         const store=await pq.storeFor(this.ledger.bind(this),dav,s,device,this.transfer,async(n,digest)=>{
             this.config.pin={n,digest};await this.saveData(this.config);
         });
-        this.config.pin={n:last.p.n,digest:last.digest}; delete this.config.request;
+        this.rememberDevices(s,device);
         await this.saveData(this.config);
         return {store, route};
     }

@@ -5,11 +5,13 @@ import hmac
 import json
 import re
 import sqlite3
+import time
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 HEX = re.compile(r"[0-9a-f]{64}")
+DEVICE_LIMIT = 10
 ID = re.compile(r"[0-9a-f]{32}")
 
 class Denied(Exception):
@@ -43,6 +45,9 @@ def init(db):
         PRAGMA journal_mode=WAL;
         CREATE TABLE IF NOT EXISTS policies (n INTEGER PRIMARY KEY, digest TEXT UNIQUE, row TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS features (name TEXT PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS pairing_invite (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1), slot TEXT NOT NULL, expires INTEGER NOT NULL, code TEXT
+        );
         CREATE TABLE IF NOT EXISTS revisions (seq INTEGER PRIMARY KEY, id TEXT UNIQUE, epoch INTEGER, row TEXT NOT NULL);
         """)
 
@@ -67,6 +72,7 @@ def insert_policy(c,head,row,token,bootstrap_hash,rotation=False):
         require(by in ("recovery",prior["admin"]) and hmac.compare_digest(token_hash(token),authorized["cap"]),403,"Management denied")
         require(p["anchor"]==prior["anchor"],400,"Vault changed")
         require(by=="recovery" or p["recovery"]==prior["recovery"],400,"Root rotation requires recovery")
+        require(by=="recovery" or p["admin"]==prior["admin"],403,"Only recovery can replace the administrator")
     if rotation:
         require(p["by"]==prior["admin"]==p["admin"] and p["members"]==prior["members"] and
                 "keyLink" in p and ID.fullmatch(p["revisionId"]),400,"Invalid admin revision policy")
@@ -79,14 +85,55 @@ def insert_policy(c,head,row,token,bootstrap_hash,rotation=False):
                     valid_b64(box[1],12) and valid_b64(box[2],64),400,"Invalid recipient envelope")
             require(box[0]!=old_box[0] and box[2]!=old_box[2],400,"Reused recipient envelope")
     require(p["n"]==n+1 and p["parent"]==previous and ID.fullmatch(p["anchor"]),409,"Wrong successor")
-    require(0<len(p["members"])<=32 and p["admin"] in p["members"],400,"Invalid membership")
+    members=p["members"]
+    require(isinstance(members,dict) and 0<len(members) and p["admin"] in members,400,"Invalid membership")
+    # Older vaults can keep writing, revoke gradually, or recover. New identities cannot
+    # enter an over-limit roster, even when an older client swaps out an existing member.
+    if len(members)>DEVICE_LIMIT:
+        require(prior is not None and members.keys()<=prior["members"].keys(),409,"Device limit reached")
+    elif prior and p["by"]!="recovery" and len(prior["members"])>=DEVICE_LIMIT:
+        require(members.keys()<=prior["members"].keys(),409,"Device limit reached")
     if "keyLink" in p:
         require(n>=0 and valid_b64(p["keyLink"],60),400,"Invalid epoch key link")
     elif prior:
         require("keyLink" not in prior and p["n"]<256,409,"Upgrade client for further authorization changes")
     require(all(HEX.fullmatch(v["cap"]) for v in [p["recovery"],*p["members"].values()]),400,"Invalid device verifier")
     c.execute("INSERT INTO policies VALUES(?,?,?)",(p["n"],digest,row))
+    if not rotation:
+        c.execute("DELETE FROM pairing_invite")
     return p,digest
+
+def current_invite(c, slot):
+    require(isinstance(slot,str) and ID.fullmatch(slot),400,"Invalid invitation")
+    row=c.execute("SELECT code FROM pairing_invite WHERE slot=? AND expires>?",(slot,int(time.time()*1000))).fetchone()
+    require(row is not None,410,"Invitation expired or replaced")
+    return row[0]
+
+def pair(c,head,data,token):
+    require(head,403,"Uninitialized")
+    action,slot=data["action"],data["slot"]
+    require(isinstance(slot,str) and ID.fullmatch(slot),400,"Invalid invitation")
+    if action in ("open","poll"):
+        p=json.loads(head[2])["policy"]
+        require(hmac.compare_digest(token_hash(token),p["members"][p["admin"]]["cap"]),403,"Management denied")
+        if action=="open":
+            require(data["head"]==head[1],409,"Authorization changed; retry")
+            require(len(p["members"])<DEVICE_LIMIT,409,"Device limit reached")
+            now=int(time.time()*1000)
+            expires=data["expires"]
+            require(type(expires) is int and now<expires<=now+11*60*1000,400,"Invalid expiration")
+            active=c.execute("SELECT slot,expires FROM pairing_invite WHERE singleton=1").fetchone()
+            if active!=(slot,expires):
+                c.execute("INSERT OR REPLACE INTO pairing_invite VALUES(1,?,?,NULL)",(slot,expires))
+            return {"opened":True}
+        return {"code":current_invite(c,slot)}
+    require(action=="claim",400,"Invalid invitation action")
+    code=data["code"]
+    require(isinstance(code,str) and ID.fullmatch(code),400,"Invalid request code")
+    existing=current_invite(c,slot)
+    if existing is None:
+        c.execute("UPDATE pairing_invite SET code=? WHERE singleton=1",(code,))
+    return {"code":existing or code}
 
 def commit_revision(c,head,data,token,bootstrap_hash):
     require(head,403,"Uninitialized")
@@ -132,12 +179,17 @@ def transact(db, bootstrap_hash, method, data, token):
         if method=="state":
             require(head,404,"Uninitialized")
             require(json.loads(head[2])["policy"]["anchor"]==data["anchor"],403,"Wrong vault")
-            return {"nonce":data["nonce"],"adminRevisionRotation":1,
+            return {"nonce":data["nonce"],"adminRevisionRotation":1,"deviceLimit":DEVICE_LIMIT,"qrPairing":1,
                     "policies":[r[0] for r in c.execute("SELECT row FROM policies ORDER BY n")],
                     "revisions":[r[0] for r in c.execute("SELECT row FROM revisions ORDER BY seq")] if data.get("withRevisions",True) else []}
         if method=="commit":return commit_revision(c,head,data,token,bootstrap_hash)
         require(method=="policy",404,"Unknown operation")
+        if "pairing" in data:
+            return pair(c,head,data["pairing"],token)
         if head:require(data["head"]==head[1],409,"Authorization changed; retry")
+        if "invitation" in data:
+            invite=data["invitation"]
+            require(ID.fullmatch(invite["code"]) and current_invite(c,invite["slot"])==invite["code"],409,"Different pairing request")
         _,digest=insert_policy(c,head,data["row"],token,bootstrap_hash)
         return {"digest":digest}
 

@@ -30,7 +30,8 @@ async function identity(seed, label) {
     const enc=kem.keygen(await derive("kem",64)), sig=dsa.keygen(await derive("signature",32));
     const token=b64(await derive("ledger-capability",32));
     const pub={kem:b64(enc.publicKey),sig:b64(sig.publicKey),cap:await sha(new TextEncoder().encode(token))};
-    return {pub,token,id:await fingerprint([pub.kem,pub.sig,pub.cap]),enc:enc.secretKey,sign:sig.secretKey};
+    const stagingKey=label==="device" ? await aes(await derive("local-upload-checkpoint",32)) : undefined;
+    return {pub,token,stagingKey,id:await fingerprint([pub.kem,pub.sig,pub.cap]),enc:enc.secretKey,sign:sig.secretKey};
 }
 const freshSeed=()=>b64(random(32));
 const aes=raw=>crypto.subtle.importKey("raw",raw,"AES-GCM",false,["encrypt","decrypt"]);
@@ -66,6 +67,11 @@ async function state(ledger,anchor,pin,withRevisions=true) {
         check(p.by==="recovery" || p.by===prior.admin,"无管理权限。");
         verify("policy",[p],sig,p.by==="recovery"?prior.recovery.sig:prior.members[prior.admin].sig);
         check(p.members[p.admin] && (p.by==="recovery"||JSON.stringify(p.recovery)===JSON.stringify(prior.recovery)),"无效恢复根。");
+        if(p.revisionId!==undefined){
+            check(prev && typeof p.revisionId==="string" && idPattern.test(p.revisionId) && p.keyLink &&
+                p.by===prior.admin && p.admin===prior.admin &&
+                JSON.stringify(p.members)===JSON.stringify(prior.members), "修订换钥改变了成员或管理员。");
+        }
         if(p.keyLink!==undefined){
             check(prev && typeof p.keyLink==="string" && un64(p.keyLink).length===60,"历史密钥链接损坏。");
             linked=true;
@@ -75,20 +81,36 @@ async function state(ledger,anchor,pin,withRevisions=true) {
         policies.push({p,digest});
     }
     check(!pin||pin.n<policies.length,"授权记录回退。");
-    return {policies,rows:snapshot.revisions};
+    return {policies,rows:snapshot.revisions,canRotate:snapshot.adminRevisionRotation===1};
 }
-async function signPolicy(ledger,p,actor,keys,token=actor.token){
+async function preparePolicy(p,actor,key){
     p.boxes={};
-    for(const [id,m] of Object.entries(p.members))p.boxes[id]=await envelope(m,keys,[p.anchor,p.n,id]);
-    p.recoveryBox=await envelope(p.recovery,keys,[p.anchor,p.n,"recovery"]);
+    for(const [id,m] of Object.entries(p.members))p.boxes[id]=await envelope(m,[key],[p.anchor,p.n,id]);
+    p.recoveryBox=await envelope(p.recovery,[key],[p.anchor,p.n,"recovery"]);
     const row=JSON.stringify({policy:p,sig:signed("policy",[p],actor.sign)});
-    const result=await ledger("policy",{head:p.parent,row},token);
-    check(result.digest===await digestOf(row),"提交服务返回了不同的授权摘要。");
-    return {p,digest:result.digest};
+    return {p,row,digest:await digestOf(row)};
+}
+async function commitPolicy(ledger,next,token){
+    const receipt=await ledger("policy",{head:next.p.parent,row:next.row},token);
+    check(receipt.digest===next.digest,"提交服务返回了不同的授权摘要。");
+    return {p:next.p,digest:next.digest};
 }
 async function genesis(ledger,device,name,recovery,bootstrap){
     const p={suite,n:0,parent:"",by:"recovery",anchor:recovery.id,recovery:recovery.pub,admin:device.id,members:{[device.id]:publicDevice(device,name)}};
-    await signPolicy(ledger,p,recovery,[freshSeed()],bootstrap);
+    await commitPolicy(ledger,await preparePolicy(p,recovery,freshSeed()),bootstrap);
+}
+function membershipHead(s){
+    let i=s.policies.length-1;
+    while(i>0 && s.policies[i].p.revisionId!==undefined)i--;
+    return s.policies[i];
+}
+function currentPairingHead(s,head){
+    // Accept requests from older clients that used any head in this membership period.
+    for(let i=s.policies.length-1;i>=0;i--){
+        if(s.policies[i].digest===head)return true;
+        if(s.policies[i].p.revisionId===undefined)break;
+    }
+    return false;
 }
 const lifetime=10*60*1000;
 async function requestPair(dav,s,device,name){
@@ -101,12 +123,12 @@ async function requestPair(dav,s,device,name){
 async function readRequest(dav,s,code){
     check(idPattern.test(code),"配对码格式错误。");
     const {request,sig}=parseBytes(await dav.child("requests").read(code));
-    const {p,digest}=latest(s);
-    check(request.anchor===p.anchor && request.head===digest,"配对申请已过期或已使用。");
+    const {p}=latest(s);
+    check(request.anchor===p.anchor && currentPairingHead(s,request.head),"配对申请已过期或已使用。");
     check(Number.isSafeInteger(request.expires)&&request.expires>=Date.now()&&request.expires<=Date.now()+lifetime+60000,"配对申请已过期。");
     check(idPattern.test(request.nonce)&&await fingerprint([request])===code,"配对码被替换。");
     verify("join",[request],sig,request.pub.sig);
-    return {id:await publicId(request.pub),pub:request.pub,expires:request.expires,head:digest};
+    return {id:await publicId(request.pub),pub:request.pub,expires:request.expires,head:request.head};
 }
 async function nextPolicy(ledger,s,actor,action,arg){
     const {p,digest}=latest(s),restoring=action==="restore";
@@ -121,17 +143,20 @@ async function nextPolicy(ledger,s,actor,action,arg){
     }else if(action==="revoke"){
         check(arg!==admin&&members[arg],"无法撤销该设备。");delete members[arg];
     }else if(action==="approve"){
-        check(!members[arg.id] && arg.expires>=Date.now() && arg.head===digest,"配对申请失效。");members[arg.id]=arg.pub;
+        check(!members[arg.id] && arg.expires>=Date.now() && currentPairingHead(s,arg.head),"配对申请失效。");members[arg.id]=arg.pub;
     }else check(action==="seal-history","未知操作。");
-    // A policy transaction is independent of the DAV data plane. Damaged bodies cannot veto rotation.
-    const next={suite,n:p.n+1,parent:digest,anchor:p.anchor,by:restoring?"recovery":actor.id,recovery,admin,members};
-    // A new key unlocks its predecessor. Possession of an old key cannot unlock a successor.
-    const current=freshSeed();
-    next.keyLink=b64(await encrypt(un64(current),[suite,p.anchor,next.n,digest,"previous-key"],un64(keys.at(-1))));
+    const next=await prepareSuccessor({p,digest},actor,keys,{by:restoring?"recovery":actor.id,recovery,admin,members});
+    return commitPolicy(ledger,next.policy,actor.token);
+}
+async function prepareSuccessor({p,digest},actor,keys,fields){
+    const next={suite,n:p.n+1,parent:digest,anchor:p.anchor,...fields};
+    // Only the new epoch can open its predecessor. Bridge full legacy rings once.
+    const key=freshSeed();
+    next.keyLink=b64(await encrypt(un64(key),[suite,p.anchor,next.n,digest,"previous-key"],un64(keys.at(-1))));
     if(!p.keyLink && p.n>0){
-        next.legacyKeys=b64(await encrypt(un64(current),[suite,p.anchor,next.n,digest,"legacy-keys"],jsonBytes(keys.slice(0,-1))));
+        next.legacyKeys=b64(await encrypt(un64(key),[suite,p.anchor,next.n,digest,"legacy-keys"],jsonBytes(keys.slice(0,-1))));
     }
-    return signPolicy(ledger,next,actor,[current]);
+    return {key,policy:await preparePolicy(next,actor,key)};
 }
 async function encrypt(rawKey,label,bytes){
     const iv=random(12),cipher=await crypto.subtle.encrypt({name:"AES-GCM",iv,additionalData:jsonBytes(label)},await aes(rawKey),bytes);
@@ -155,8 +180,8 @@ function validateGraph(revisions){
     }
     return seen;
 }
-async function storeFor(ledger,dav,s,device,transfer){
-    const {p,digest}=latest(s);
+async function storeFor(ledger,dav,s,device,transfer,onRotation){
+    const {p}=latest(s);
     const envelopeKeys=await openRing(device,p.boxes[device.id],[p.anchor,p.n,device.id]);
     let ring=envelopeKeys;
     if(p.keyLink){
@@ -167,7 +192,9 @@ async function storeFor(ledger,dav,s,device,transfer){
         while(n>0 && s.policies[n].p.keyLink){
             const policy=s.policies[n].p;
             const previous=await decrypt(un64(ring[n]),[suite,p.anchor,n,policy.parent,"previous-key"],un64(policy.keyLink));
-            ring[--n]=b64(previous);
+            const previousKey=b64(previous);
+            if(policy.revisionId)check(previousKey!==ring[n],"管理员修订复用了上一代密钥。");
+            ring[--n]=previousKey;
         }
         if(n>0){
             // The authenticated bridge is stored once, even for a full beta.2 keyring.
@@ -180,10 +207,18 @@ async function storeFor(ledger,dav,s,device,transfer){
     }
     check(ring.length===s.policies.length,"密钥记录不完整。");
     const bodies=dav.child("objects"), revisions=[];
+    const firstRotation=s.policies.findIndex(entry=>entry.p.revisionId!==undefined);
+    const pending=new Set(s.policies.filter(entry=>entry.p.revisionId!==undefined).map(entry=>entry.p.n));
     let previousEpoch=-1;
     for(const raw of s.rows){
         const {record:r,sig}=JSON.parse(raw),policy=s.policies[r.epoch];
         check(policy && r.anchor===p.anchor && r.head===policy.digest && r.epoch>=previousEpoch && policy.p.members[r.from],"非法写入代际或作者。");
+        if(pending.has(r.epoch)){
+            check(r.from===policy.p.admin && r.id===policy.p.revisionId,"换钥记录缺少对应的管理员修订。");
+            pending.delete(r.epoch);
+        }else if(firstRotation>=0 && r.epoch>=firstRotation){
+            check(r.from!==policy.p.admin,"管理员修订缺少独立换钥记录。");
+        }
         verify("revision",[r],sig,policy.p.members[r.from].sig);
         const rev=parseBytes(await decrypt(un64(ring[r.epoch]),[suite,p.anchor,r.epoch,r.id,"manifest"],un64(r.payload)));
         check(rev.id===r.id && (rev.hash===null?rev.key===null:typeof rev.key==="string"&&un64(rev.key).length===32),"修订记录异常。");
@@ -191,7 +226,11 @@ async function storeFor(ledger,dav,s,device,transfer){
         rev.author = policy.p.members[r.from].name;
         revisions.push(rev);previousEpoch=r.epoch;
     }
+    check(!pending.size,"换钥记录对应的修订缺失。");
     const history=validateGraph(revisions);
+    // Resume across ordinary edits, but never carry staged keys across a membership change.
+    const membership=membershipHead(s);
+    let current=latest(s),currentKeys=envelopeKeys;
     const scope="pqc/"+p.anchor;
     return {
         async history(){return new Map(history);},
@@ -204,9 +243,12 @@ async function storeFor(ledger,dav,s,device,transfer){
             check(await sha(body)===rev.hash,"正文校验失败。");return body;
         },
         async publish(path,parents,bytes){
+            const parent=current, keys=currentKeys;
+            const admin=device.id===parent.p.admin;
+            if(admin)check(s.canRotate,"请先升级此 PQC 库的可信提交服务，再同步管理员修订。");
             const hash=bytes===null?null:await sha(bytes);
             const staged=transfer?.shouldSplit(bytes) ? await transfer.upload({
-                objects:bodies,scope,epoch:digest,wrapKey:await aes(un64(ring[p.n])),path,parents,hash,bytes
+                objects:bodies,scope,epoch:membership.digest,wrapKey:await aes(un64(ring[membership.p.n])),deviceKey:device.stagingKey,path,parents,hash,bytes
             }) : null;
             const id=staged?.id || randomId();
             const contentKey=bytes===null || staged ? null : random(32);
@@ -214,12 +256,26 @@ async function storeFor(ledger,dav,s,device,transfer){
             if(staged)rev.parts=staged.parts;
             validateGraph([...history.values(),rev]);
             if(contentKey)await bodies.put(id,(await encrypt(contentKey,[suite,p.anchor,id,"body"],bytes)).buffer);
-            const r={anchor:p.anchor,head:digest,epoch:p.n,id,from:device.id,
-                payload:b64(await encrypt(un64(ring[p.n]),[suite,p.anchor,p.n,id,"manifest"],jsonBytes(rev)))};
+            // Prepare the new recipient boxes only after the full body has reached DAV.
+            const rotation=admin ? await prepareSuccessor(parent,device,keys,{
+                by:device.id,recovery:p.recovery,admin:p.admin,members:p.members,revisionId:id
+            }) : null;
+            const target=rotation?.policy ?? parent;
+            const epoch=target.p.n, key=rotation?.key ?? keys.at(-1);
+            const r={anchor:p.anchor,head:target.digest,epoch,id,from:device.id,
+                payload:b64(await encrypt(un64(key),[suite,p.anchor,epoch,id,"manifest"],jsonBytes(rev)))};
             const row=JSON.stringify({record:r,sig:signed("revision",[r],device.sign)});
-            const receipt=await ledger("commit",{head:digest,row},device.token);
-            check(receipt.digest===await digestOf(row),"写入回执无效。");history.set(id,rev);
-            if(staged)await transfer.uploaded(scope,path);
+            const data={head:parent.digest,row};
+            if(rotation)data.rotation=target.row;
+            const receipt=await ledger("commit",data,device.token);
+            check(receipt.digest===await digestOf(row),"写入回执无效。");
+            if(rotation){
+                check(receipt.policyDigest===target.digest,"换钥回执无效。");
+                current=target;currentKeys=[key];
+                if(onRotation)await onRotation(epoch,target.digest);
+            }
+            history.set(id,rev);
+            if(staged)await transfer.uploaded(scope,path,device.stagingKey);
             return rev;
         }
     };

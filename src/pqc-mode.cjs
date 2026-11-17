@@ -148,7 +148,7 @@ class PqcMode{
         const response=await requestUrl({url:this.config.witness+"/"+method,method:"POST",headers,
             contentType:"application/json",body:JSON.stringify({...data,transportNonce:nonce}),throw:false});
         if(response.status!==200){
-            const msg=({403:"未获授权、已撤销或恢复码失效",404:"请求不存在",409:"授权已变化，请重新同步或配对"})[response.status]||"可信提交服务不可用";
+            const msg=({403:"未获授权、已撤销或恢复码失效",404:"请求不存在",409:"授权已变化，请重新同步或配对",426:"管理员逐修订换钥需要升级插件和可信提交服务"})[response.status]||"可信提交服务不可用";
             throw Object.assign(Error(msg+" ("+response.status+")"),{status:response.status});
         }
         return response.json;
@@ -264,7 +264,9 @@ class PqcMode{
             await this.refresh(s);
             throw Error("此设备未获授权，或已被撤销。请在设置中重新申请配对。");
         }
-        const store=await pq.storeFor(this.ledger.bind(this),dav,s,device,this.transfer);
+        const store=await pq.storeFor(this.ledger.bind(this),dav,s,device,this.transfer,async(n,digest)=>{
+            this.config.pin={n,digest};await this.saveData(this.config);
+        });
         this.config.pin={n:last.p.n,digest:last.digest}; delete this.config.request;
         await this.saveData(this.config);
         return {store, route};

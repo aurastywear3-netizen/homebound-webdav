@@ -42,8 +42,88 @@ def init(db):
         c.executescript("""
         PRAGMA journal_mode=WAL;
         CREATE TABLE IF NOT EXISTS policies (n INTEGER PRIMARY KEY, digest TEXT UNIQUE, row TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS features (name TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS revisions (seq INTEGER PRIMARY KEY, id TEXT UNIQUE, epoch INTEGER, row TEXT NOT NULL);
         """)
+
+def unpack(row):
+    require(isinstance(row,str) and len(raw(row))<=512*1024,413,"Record too large")
+    obj=json.loads(row)
+    require(isinstance(obj,dict),400,"Invalid record")
+    return obj,hashlib.sha256(raw(row)).hexdigest()
+
+def insert_policy(c,head,row,token,bootstrap_hash,rotation=False):
+    obj,digest=unpack(row)
+    p=obj["policy"]
+    require(("revisionId" in p)==rotation,400,"Rotation requires the matching revision")
+    n,previous,old=head if head else (-1,"",None)
+    prior=json.loads(old)["policy"] if old else None
+    if prior is None:
+        require(not rotation and hmac.compare_digest(token_hash(token),bootstrap_hash),403,"Bootstrap denied")
+        require(p["by"]=="recovery",400,"Invalid genesis")
+    else:
+        by=p["by"]
+        authorized=prior["recovery"] if by=="recovery" else prior["members"][prior["admin"]]
+        require(by in ("recovery",prior["admin"]) and hmac.compare_digest(token_hash(token),authorized["cap"]),403,"Management denied")
+        require(p["anchor"]==prior["anchor"],400,"Vault changed")
+        require(by=="recovery" or p["recovery"]==prior["recovery"],400,"Root rotation requires recovery")
+    if rotation:
+        require(p["by"]==prior["admin"]==p["admin"] and p["members"]==prior["members"] and
+                "keyLink" in p and ID.fullmatch(p["revisionId"]),400,"Invalid admin revision policy")
+        require(valid_b64(obj.get("sig"),3309),400,"Invalid policy signature encoding")
+        boxes=p["boxes"]
+        require(set(boxes)==set(p["members"]),400,"Missing recipient")
+        recipients=[(boxes[k],prior["boxes"][k]) for k in p["members"]]
+        for box,old_box in [*recipients,(p["recoveryBox"],prior["recoveryBox"])]:
+            require(isinstance(box,list) and len(box)==3 and valid_b64(box[0],1088) and
+                    valid_b64(box[1],12) and valid_b64(box[2],64),400,"Invalid recipient envelope")
+            require(box[0]!=old_box[0] and box[2]!=old_box[2],400,"Reused recipient envelope")
+    require(p["n"]==n+1 and p["parent"]==previous and ID.fullmatch(p["anchor"]),409,"Wrong successor")
+    require(0<len(p["members"])<=32 and p["admin"] in p["members"],400,"Invalid membership")
+    if "keyLink" in p:
+        require(n>=0 and valid_b64(p["keyLink"],60),400,"Invalid epoch key link")
+    elif prior:
+        require("keyLink" not in prior and p["n"]<256,409,"Upgrade client for further authorization changes")
+    require(all(HEX.fullmatch(v["cap"]) for v in [p["recovery"],*p["members"].values()]),400,"Invalid device verifier")
+    c.execute("INSERT INTO policies VALUES(?,?,?)",(p["n"],digest,row))
+    return p,digest
+
+def commit_revision(c,head,data,token,bootstrap_hash):
+    require(head,403,"Uninitialized")
+    obj,digest=unpack(data["row"])
+    record=obj["record"]
+    require(isinstance(record,dict) and set(record)=={"anchor","head","epoch","id","from","payload"},400,"Invalid revision")
+    require(valid_b64(obj.get("sig"),3309) and ID.fullmatch(record["id"]),400,"Invalid revision signature or ID")
+    n,previous,old=head
+    policy=json.loads(old)["policy"]
+    rotation="rotation" in data
+    replay=rotation and data["rotation"]==old and data["head"]==policy["parent"] and policy.get("revisionId")==record["id"]
+    if not replay:require(data["head"]==previous,409,"Authorization changed; retry")
+    author=policy["members"].get(record["from"])
+    require(author and hmac.compare_digest(token_hash(token),author["cap"]),403,"Device revoked")
+    if rotation:
+        require(record["from"]==policy["admin"],403,"Only an administrator can rotate on commit")
+        # Exact retransmission after a lost response. Recheck the current authorization above.
+        if replay:
+            found=c.execute("SELECT row FROM revisions WHERE id=?",(record["id"],)).fetchone()
+            require(found and found[0]==data["row"],409,"Revision collision")
+            return {"digest":digest,"policyDigest":previous}
+        policy,previous=insert_policy(c,head,data["rotation"],token,bootstrap_hash,rotation=True)
+        n=policy["n"]
+        require(record["id"]==policy["revisionId"],409,"Wrong revision for this rotation")
+        c.execute("INSERT OR IGNORE INTO features VALUES('admin-revision-rotation')")
+    elif record["from"]==policy["admin"]:
+        active=c.execute("SELECT 1 FROM features WHERE name='admin-revision-rotation'").fetchone()
+        require(not active,426,"Upgrade the administrator client for per-revision rotation")
+    require(record["epoch"]==n and record["head"]==previous and record["anchor"]==policy["anchor"],409,"Stale revision")
+    existing=c.execute("SELECT row FROM revisions WHERE id=?",(record["id"],)).fetchone()
+    if existing:
+        require(existing[0]==data["row"],409,"Revision collision")
+    else:
+        c.execute("INSERT INTO revisions(id,epoch,row) VALUES(?,?,?)",(record["id"],n,data["row"]))
+    result={"digest":digest}
+    if rotation:result["policyDigest"]=previous
+    return result
 
 def transact(db, bootstrap_hash, method, data, token):
     with closing(sqlite3.connect(db,timeout=10)) as c, c:
@@ -52,51 +132,13 @@ def transact(db, bootstrap_hash, method, data, token):
         if method=="state":
             require(head,404,"Uninitialized")
             require(json.loads(head[2])["policy"]["anchor"]==data["anchor"],403,"Wrong vault")
-            return {"nonce":data["nonce"],"policies":[r[0] for r in c.execute("SELECT row FROM policies ORDER BY n")],
+            return {"nonce":data["nonce"],"adminRevisionRotation":1,
+                    "policies":[r[0] for r in c.execute("SELECT row FROM policies ORDER BY n")],
                     "revisions":[r[0] for r in c.execute("SELECT row FROM revisions ORDER BY seq")] if data.get("withRevisions",True) else []}
-        require(method in ("policy","commit"),404,"Unknown operation")
-        row=data["row"]
-        require(isinstance(row,str) and len(raw(row))<=512*1024,413,"Record too large")
-        obj=json.loads(row)
-        digest=hashlib.sha256(raw(row)).hexdigest()
-        if not head:
-            require(method=="policy" and hmac.compare_digest(token_hash(token),bootstrap_hash),403,"Bootstrap denied")
-            n=-1
-            previous=""
-        else:
-            n,previous,old=head
-            policy=json.loads(old)["policy"]
-            require(data["head"]==previous,409,"Authorization changed; retry")
-            if method=="commit":
-                record=obj["record"]
-                require(isinstance(record,dict) and set(record)=={"anchor","head","epoch","id","from","payload"},400,"Invalid revision")
-                require(valid_b64(obj.get("sig"),3309),400,"Invalid signature encoding")
-                author=policy["members"].get(record["from"])
-                require(author and hmac.compare_digest(token_hash(token),author["cap"]),403,"Device revoked")
-                require(record["epoch"]==n and record["head"]==previous and record["anchor"]==policy["anchor"],409,"Stale revision")
-                require(ID.fullmatch(record["id"]),400,"Invalid revision id")
-                existing=c.execute("SELECT row FROM revisions WHERE id=?",(record["id"],)).fetchone()
-                if existing:
-                    require(existing[0]==row,409,"Revision collision")
-                else:
-                    c.execute("INSERT INTO revisions(id,epoch,row) VALUES(?,?,?)",(record["id"],n,row))
-                return {"digest":digest}
-            new=obj["policy"]
-            by=new["by"]
-            authorized=policy["recovery"] if by=="recovery" else policy["members"][policy["admin"]]
-            require(by in ("recovery",policy["admin"]) and hmac.compare_digest(token_hash(token),authorized["cap"]),403,"Management denied")
-            require(new["anchor"]==policy["anchor"],400,"Vault changed")
-            require(by=="recovery" or new["recovery"]==policy["recovery"],400,"Root rotation requires recovery")
-        p=obj["policy"]
-        require(p["n"]==n+1 and p["parent"]==previous and ID.fullmatch(p["anchor"]),409,"Wrong successor")
-        require(0<len(p["members"])<=32 and p["admin"] in p["members"],400,"Invalid membership")
-        if "keyLink" in p:
-            require(n>=0 and valid_b64(p["keyLink"],60),400,"Invalid epoch key link")
-        elif n>=0:
-            require("keyLink" not in policy and p["n"]<256,409,"Upgrade client for further authorization changes")
-        require(all(HEX.fullmatch(v["cap"]) for v in [p["recovery"],*p["members"].values()]),400,"Invalid device verifier")
-        if n==-1: require(p["by"]=="recovery",400,"Invalid genesis")
-        c.execute("INSERT INTO policies VALUES(?,?,?)",(p["n"],digest,row))
+        if method=="commit":return commit_revision(c,head,data,token,bootstrap_hash)
+        require(method=="policy",404,"Unknown operation")
+        if head:require(data["head"]==head[1],409,"Authorization changed; retry")
+        _,digest=insert_policy(c,head,data["row"],token,bootstrap_hash)
         return {"digest":digest}
 
 class API(BaseHTTPRequestHandler):
@@ -104,7 +146,9 @@ class API(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             n=int(self.headers.get("Content-Length","0"))
-            require(0<n<=768*1024,413,"Request size")
+            # A rotating commit carries two separately bounded signed rows.
+            limit=2*768*1024 if self.path=="/commit" else 768*1024
+            require(0<n<=limit,413,"Request size")
             data=json.loads(self.rfile.read(n))
             token=self.headers.get("Authorization","").removeprefix("Bearer ")
             result=transact(self.server.db,self.server.bootstrap_hash,self.path.removeprefix("/"),data,token)

@@ -140,7 +140,7 @@ test("10: copied recovery root cannot reclaim or read future writes after recove
     const f=await setup(t),{s,device,renewed}=await takeover(f);
     await (await pq.storeFor(f.ledger,f.dav,s,device)).publish("new.md",[],buffer("new root"));
     await assert.rejects(takeover(f,f.rec),/恢复身份/);
-    const bad={...f.rec,token:f.rec.token};await assert.rejects(f.ledger("policy",{head:pq.latest(s).digest,row:JSON.stringify({policy:{by:"recovery"}})},bad.token),/denied/);
+    const bad={...f.rec,token:f.rec.token};await assert.rejects(f.ledger("policy",{head:pq.latest(await f.state()).digest,row:JSON.stringify({policy:{by:"recovery"}})},bad.token),/denied/);
     const again=await takeover(f,renewed);assert.equal((await (await pq.storeFor(f.ledger,f.dav,again.s,again.device)).history()).size,1);
 });
 
@@ -191,6 +191,22 @@ test("12: damaged existing attachment is named during recovery",async t=>{
     assert.deepEqual(report,{checked:1,faults:[{id:rev.id,path:"图像.bin"}]});
 });
 
+// Emit a pre-rotation administrator revision against the historical wire format.
+async function legacyAdminWrite(ledger,dav,s,owner,path,body){
+    const {p,digest}=pq.latest(s),id=core.randomId(),key=randomBytes(32);
+    const encrypt=async(raw,label,data)=>{
+        const iv=randomBytes(12);
+        const ciphertext=await crypto.subtle.encrypt({name:"AES-GCM",iv,additionalData:core.jsonBytes(label)},await aes(raw,"encrypt"),data);
+        return Buffer.concat([iv,new Uint8Array(ciphertext)]);
+    };
+    const rev={id,path,parents:[],hash:await core.sha(body),key:b64(key)};
+    await dav.child("objects").put(id,await encrypt(key,[suite,p.anchor,id,"body"],body));
+    const payload=await encrypt(un64(await oldKey(s,owner)),[suite,p.anchor,p.n,id,"manifest"],core.jsonBytes(rev));
+    const record={anchor:p.anchor,head:digest,epoch:p.n,id,from:owner.id,payload:b64(payload)};
+    const sig=b64(dsa.sign(core.jsonBytes([suite,"revision",record]),owner.sign));
+    await ledger("commit",{head:digest,row:JSON.stringify({record,sig})},owner.token);
+    return rev;
+}
 // Recreate the beta.2 wire format, including a separate full historical keyring in each recipient envelope.
 async function legacySeal(f,s,keys){
     const {p,digest}=pq.latest(s);
@@ -211,7 +227,7 @@ test("13: a genuine 256-record legacy vault can revoke, recover repeatedly and d
     const {ledger,bootstrap}=await service(t),dav=new Dav(),owner=await seed(),guest=await seed(),rec=await root();
     await pq.genesis(ledger,owner,"Owner",rec,bootstrap);
     let s=await pq.state(ledger,rec.id);
-    const first=await (await pq.storeFor(ledger,dav,s,owner)).publish("旧代.md",[],buffer("before capacity"));
+    const first=await legacyAdminWrite(ledger,dav,s,owner,"旧代.md",buffer("before capacity"));
     const keys=[await oldKey(s,owner)],f={ledger,owner};
     // A beta.2 owner can sign a membership change. Keep the guest enrolled up to the real boundary.
     for(let n=1;n<=255;n++){
@@ -235,7 +251,7 @@ test("13: a genuine 256-record legacy vault can revoke, recover repeatedly and d
     const after=await read.publish("换钥后.md",[],buffer("after revoke"));
     const recovered=await takeover({ledger,state:latestState,rec});
     const again=await takeover({ledger,state:latestState,rec:recovered.renewed});
-    assert.equal(pq.latest(again.s).p.n,258);
+    assert.equal(pq.latest(again.s).p.n,259); // revocation, admin write, and two takeovers
     assert.equal(pq.latest(again.s).p.legacyKeys,undefined);
     const restored=await pq.storeFor(ledger,dav,again.s,again.device);
     const history=await restored.history();
@@ -259,6 +275,11 @@ test("14: full 32-member roster still permits revocation and recovery, compact r
     assert.equal(Object.keys(pq.latest(current).p.members).length,32);
     const head=pq.latest(current);
     assert.ok(Buffer.byteLength(JSON.stringify(head.p))<300*1024);
+    const memberLimitWriter=await pq.storeFor(f.ledger,f.dav,current,f.owner);
+    const rev=await memberLimitWriter.publish("all-members.md",[],buffer("32 members"));
+    current=await f.state();
+    assert.equal(pq.latest(current).p.revisionId,rev.id);
+    assert.equal(Object.keys(pq.latest(current).p.boxes).length,32);
     await pq.nextPolicy(f.ledger,current,f.owner,"revoke",guests.at(-1).id);
     const {device,s}=await takeover({...f,state:f.state});
     assert.equal(Object.keys(pq.latest(s).p.members).length,1);
@@ -320,4 +341,146 @@ test("chunked transfer crossing revocation leaves ciphertext only; a new epoch c
     assert.deepEqual(new Uint8Array(await reader.readBody(history.get(rev.id))),data);
     const raw=(await f.state()).rows[0];assert.ok(!raw.includes(path) && !raw.includes(rev.parts.seed));
     assert.equal((await old.history()).size,0);
+});
+
+test("admin edits and deletion each open a fresh epoch, with fresh envelopes for every recipient",async t=>{
+    const f=await setup(t),pins=[];
+    const store=await pq.storeFor(f.ledger,f.dav,f.s,f.owner,undefined,(n,digest)=>pins.push({n,digest}));
+    const one=await store.publish("note.md",[],buffer("one"));
+    const two=await store.publish("note.md",[one.id],buffer("two"));
+    const three=await store.publish("note.md",[two.id],null);
+    let s=await f.state();
+    assert.deepEqual(s.policies.slice(-3).map(({p})=>p.revisionId),[one.id,two.id,three.id]);
+    assert.deepEqual(s.rows.map(row=>JSON.parse(row).record.epoch),pins.map(({n})=>n));
+    assert.deepEqual(pins.map(pin=>pin.digest),s.policies.slice(-3).map(entry=>entry.digest));
+    const prior=await oldKey(f.s,f.owner),epochs=new Set([prior]);
+    const seen=new Map();
+    for(const entry of s.policies.slice(-4)){
+        const p=entry.p;
+        for(const [label,actor,box] of [["admin",f.owner,p.boxes[f.owner.id]],["member",f.guest,p.boxes[f.guest.id]],["recovery",f.rec,p.recoveryBox]]){
+            const [ct,iv,cipher]=box;
+            const secret=kem.decapsulate(un64(ct),actor.enc);
+            const group=seen.get(label)||[new Set(),new Set(),new Set(),new Set()];
+            [ct,b64(secret),cipher,iv].forEach((value,i)=>{assert.ok(!group[i].has(value));group[i].add(value);});
+            seen.set(label,group);
+            const recovered=core.parseBytes(await crypto.subtle.decrypt({
+                name:"AES-GCM",iv:un64(iv),additionalData:core.jsonBytes([suite,"envelope",p.anchor,p.n,label==="recovery"?"recovery":actor.id])
+            },await aes(secret,"decrypt"),un64(cipher))).at(-1);
+            assert.equal(recovered,await oldKey({policies:[entry]},f.owner));
+        }
+        if(p.revisionId){
+            const key=await oldKey({policies:[entry]},f.owner);assert.ok(!epochs.has(key));epochs.add(key);
+            const {record}=JSON.parse(s.rows.find(row=>JSON.parse(row).record.id===p.revisionId)),packet=un64(record.payload);
+            await assert.rejects(crypto.subtle.decrypt({name:"AES-GCM",iv:packet.subarray(0,12),additionalData:core.jsonBytes([suite,p.anchor,p.n,record.id,"manifest"])},await aes(un64(prior),"decrypt"),packet.subarray(12)));
+        }
+    }
+    const guest=await pq.storeFor(f.ledger,f.dav,s,f.guest);
+    assert.equal(text(await guest.readBody((await guest.history()).get(two.id))),"two");
+    await guest.publish("member.md",[],buffer("member"));
+    const after=await f.state();assert.equal(after.policies.length,s.policies.length);
+    const takeoverState=await takeover(f);
+    const recovered=await pq.storeFor(f.ledger,f.dav,takeoverState.s,takeoverState.device);
+    assert.deepEqual(await pq.auditData(recovered),{checked:4,faults:[]});
+});
+
+test("half-commits roll back, exact lost acknowledgements are idempotent and publication cannot downgrade",async t=>{
+    const f=await setup(t);let captured;
+    const intercept=async(method,data,token)=>{
+        if(!data.rotation)return f.ledger(method,data,token);
+        captured=data;
+        const malformed=JSON.parse(data.row);malformed.record.head=data.head;
+        await assert.rejects(f.ledger(method,{...data,row:JSON.stringify(malformed)},token),e=>e.status===409);
+        const before=await f.state();assert.equal(before.policies.length,f.s.policies.length);assert.equal(before.rows.length,0);
+        await assert.rejects(f.ledger("policy",{head:data.head,row:data.rotation},token),e=>e.status===400);
+        await assert.rejects(f.ledger(method,data,f.guest.token),e=>e.status===403);
+        const reused=JSON.parse(data.rotation);
+        reused.policy.recoveryBox=pq.latest(f.s).p.recoveryBox;
+        await assert.rejects(f.ledger(method,{...data,rotation:JSON.stringify(reused)},token),/Reused recipient/);
+        // Deliver the transaction, then drop the reply.
+        await f.ledger(method,data,token);throw Error("reply lost");
+    };
+    const bytes=buffer("saved"),writer=await pq.storeFor(intercept,f.dav,f.s,f.owner);
+    const baseline=new Map(),local={paths:()=>new Set(["note.md"]),allowed:()=>true,read:()=>bytes};
+    const sync=store=>core.synchronize({store,local,baseline,cache:new Map(),checkpoint(){}});
+    await assert.rejects(sync(writer),/reply lost/);
+    const receipt=await f.ledger("commit",captured,f.owner.token),s=await f.state();
+    assert.equal(s.rows.length,1);assert.equal(receipt.policyDigest,pq.latest(s).digest);
+    const fresh=await pq.storeFor(f.ledger,f.dav,s,f.owner);
+    const result=await sync(fresh);assert.equal(result.sent,0);assert.equal(result.received,0);
+    assert.deepEqual((await f.state()).policies,s.policies);
+    await assert.rejects(legacyAdminWrite(f.ledger,f.dav,s,f.owner,"old.md",buffer("x")),e=>e.status===426);
+    await assert.rejects(pq.storeFor(f.ledger,f.dav,{...s,rows:[]},f.guest),/修订缺失/);
+    const newHead=await pq.nextPolicy(f.ledger,s,f.owner,"seal-history");
+    await assert.rejects(legacyAdminWrite(f.ledger,f.dav,await f.state(),f.owner,"old.md",buffer("x")),e=>e.status===426);
+    assert.equal(pq.latest(await f.state()).digest,newHead.digest);
+});
+
+test("pairing survives note edits, expires at membership changes, and concurrent recovery fences the old admin",async t=>{
+    const f=await setup(t),joining=await seed(),code=await pq.requestPair(f.dav,f.s,joining,"joining");
+    const writer=await pq.storeFor(f.ledger,f.dav,f.s,f.owner);
+    await writer.publish("first.md",[],buffer("first"));let s=await f.state();
+    const candidate=await pq.readRequest(f.dav,s,code);
+    await writer.publish("second.md",[],buffer("second"));s=await f.state();
+    await pq.nextPolicy(f.ledger,s,f.owner,"approve",candidate);
+    await assert.rejects(pq.readRequest(f.dav,await f.state(),code),/过期/);
+    const current=await f.state();
+    const race=async(method,data,token)=>{
+        if(data.rotation)await takeover(f);
+        return f.ledger(method,data,token);
+    };
+    await assert.rejects((await pq.storeFor(race,f.dav,current,f.owner)).publish("obsolete.md",[],buffer("secret")),e=>[403,409].includes(e.status));
+    const result=await f.state();assert.equal(result.rows.length,2);assert.equal(result.policies.length,current.policies.length+1);
+    assert.ok(!pq.latest(result).p.members[f.owner.id]);
+});
+
+test("unsupported witnesses stop before upload, and same-head competing admin writes have only one winner",async t=>{
+    const f=await setup(t),old=await pq.state(async(method,data,token)=>{
+        const reply=await f.ledger(method,data,token);delete reply.adminRevisionRotation;return reply;
+    },f.rec.id);
+    const count=f.dav.files.size;
+    await assert.rejects((await pq.storeFor(f.ledger,f.dav,old,f.owner)).publish("a",[],buffer("new")),/升级/);
+    assert.equal(f.dav.files.size,count);
+    const writer=await pq.storeFor(f.ledger,f.dav,f.s,f.owner);
+    const writes=await Promise.allSettled(["a","b"].map(p=>writer.publish(p,[],buffer(p))));
+    assert.equal(writes.filter(v=>v.status==="fulfilled").length,1);
+    assert.equal(writes.find(v=>v.status==="rejected").reason.status,409);
+    const s=await f.state();assert.equal(s.rows.length,1);assert.equal(s.policies.length,f.s.policies.length+1);
+});
+
+test("a guest resumes a legacy chunk checkpoint across an admin rotation, then verifies its new revision",async t=>{
+    const {ChunkTransfer,threshold}=require("../src/transfer.cjs");
+    const f=await setup(t),slots=new Map();
+    const cache={get:k=>structuredClone(slots.get(JSON.stringify(k))),put:(k,v)=>slots.set(JSON.stringify(k),structuredClone(v)),
+        remove:k=>slots.delete(JSON.stringify(k)),clearDownload(){}};
+    const transfer=new ChunkTransfer(cache,{enabled:true,wait:async()=>{}});
+    const body=new Uint8Array(threshold+1),file="partial.bin",scope="pqc/"+f.rec.id;
+    const child=f.dav.child.bind(f.dav),objects=child("objects"),put=objects.put.bind(objects);
+    let offline=false,cut=true,writes=0;
+    objects.put=async(n,b)=>{
+        if(offline)throw Object.assign(Error("offline"),{offline:true});
+        await put(n,b);
+        if(++writes===3 && cut){offline=true;throw Object.assign(Error("offline"),{offline:true});}
+    };
+    const read=objects.read.bind(objects);
+    objects.read=n=>{if(offline)throw Object.assign(Error("offline"),{offline:true});return read(n);};
+    f.dav.child=n=>n==="objects"?objects:child(n);
+    const head=pq.latest(f.s),key=await crypto.subtle.importKey("raw",un64(await oldKey(f.s,f.guest)),"AES-GCM",false,["encrypt","decrypt"]);
+    await assert.rejects(transfer.upload({objects,scope,epoch:head.digest,wrapKey:key,path:file,parents:[],hash:await core.sha(body),bytes:body}));
+    assert.equal(writes,3);assert.ok(await cache.get([scope,"put",file]));
+    const owner=await pq.storeFor(f.ledger,f.dav,f.s,f.owner);
+    await owner.publish("removed",[],null);
+    assert.equal((await f.state()).policies.length,f.s.policies.length+1);
+    // The local checkpoint is upgraded even if the retry also loses connectivity.
+    const guest=await pq.storeFor(f.ledger,f.dav,await f.state(),f.guest,transfer);
+    await assert.rejects(guest.publish(file,[],body));
+    const migrated=await cache.get([scope,"put-device",file]);
+    assert.ok(migrated.deviceWrapped);assert.equal(await cache.get([scope,"put",file]),undefined);
+    await assert.rejects(core.unseal(key,migrated.binding,migrated.wrapped));
+    assert.equal((await core.unseal(f.guest.stagingKey,migrated.binding,migrated.wrapped)).byteLength,32);
+    offline=false;cut=false;
+    const rev=await guest.publish(file,[],body);assert.equal(writes,9);
+    const s=await f.state();
+    assert.equal(s.policies.length,f.s.policies.length+1);assert.equal(s.rows.length,2);
+    const admin=await pq.storeFor(f.ledger,f.dav,s,f.owner,transfer);
+    assert.deepEqual(new Uint8Array(await admin.readBody((await admin.history()).get(rev.id))),body);
 });

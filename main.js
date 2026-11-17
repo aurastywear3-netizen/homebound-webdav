@@ -2588,7 +2588,8 @@ var require_pqc = __commonJS({
       const enc = kem.keygen(await derive("kem", 64)), sig = dsa.keygen(await derive("signature", 32));
       const token = b64(await derive("ledger-capability", 32));
       const pub = { kem: b64(enc.publicKey), sig: b64(sig.publicKey), cap: await sha(new TextEncoder().encode(token)) };
-      return { pub, token, id: await fingerprint([pub.kem, pub.sig, pub.cap]), enc: enc.secretKey, sign: sig.secretKey };
+      const stagingKey = label === "device" ? await aes(await derive("local-upload-checkpoint", 32)) : void 0;
+      return { pub, token, stagingKey, id: await fingerprint([pub.kem, pub.sig, pub.cap]), enc: enc.secretKey, sign: sig.secretKey };
     }
     var freshSeed = () => b64(random(32));
     var aes = (raw) => crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]);
@@ -2624,6 +2625,9 @@ var require_pqc = __commonJS({
         check(p.by === "recovery" || p.by === prior.admin, "\u65E0\u7BA1\u7406\u6743\u9650\u3002");
         verify("policy", [p], sig, p.by === "recovery" ? prior.recovery.sig : prior.members[prior.admin].sig);
         check(p.members[p.admin] && (p.by === "recovery" || JSON.stringify(p.recovery) === JSON.stringify(prior.recovery)), "\u65E0\u6548\u6062\u590D\u6839\u3002");
+        if (p.revisionId !== void 0) {
+          check(prev && typeof p.revisionId === "string" && idPattern.test(p.revisionId) && p.keyLink && p.by === prior.admin && p.admin === prior.admin && JSON.stringify(p.members) === JSON.stringify(prior.members), "\u4FEE\u8BA2\u6362\u94A5\u6539\u53D8\u4E86\u6210\u5458\u6216\u7BA1\u7406\u5458\u3002");
+        }
         if (p.keyLink !== void 0) {
           check(prev && typeof p.keyLink === "string" && un64(p.keyLink).length === 60, "\u5386\u53F2\u5BC6\u94A5\u94FE\u63A5\u635F\u574F\u3002");
           linked = true;
@@ -2633,20 +2637,35 @@ var require_pqc = __commonJS({
         policies.push({ p, digest });
       }
       check(!pin || pin.n < policies.length, "\u6388\u6743\u8BB0\u5F55\u56DE\u9000\u3002");
-      return { policies, rows: snapshot.revisions };
+      return { policies, rows: snapshot.revisions, canRotate: snapshot.adminRevisionRotation === 1 };
     }
-    async function signPolicy(ledger, p, actor, keys, token = actor.token) {
+    async function preparePolicy(p, actor, key) {
       p.boxes = {};
-      for (const [id2, m] of Object.entries(p.members)) p.boxes[id2] = await envelope(m, keys, [p.anchor, p.n, id2]);
-      p.recoveryBox = await envelope(p.recovery, keys, [p.anchor, p.n, "recovery"]);
+      for (const [id2, m] of Object.entries(p.members)) p.boxes[id2] = await envelope(m, [key], [p.anchor, p.n, id2]);
+      p.recoveryBox = await envelope(p.recovery, [key], [p.anchor, p.n, "recovery"]);
       const row = JSON.stringify({ policy: p, sig: signed("policy", [p], actor.sign) });
-      const result = await ledger("policy", { head: p.parent, row }, token);
-      check(result.digest === await digestOf(row), "\u63D0\u4EA4\u670D\u52A1\u8FD4\u56DE\u4E86\u4E0D\u540C\u7684\u6388\u6743\u6458\u8981\u3002");
-      return { p, digest: result.digest };
+      return { p, row, digest: await digestOf(row) };
+    }
+    async function commitPolicy(ledger, next, token) {
+      const receipt = await ledger("policy", { head: next.p.parent, row: next.row }, token);
+      check(receipt.digest === next.digest, "\u63D0\u4EA4\u670D\u52A1\u8FD4\u56DE\u4E86\u4E0D\u540C\u7684\u6388\u6743\u6458\u8981\u3002");
+      return { p: next.p, digest: next.digest };
     }
     async function genesis(ledger, device, name, recovery, bootstrap) {
       const p = { suite, n: 0, parent: "", by: "recovery", anchor: recovery.id, recovery: recovery.pub, admin: device.id, members: { [device.id]: publicDevice(device, name) } };
-      await signPolicy(ledger, p, recovery, [freshSeed()], bootstrap);
+      await commitPolicy(ledger, await preparePolicy(p, recovery, freshSeed()), bootstrap);
+    }
+    function membershipHead(s) {
+      let i = s.policies.length - 1;
+      while (i > 0 && s.policies[i].p.revisionId !== void 0) i--;
+      return s.policies[i];
+    }
+    function currentPairingHead(s, head) {
+      for (let i = s.policies.length - 1; i >= 0; i--) {
+        if (s.policies[i].digest === head) return true;
+        if (s.policies[i].p.revisionId === void 0) break;
+      }
+      return false;
     }
     var lifetime = 10 * 60 * 1e3;
     async function requestPair(dav, s, device, name) {
@@ -2659,12 +2678,12 @@ var require_pqc = __commonJS({
     async function readRequest(dav, s, code) {
       check(idPattern.test(code), "\u914D\u5BF9\u7801\u683C\u5F0F\u9519\u8BEF\u3002");
       const { request, sig } = parseBytes(await dav.child("requests").read(code));
-      const { p, digest } = latest(s);
-      check(request.anchor === p.anchor && request.head === digest, "\u914D\u5BF9\u7533\u8BF7\u5DF2\u8FC7\u671F\u6216\u5DF2\u4F7F\u7528\u3002");
+      const { p } = latest(s);
+      check(request.anchor === p.anchor && currentPairingHead(s, request.head), "\u914D\u5BF9\u7533\u8BF7\u5DF2\u8FC7\u671F\u6216\u5DF2\u4F7F\u7528\u3002");
       check(Number.isSafeInteger(request.expires) && request.expires >= Date.now() && request.expires <= Date.now() + lifetime + 6e4, "\u914D\u5BF9\u7533\u8BF7\u5DF2\u8FC7\u671F\u3002");
       check(idPattern.test(request.nonce) && await fingerprint([request]) === code, "\u914D\u5BF9\u7801\u88AB\u66FF\u6362\u3002");
       verify("join", [request], sig, request.pub.sig);
-      return { id: await publicId(request.pub), pub: request.pub, expires: request.expires, head: digest };
+      return { id: await publicId(request.pub), pub: request.pub, expires: request.expires, head: request.head };
     }
     async function nextPolicy(ledger, s, actor, action, arg) {
       const { p, digest } = latest(s), restoring = action === "restore";
@@ -2682,16 +2701,20 @@ var require_pqc = __commonJS({
         check(arg !== admin && members[arg], "\u65E0\u6CD5\u64A4\u9500\u8BE5\u8BBE\u5907\u3002");
         delete members[arg];
       } else if (action === "approve") {
-        check(!members[arg.id] && arg.expires >= Date.now() && arg.head === digest, "\u914D\u5BF9\u7533\u8BF7\u5931\u6548\u3002");
+        check(!members[arg.id] && arg.expires >= Date.now() && currentPairingHead(s, arg.head), "\u914D\u5BF9\u7533\u8BF7\u5931\u6548\u3002");
         members[arg.id] = arg.pub;
       } else check(action === "seal-history", "\u672A\u77E5\u64CD\u4F5C\u3002");
-      const next = { suite, n: p.n + 1, parent: digest, anchor: p.anchor, by: restoring ? "recovery" : actor.id, recovery, admin, members };
-      const current = freshSeed();
-      next.keyLink = b64(await encrypt(un64(current), [suite, p.anchor, next.n, digest, "previous-key"], un64(keys.at(-1))));
+      const next = await prepareSuccessor({ p, digest }, actor, keys, { by: restoring ? "recovery" : actor.id, recovery, admin, members });
+      return commitPolicy(ledger, next.policy, actor.token);
+    }
+    async function prepareSuccessor({ p, digest }, actor, keys, fields) {
+      const next = { suite, n: p.n + 1, parent: digest, anchor: p.anchor, ...fields };
+      const key = freshSeed();
+      next.keyLink = b64(await encrypt(un64(key), [suite, p.anchor, next.n, digest, "previous-key"], un64(keys.at(-1))));
       if (!p.keyLink && p.n > 0) {
-        next.legacyKeys = b64(await encrypt(un64(current), [suite, p.anchor, next.n, digest, "legacy-keys"], jsonBytes(keys.slice(0, -1))));
+        next.legacyKeys = b64(await encrypt(un64(key), [suite, p.anchor, next.n, digest, "legacy-keys"], jsonBytes(keys.slice(0, -1))));
       }
-      return signPolicy(ledger, next, actor, [current]);
+      return { key, policy: await preparePolicy(next, actor, key) };
     }
     async function encrypt(rawKey, label, bytes) {
       const iv = random(12), cipher = await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: jsonBytes(label) }, await aes(rawKey), bytes);
@@ -2716,8 +2739,8 @@ var require_pqc = __commonJS({
       }
       return seen;
     }
-    async function storeFor(ledger, dav, s, device, transfer) {
-      const { p, digest } = latest(s);
+    async function storeFor(ledger, dav, s, device, transfer, onRotation) {
+      const { p } = latest(s);
       const envelopeKeys = await openRing(device, p.boxes[device.id], [p.anchor, p.n, device.id]);
       let ring = envelopeKeys;
       if (p.keyLink) {
@@ -2728,7 +2751,9 @@ var require_pqc = __commonJS({
         while (n > 0 && s.policies[n].p.keyLink) {
           const policy = s.policies[n].p;
           const previous = await decrypt(un64(ring[n]), [suite, p.anchor, n, policy.parent, "previous-key"], un64(policy.keyLink));
-          ring[--n] = b64(previous);
+          const previousKey = b64(previous);
+          if (policy.revisionId) check(previousKey !== ring[n], "\u7BA1\u7406\u5458\u4FEE\u8BA2\u590D\u7528\u4E86\u4E0A\u4E00\u4EE3\u5BC6\u94A5\u3002");
+          ring[--n] = previousKey;
         }
         if (n > 0) {
           const bridge = s.policies[n + 1].p.legacyKeys;
@@ -2740,10 +2765,18 @@ var require_pqc = __commonJS({
       }
       check(ring.length === s.policies.length, "\u5BC6\u94A5\u8BB0\u5F55\u4E0D\u5B8C\u6574\u3002");
       const bodies = dav.child("objects"), revisions = [];
+      const firstRotation = s.policies.findIndex((entry) => entry.p.revisionId !== void 0);
+      const pending = new Set(s.policies.filter((entry) => entry.p.revisionId !== void 0).map((entry) => entry.p.n));
       let previousEpoch = -1;
       for (const raw of s.rows) {
         const { record: r, sig } = JSON.parse(raw), policy = s.policies[r.epoch];
         check(policy && r.anchor === p.anchor && r.head === policy.digest && r.epoch >= previousEpoch && policy.p.members[r.from], "\u975E\u6CD5\u5199\u5165\u4EE3\u9645\u6216\u4F5C\u8005\u3002");
+        if (pending.has(r.epoch)) {
+          check(r.from === policy.p.admin && r.id === policy.p.revisionId, "\u6362\u94A5\u8BB0\u5F55\u7F3A\u5C11\u5BF9\u5E94\u7684\u7BA1\u7406\u5458\u4FEE\u8BA2\u3002");
+          pending.delete(r.epoch);
+        } else if (firstRotation >= 0 && r.epoch >= firstRotation) {
+          check(r.from !== policy.p.admin, "\u7BA1\u7406\u5458\u4FEE\u8BA2\u7F3A\u5C11\u72EC\u7ACB\u6362\u94A5\u8BB0\u5F55\u3002");
+        }
         verify("revision", [r], sig, policy.p.members[r.from].sig);
         const rev = parseBytes(await decrypt(un64(ring[r.epoch]), [suite, p.anchor, r.epoch, r.id, "manifest"], un64(r.payload)));
         check(rev.id === r.id && (rev.hash === null ? rev.key === null : typeof rev.key === "string" && un64(rev.key).length === 32), "\u4FEE\u8BA2\u8BB0\u5F55\u5F02\u5E38\u3002");
@@ -2751,7 +2784,10 @@ var require_pqc = __commonJS({
         revisions.push(rev);
         previousEpoch = r.epoch;
       }
+      check(!pending.size, "\u6362\u94A5\u8BB0\u5F55\u5BF9\u5E94\u7684\u4FEE\u8BA2\u7F3A\u5931\u3002");
       const history = validateGraph(revisions);
+      const membership = membershipHead(s);
+      let current = latest(s), currentKeys = envelopeKeys;
       const scope = "pqc/" + p.anchor;
       return {
         async history() {
@@ -2767,12 +2803,16 @@ var require_pqc = __commonJS({
           return body;
         },
         async publish(path, parents, bytes) {
+          const parent = current, keys = currentKeys;
+          const admin = device.id === parent.p.admin;
+          if (admin) check(s.canRotate, "\u8BF7\u5148\u5347\u7EA7\u6B64 PQC \u5E93\u7684\u53EF\u4FE1\u63D0\u4EA4\u670D\u52A1\uFF0C\u518D\u540C\u6B65\u7BA1\u7406\u5458\u4FEE\u8BA2\u3002");
           const hash = bytes === null ? null : await sha(bytes);
           const staged = transfer?.shouldSplit(bytes) ? await transfer.upload({
             objects: bodies,
             scope,
-            epoch: digest,
-            wrapKey: await aes(un64(ring[p.n])),
+            epoch: membership.digest,
+            wrapKey: await aes(un64(ring[membership.p.n])),
+            deviceKey: device.stagingKey,
             path,
             parents,
             hash,
@@ -2784,19 +2824,36 @@ var require_pqc = __commonJS({
           if (staged) rev.parts = staged.parts;
           validateGraph([...history.values(), rev]);
           if (contentKey) await bodies.put(id2, (await encrypt(contentKey, [suite, p.anchor, id2, "body"], bytes)).buffer);
+          const rotation = admin ? await prepareSuccessor(parent, device, keys, {
+            by: device.id,
+            recovery: p.recovery,
+            admin: p.admin,
+            members: p.members,
+            revisionId: id2
+          }) : null;
+          const target = rotation?.policy ?? parent;
+          const epoch = target.p.n, key = rotation?.key ?? keys.at(-1);
           const r = {
             anchor: p.anchor,
-            head: digest,
-            epoch: p.n,
+            head: target.digest,
+            epoch,
             id: id2,
             from: device.id,
-            payload: b64(await encrypt(un64(ring[p.n]), [suite, p.anchor, p.n, id2, "manifest"], jsonBytes(rev)))
+            payload: b64(await encrypt(un64(key), [suite, p.anchor, epoch, id2, "manifest"], jsonBytes(rev)))
           };
           const row = JSON.stringify({ record: r, sig: signed("revision", [r], device.sign) });
-          const receipt = await ledger("commit", { head: digest, row }, device.token);
+          const data = { head: parent.digest, row };
+          if (rotation) data.rotation = target.row;
+          const receipt = await ledger("commit", data, device.token);
           check(receipt.digest === await digestOf(row), "\u5199\u5165\u56DE\u6267\u65E0\u6548\u3002");
+          if (rotation) {
+            check(receipt.policyDigest === target.digest, "\u6362\u94A5\u56DE\u6267\u65E0\u6548\u3002");
+            current = target;
+            currentKeys = [key];
+            if (onRotation) await onRotation(epoch, target.digest);
+          }
           history.set(id2, rev);
-          if (staged) await transfer.uploaded(scope, path);
+          if (staged) await transfer.uploaded(scope, path, device.stagingKey);
           return rev;
         }
       };
@@ -3129,7 +3186,7 @@ var require_pqc_mode = __commonJS({
           throw: false
         });
         if (response.status !== 200) {
-          const msg = { 403: "\u672A\u83B7\u6388\u6743\u3001\u5DF2\u64A4\u9500\u6216\u6062\u590D\u7801\u5931\u6548", 404: "\u8BF7\u6C42\u4E0D\u5B58\u5728", 409: "\u6388\u6743\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u540C\u6B65\u6216\u914D\u5BF9" }[response.status] || "\u53EF\u4FE1\u63D0\u4EA4\u670D\u52A1\u4E0D\u53EF\u7528";
+          const msg = { 403: "\u672A\u83B7\u6388\u6743\u3001\u5DF2\u64A4\u9500\u6216\u6062\u590D\u7801\u5931\u6548", 404: "\u8BF7\u6C42\u4E0D\u5B58\u5728", 409: "\u6388\u6743\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u540C\u6B65\u6216\u914D\u5BF9", 426: "\u7BA1\u7406\u5458\u9010\u4FEE\u8BA2\u6362\u94A5\u9700\u8981\u5347\u7EA7\u63D2\u4EF6\u548C\u53EF\u4FE1\u63D0\u4EA4\u670D\u52A1" }[response.status] || "\u53EF\u4FE1\u63D0\u4EA4\u670D\u52A1\u4E0D\u53EF\u7528";
           throw Object.assign(Error(msg + " (" + response.status + ")"), { status: response.status });
         }
         return response.json;
@@ -3272,7 +3329,10 @@ var require_pqc_mode = __commonJS({
           await this.refresh(s);
           throw Error("\u6B64\u8BBE\u5907\u672A\u83B7\u6388\u6743\uFF0C\u6216\u5DF2\u88AB\u64A4\u9500\u3002\u8BF7\u5728\u8BBE\u7F6E\u4E2D\u91CD\u65B0\u7533\u8BF7\u914D\u5BF9\u3002");
         }
-        const store = await pq.storeFor(this.ledger.bind(this), dav, s, device, this.transfer);
+        const store = await pq.storeFor(this.ledger.bind(this), dav, s, device, this.transfer, async (n, digest) => {
+          this.config.pin = { n, digest };
+          await this.saveData(this.config);
+        });
         this.config.pin = { n: last.p.n, digest: last.digest };
         delete this.config.request;
         await this.saveData(this.config);
@@ -3413,14 +3473,22 @@ var require_transfer = __commonJS({
           }
         }
       }
-      async upload({ objects, scope, epoch, wrapKey, path, parents, hash, bytes }) {
+      async upload({ objects, scope, epoch, wrapKey, deviceKey, path, parents, hash, bytes }) {
         const data = new Uint8Array(bytes.buffer ?? bytes, bytes.byteOffset ?? 0, bytes.byteLength);
-        const slot = [scope, "put", path];
+        const slot = [scope, deviceKey ? "put-device" : "put", path];
+        const legacySlot = [scope, "put", path];
         const binding = JSON.stringify(["upload-1", scope, epoch, path, hash, [...parents].sort()]);
         let pending = await this.cache.get(slot);
+        const migrated = !pending && deviceKey ? await this.cache.get(legacySlot) : null;
+        pending ??= migrated;
         let raw;
         if (pending?.binding === binding) {
-          raw = await core2.unseal(wrapKey, binding, pending.wrapped);
+          raw = await core2.unseal(pending.deviceWrapped ? deviceKey : wrapKey, binding, pending.wrapped);
+          if (deviceKey && !pending.deviceWrapped) {
+            pending.wrapped = await core2.seal(deviceKey, binding, raw);
+            pending.deviceWrapped = true;
+            await this.cache.put(slot, pending);
+          }
         } else {
           raw = crypto.getRandomValues(new Uint8Array(32));
           pending = {
@@ -3429,10 +3497,12 @@ var require_transfer = __commonJS({
             parts: { v: 1, size: data.length, seed: core2.randomId() },
             done: 0,
             inFlight: false,
-            wrapped: await core2.seal(wrapKey, binding, raw)
+            deviceWrapped: Boolean(deviceKey),
+            wrapped: await core2.seal(deviceKey ?? wrapKey, binding, raw)
           };
           await this.cache.put(slot, pending);
         }
+        if (migrated) await this.cache.remove(legacySlot);
         const { id: id2, parts } = pending, total = Math.ceil(data.length / blockSize2);
         if (!validParts(parts) || parts.size !== data.length || !Number.isInteger(pending.done) || pending.done < 0 || pending.done > total) throw Error("\u5206\u5757\u4E0A\u4F20\u8BB0\u5F55\u635F\u574F\u3002");
         const key = await aes(raw);
@@ -3504,8 +3574,8 @@ var require_transfer = __commonJS({
         if (!audit) await this.cache.clearDownload(scope, id2);
         return output.buffer;
       }
-      uploaded(scope, path) {
-        return this.cache.remove([scope, "put", path]);
+      uploaded(scope, path, deviceKey) {
+        return this.cache.remove([scope, deviceKey ? "put-device" : "put", path]);
       }
     };
     module2.exports = { ChunkTransfer: ChunkTransfer2, TransferCache: TransferCache2, blockSize: blockSize2, threshold, validParts };

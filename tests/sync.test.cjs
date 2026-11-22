@@ -181,6 +181,72 @@ async function offlineConflict() {
     return {f, mac, ipad, note, selection};
 }
 
+test("offline changes in different paragraphs auto-save one combined head and sync back without review",async()=>{
+    const f=await fixture(),mac=f.device(),ipad=f.device(),note="日报.md";
+    mac.contents.set(note,text("甲\n\n乙\n"));await mac.sync();await ipad.sync();
+    mac.contents.set(note,text("Mac\n\n乙\n"));ipad.contents.set(note,text("甲\n\niPad\n"));
+    await mac.sync();
+    const merged=await ipad.sync();assert.deepEqual(merged.conflicts,[]);assert.equal(ipad.archived.size,0);
+    const heads=core.headsByPath(merged.history).get(note);
+    assert.equal(heads.length,1);assert.equal(heads[0].parents.length,2);
+    assert.deepEqual(await f.store.readBody(heads[0]),text("Mac\n\niPad\n"));
+    assert.deepEqual((await mac.sync()).conflicts,[]);assert.deepEqual(mac.contents,ipad.contents);
+    assert.equal((await ipad.sync()).sent,0);assert.equal(f.markers.size,4);
+});
+
+test("a lost merge acknowledgement recovers without re-uploading the losing local branch",async()=>{
+    const f=await fixture(),a=f.device(),b=f.device(),note="test.md";
+    a.contents.set(note,text("a\nb\n"));await a.sync();await b.sync();
+    b.contents.set(note,text("a\nB\n"));a.contents.set(note,text("A\nb\n"));await a.sync();
+    const mkdir=f.dav.mkdir;let count=0;
+    f.dav.mkdir=async path=>{await mkdir(path);if (++count===2) throw Error("merge acknowledgement lost");};
+    await assert.rejects(b.sync(),/acknowledgement/);assert.deepEqual(b.contents.get(note),text("a\nB\n"));
+    f.dav.mkdir=mkdir;const retry=await b.sync();assert.equal(retry.sent,0);assert.deepEqual(retry.conflicts,[]);
+    await a.sync();assert.deepEqual(b.contents.get(note),text("A\nB\n"));assert.deepEqual(a.contents,b.contents);
+});
+
+test("editing the note while the automatic merge loads the base preserves the new edit",async()=>{
+    const f=await fixture(),a=f.device(),b=f.device(),note="test.md";
+    a.contents.set(note,text("a\nb\nc\n"));await a.sync();await b.sync();
+    const [root]=b.baseline.get(note).ids;
+    a.contents.set(note,text("A\nb\nc\n"));b.contents.set(note,text("a\nB\nc\n"));await a.sync();
+    const read=f.store.readBody.bind(f.store);
+    f.store.readBody=async rev=>{
+        if (rev.id===root) b.contents.set(note,text("a\nB\nC\n"));
+        return read(rev);
+    };
+    await assert.rejects(b.sync(),/正文已变化/);
+    assert.deepEqual(b.contents.get(note),text("a\nB\nC\n"));
+    f.store.readBody=read;
+    assert.deepEqual((await b.sync()).conflicts,[]);await a.sync();
+    assert.deepEqual(a.contents.get(note),text("A\nB\nC\n"));
+});
+
+test("an empty device and concurrent resolvers use the same branch contents and converge",async()=>{
+    const f=await fixture(),old=f.device(),fresh=f.device(),note="test.md";
+    old.contents.set(note,text("x\ny\n"));await old.sync();const parent=old.baseline.get(note).ids;
+    await f.store.publish(note,parent,text("X\ny\n"));await f.store.publish(note,parent,text("x\nY\n"));
+    const rounds=await Promise.all([fresh.sync(),old.sync()]);assert(rounds.every(r=>!r.conflicts.length));
+    assert.deepEqual(fresh.contents.get(note),text("X\nY\n"));assert.deepEqual(old.contents,fresh.contents);
+    for (const device of [old,fresh]) assert.equal((await device.sync()).sent,0);
+});
+
+test("an unpublished local change survives discovering two remote branches",async()=>{
+    const f=await fixture(),d=f.device(),note="three.md";
+    d.contents.set(note,text("a\nb\nc"));await d.sync();const parent=d.baseline.get(note).ids;
+    await f.store.publish(note,parent,text("A\nb\nc"));await f.store.publish(note,parent,text("a\nB\nc"));
+    d.contents.set(note,text("a\nb\nC"));const result=await d.sync();
+    assert.deepEqual(result.conflicts,[]);assert.deepEqual(d.contents.get(note),text("A\nB\nC"));
+    assert.equal(core.headsByPath(result.history).get(note).length,1);
+});
+
+test("binary attachments with disjoint byte changes stay in manual review",async()=>{
+    const f=await fixture(),a=f.device(),b=f.device(),note="attachment.bin";
+    a.contents.set(note,text("left\nright"));await a.sync();await b.sync();
+    a.contents.set(note,text("LEFT\nright"));b.contents.set(note,text("left\nRIGHT"));await a.sync();
+    assert.deepEqual((await b.sync()).conflicts,[note]);assert.equal(b.archived.size,2);
+});
+
 test("select a reviewed peer copy and converge without reporting the old conflict again", async () => {
     const {mac, ipad, note, selection} = await offlineConflict();
     const result = await mac.sync(undefined, selection);

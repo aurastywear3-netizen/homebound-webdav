@@ -4,7 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const {EventEmitter, once} = require("node:events");
-const {lineDiff, contextRows, textWindow, mergeParts, mergedText} = require("../src/diff.cjs");
+const {lineDiff, contextRows, textWindow} = require("../src/diff.cjs");
 const {VersionWatch} = require("../src/version.cjs");
 const {PendingUploads} = require("../src/pending.cjs");
 const core = require("../src/core.cjs");
@@ -91,15 +91,25 @@ test("conflict dialogs open in order, can be dismissed, and reopen for a new ver
     p.reviewModal.close();
 });
 
-test("merge choices preserve independent edits, blank files, UTF-8 and line endings", () => {
-    const parts = mergeParts("本机\r\ncommon\r\nold","peer\r\ncommon\r\nnew");
-    assert.equal(mergedText(parts),"本机\r\ncommon\r\nold");
-    parts[0].choice = "both"; parts[2].choice = "selected";
-    assert.equal(mergedText(parts),"本机\r\npeer\r\ncommon\r\nnew");
-    const last = mergeParts("left","right"); last[0].choice="both";
-    assert.equal(mergedText(last),"left\nright");
-    const deleted = mergeParts("body\n",""); deleted[0].choice="selected";
-    assert.equal(mergedText(deleted),"");
+test("a successful sync closes only a resolved review in this vault, leaving a submitting dialog to finish", () => {
+    const p = new compiled.exports();
+    p.state = {current:{id:"vault"}};
+    p.app = {saveLocalStorage(){}};
+    p.settingsTab = {refreshStatus(){}};
+    let closes = 0;
+    const modal = {review:{vaultId:"vault",path:"a.md"}, close(){closes++; p.reviewModal=null;}};
+    p.reviewModal = modal;
+    p.recordSuccess(["a.md"]);
+    modal.submitting = true;
+    p.recordSuccess([]);
+    modal.submitting = false;
+    modal.review.vaultId = "other";
+    p.recordSuccess([]);
+    assert.equal(closes,0);
+    modal.review.vaultId = "vault";
+    p.recordSuccess(["b.md"]);
+    p.recordSuccess([]);
+    assert.equal(closes,1);
 });
 
 test("probes coalesce coarse timestamps and unsupported collections use a small shared marker", async t => {

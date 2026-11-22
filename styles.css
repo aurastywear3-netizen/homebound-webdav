@@ -77,3 +77,10 @@
     resize: vertical;
     box-sizing: border-box;
 }
+.homebound-merge-region {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    max-height: 30vh;
+    overflow: auto;
+    padding: var(--size-4-2);
+}

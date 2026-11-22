@@ -1,17 +1,11 @@
 "use strict";
 
 const {Modal, Setting, getLanguage} = require("obsidian");
-const {lineDiff, contextRows, textWindow, mergeParts, mergedText} = require("./diff.cjs");
+const {lineDiff, contextRows, textWindow} = require("./diff.cjs");
+const {asText} = require("./merge.cjs");
 const tr = (en, zh) => getLanguage().startsWith("zh") ? zh : en;
 const previewLimit = 256 * 1024;
 
-function asText(bytes) {
-    if (bytes === null) return "";
-    try {
-        const text = new TextDecoder("utf-8",{fatal:true,ignoreBOM:true}).decode(bytes);
-        return /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text) ? null : text;
-    } catch { return null; }
-}
 
 function describe(hash, size) {
     if (hash === null) return tr("Deleted","已删除");
@@ -60,170 +54,132 @@ function drawWindows(el, left, right) {
 class ConflictReview extends Modal {
     constructor(app, review, submit, closed) {
         super(app);
-        this.review = review;
-        this.submit = submit;
-        this.closed = closed;
-        this.generation = 0;
+        this.review=review;
+        this.submit=submit;
+        this.closed=closed;
+        this.generation=0;
     }
     onOpen() {
-        const {path, heads, localHash, bytes} = this.review;
-        this.setTitle(tr("Compare conflict","比较冲突版本"));
-        const el = this.contentEl;
+        const {path,heads,localHash}=this.review, el=this.contentEl;
+        this.setTitle(tr("Resolve conflict","处理冲突"));
         el.addClass("homebound-review");
         el.createEl("p",{text:path,cls:"homebound-review-path"});
-        const first = heads.find(r => r.hash !== localHash) || heads[0];
-        new Setting(el).setName(tr("Compare local file with","与本机文件比较")).addDropdown(d => {
-            this.picker = d;
-            for (const rev of heads) {
-                const label = rev.hash === null ? tr("Deletion","删除版本") : tr("Version","版本");
-                d.addOption(rev.id, label + " · " + rev.id.slice(0,12));
-            }
-            d.setValue(first.id).onChange(id => this.preview(heads.find(r => r.id === id)));
-        });
-        this.body = el.createDiv();
-        this.message = el.createDiv({attr:{role:"status"}});
-        this.actions = new Setting(el).addButton(b => b.setButtonText(tr("Close","关闭")).onClick(() => this.close())).addButton(b => {
-            this.localButton = b.setButtonText(bytes === null ? tr("Keep local deletion","保留本机删除") : tr("Keep local file","保留本机文件"))
-                .onClick(() => this.choose("local"));
-        }).addButton(b => { this.remoteButton = b.setCta().onClick(() => this.choose(this.selected.id)); });
-        this.preview(first);
+        const peers=[...new Map(heads.filter(r=>r.hash!==localHash).map(r=>[r.hash,r])).values()];
+        if (peers.length>1) {
+            new Setting(el).setName(tr("Remote version","远端版本")).addDropdown(d=>{
+                this.picker=d;
+                for (const peer of peers) d.addOption(peer.id,peer.id.slice(0,12));
+                d.setValue(peers[0].id).onChange(id=>this.preview(peers.find(r=>r.id===id)));
+            });
+        }
+        this.body=el.createDiv();
+        this.actions=el.createDiv();
+        this.message=el.createDiv({attr:{role:"status"}});
+        this.preview(peers[0]);
     }
-    async preview(rev) {
-        const generation = ++this.generation;
-        const {bytes, localHash, readVersion} = this.review;
-        this.selected = rev;
+    async preview(peer) {
+        const generation=++this.generation;
+        this.selected=peer;
+        this.actions.empty();
         this.body.empty();
-        this.localButton.setDisabled(true);
-        this.remoteButton.setDisabled(true).setButtonText(rev.hash === null ? tr("Use selected deletion","采用所选删除版本") : tr("Use selected file","采用所选文件"));
         this.message.setText(tr("Loading comparison…","正在读取差异…"));
+        const {bytes,path,localHash,readVersion,planFor}=this.review;
         try {
-            let remote = null, size = rev.parts?.size;
-            if (rev.hash !== null && size === undefined) {
-                remote = rev.hash === localHash ? bytes : await readVersion(rev);
-                size = remote.byteLength;
-            }
-            if (generation !== this.generation) return;
-            for (const [label,hash,n] of [[tr("Local","本机"),localHash,bytes?.byteLength],[tr("Selected","所选版本"),rev.hash,size]]) {
-                const p = this.body.createEl("p",{cls:"homebound-version"});
-                p.createEl("strong",{text:label + " · "});
-                p.createSpan({text:describe(hash,n)});
-            }
-            if (rev.hash === localHash) {
-                this.body.createEl("p",{text:tr("Identical content.","内容相同。")});
-            } else {
-                const large = (bytes?.byteLength || 0) > previewLimit || size > previewLimit;
-                const left = large ? null : asText(bytes), right = large ? null : asText(remote);
-                if (large && /\.(md|txt|canvas|json|csv|tsv|yaml|yml|xml|html|css|js|ts|tex|log)$/i.test(rev.path)) {
-                    const section = this.body.createDiv();
-                    new Setting(section).addButton(b => b.setButtonText(tr("Compare text in sections","分段比较文本")).onClick(async () => {
-                        b.setDisabled(true);
-                        try {
-                            const data = rev.parts ? await readVersion(rev) : remote;
-                            if (generation === this.generation) {
-                                drawWindows(section,bytes,data);
-                                const a = asText(bytes), b = asText(data);
-                                if (a !== null && b !== null) this.offerMerge(a,b);
-                            }
-                        } catch (error) {
-                            if (generation === this.generation) { this.message.setText(error.message); b.setDisabled(false); }
-                        }
-                    }));
-                } else if (left === null || right === null) {
-                    this.body.createEl("p",{text:tr("Compare file sizes and SHA-256 above.","可通过上方的大小和 SHA-256 比较文件。")});
-                } else {
-                    drawText(this.body,left,right);
-                    this.offerMerge(left,right);
-                    if (bytes !== null && remote !== null && left.endsWith("\n") !== right.endsWith("\n")) {
-                        this.body.createEl("p",{text:left.endsWith("\n") ? tr("Only the local file ends with a newline.","仅本机文件以换行结束。")
-                            : tr("Only the selected file ends with a newline.","仅所选版本以换行结束。")});
-                    }
-                }
-            }
+            const binaryAttachment=peer.parts && !/\.(md|txt|canvas|json|csv|tsv|yaml|yml|xml|html|css|js|ts|tex|log)$/i.test(path);
+            const data=peer.hash===null || binaryAttachment ? null : await readVersion(peer);
+            const left=asText(bytes), right=asText(data);
+            const parts=await planFor(peer,left,right);
+            if (generation!==this.generation) return;
             this.message.empty();
-            this.localButton.setDisabled(false);
-            this.remoteButton.setDisabled(false);
-        } catch (error) {
-            if (generation === this.generation) this.message.setText(error.message);
-        }
-    }
-    offerMerge(left, right) {
-        new Setting(this.body).addButton(b => b.setButtonText(tr("Merge text…","合并文本…"))
-            .onClick(() => this.startMerge(left,right)));
-    }
-    startMerge(left, right) {
-        const parts = mergeParts(left,right), changes = parts.filter(part => part.changed);
-        this.picker.setDisabled(true);
-        this.actions.settingEl.hidden = true;
-        this.body.empty();
-        const pane = this.body.createDiv();
-        if (this.review.heads.some(rev => rev.hash !== this.review.localHash && rev.hash !== this.selected.hash)) {
-            this.body.createEl("p",{text:tr("After saving, compare the merged file with the remaining versions.","保存后将继续比较合并结果与其余版本。")});
-        }
-        const reviewAgain = () => {
-            if (this.submitting) return;
-            this.actions.settingEl.hidden = false;
-            this.picker.setDisabled(false);
-            this.preview(this.selected);
-        };
-        new Setting(this.body).addButton(b => b.setButtonText(tr("Discard draft and return","放弃草稿并返回比较"))
-            .onClick(reviewAgain));
-        const edit = () => {
-            pane.empty();
-            const draft = mergedText(parts);
-            const label = pane.createEl("label",{text:tr("Merged text","合并后的正文")});
-            const input = label.createEl("textarea",{cls:"homebound-merge-text"});
-            input.value = draft;
-            const initial = input.value;
-            new Setting(pane).addButton(b => b.setCta().setButtonText(tr("Save merged file","保存合并文件")).onClick(async () => {
-                b.setDisabled(true);
-                // HTML textareas normalize line endings. Preserve untouched bytes and
-                // preserve CRLF style when the user edits a CRLF document.
-                let text = draft;
-                if (input.value !== initial) {
-                    const crlf = draft.includes("\r\n") && !/(^|[^\r])\n/.test(draft);
-                    text = crlf ? input.value.replace(/\n/g,"\r\n") : input.value;
+            if (parts && parts.some(p=>typeof p!=="string")) {
+                this.reviewRegions(parts);
+            } else if (parts) {
+                // Another device can finish or change a conflict while the dialog opens.
+                await this.choose("merge",parts.join(""));
+            } else {
+                // Independent creations, deletion vs edit and attachments have
+                // no common text to resolve a range against. Choose a whole file.
+                const size=peer.parts?.size ?? data?.byteLength;
+                for (const [label,hash,n] of [[tr("Local","本地"),localHash,bytes?.byteLength],[tr("Remote","远端"),peer.hash,size]]) {
+                    this.body.createEl("p",{cls:"homebound-version",text:label+" · "+describe(hash,n)});
                 }
-                input.readOnly = true;
-                await this.choose("merge",text);
-                input.readOnly = false;
-                b.setDisabled(false);
-            }));
+                const editable=!binaryAttachment && (bytes===null || left!==null) && (peer.hash===null || right!==null);
+                if (editable) {
+                    if ((bytes?.byteLength||0)+(data?.byteLength||0)>previewLimit) drawWindows(this.body.createDiv(),bytes,data);
+                    else drawText(this.body,left??"",right??"");
+                }
+                this.choices(()=>this.choose(peer.id),()=>this.choose("local"),editable ?
+                    ()=>this.edit(left??right??"",value=>this.choose("merge",value)) : null);
+            }
+        } catch (error) {
+            if (generation===this.generation) this.message.setText(error.message);
+        }
+    }
+    choices(remote,local,edit) {
+        this.actions.empty();
+        const controls=new Setting(this.actions);
+        controls.addButton(b=>b.setButtonText(tr("Keep remote","保留远端")).onClick(remote));
+        controls.addButton(b=>b.setButtonText(tr("Keep local","保留本地")).onClick(local));
+        if (edit) controls.addButton(b=>b.setButtonText(tr("Edit","编辑")).onClick(edit));
+    }
+    reviewRegions(parts) {
+        const indices=parts.map((part,i)=>typeof part==="string" ? -1 : i).filter(i=>i>=0);
+        const result=parts.slice();
+        const show=index=>{
+            const position=indices[index], part=parts[position];
+            this.body.empty();
+            this.body.createEl("p",{text:tr("Conflict ","冲突 ")+(index+1)+" / "+indices.length+
+                tr(" · original line "," · 原文第 ")+part.line+tr(""," 行")});
+            if (part.context) {
+                this.body.createEl("strong",{text:tr("Original line","原文")});
+                this.body.createEl("pre",{cls:"homebound-merge-region",text:part.context});
+            }
+            for (const [label,text,cls] of [[tr("Local","本地"),part.local,"remove"],[tr("Remote","远端"),part.remote,"add"]]) {
+                this.body.createEl("strong",{text:label});
+                this.body.createEl("pre",{cls:"homebound-merge-region homebound-diff-"+cls,
+                    text:text || tr("(deleted)","（已删除）")});
+            }
+            const take=value=>{
+                result[position]=value;
+                this.picker?.setDisabled(true);
+                if (index+1<indices.length) show(index+1);
+                else return this.choose("merge",result.join(""));
+            };
+            const eol=part.local.match(/\r?\n$/)?.[0];
+            const separator=position+1<parts.length && eol && part.remote.endsWith(eol) ? eol : "";
+            const draft=separator ? part.local.slice(0,-separator.length) : part.local;
+            this.choices(()=>take(part.remote),()=>take(part.local),()=>this.edit(draft,value=>take(value+separator)));
+            if (index>0) new Setting(this.actions).addButton(b=>b.setButtonText(tr("Previous","上一处")).onClick(()=>show(index-1)));
         };
-        const show = index => {
-            pane.empty();
-            const part = changes[index];
-            const controls = new Setting(pane).setName(tr("Change ","差异 ")+(index+1)+" / "+changes.length);
-            controls.addButton(b => b.setButtonText(tr("Previous","上一处")).setDisabled(index===0).onClick(()=>show(index-1)));
-            controls.addButton(b => b.setButtonText(tr("Next","下一处")).setDisabled(index+1===changes.length).onClick(()=>show(index+1)));
-            if (part.local.length+part.selected.length > previewLimit) {
-                const encoder = new TextEncoder();
-                drawWindows(pane.createDiv(),encoder.encode(part.local),encoder.encode(part.selected));
-            } else drawText(pane,part.local,part.selected);
-            new Setting(pane).setName(tr("Include in merge","合并时采用")).addDropdown(d => d
-                .addOption("local",tr("Local","本机")).addOption("selected",tr("Selected version","所选版本"))
-                .addOption("both",tr("Both (local first)","两者都保留（本机在前）")).setValue(part.choice)
-                .onChange(value => { part.choice = value; }));
-            new Setting(pane).addButton(b => b.setCta().setButtonText(tr("Review and edit result","预览并编辑合并结果")).onClick(edit));
-        };
-        if (changes.length) show(0); else edit();
+        show(0);
+    }
+    edit(draft,save) {
+        this.picker?.setDisabled(true);
+        this.actions.empty();
+        const label=this.actions.createEl("label",{text:tr("Edit result","编辑结果")});
+        const input=label.createEl("textarea",{cls:"homebound-merge-text"});
+        input.value=draft;
+        const initial=input.value;
+        new Setting(this.actions).addButton(b=>b.setCta().setButtonText(tr("Apply edit","采用编辑结果")).onClick(()=>{
+            let text=input.value;
+            if (text===initial) text=draft;
+            else if (draft.includes("\r\n") && !/(^|[^\r])\n/.test(draft)) text=text.replace(/\n/g,"\r\n");
+            return save(text);
+        }));
+        input.focus();
     }
     async choose(source,text) {
         if (this.submitting) return;
-        this.submitting = true;
-        this.localButton.setDisabled(true);
-        this.remoteButton.setDisabled(true);
-        this.picker.setDisabled(true);
-        this.message.setText(tr("Resolving…","正在提交…"));
+        this.submitting=true;
+        this.picker?.setDisabled(true);
+        const inputs=this.actions.querySelectorAll("button, textarea");
+        for (const input of inputs) input.disabled=true;
+        this.message.setText(tr("Saving…","正在保存…"));
         try { await this.submit(source,text,this.selected.id); this.close(); }
-        catch (e) {
-            this.message.setText(e.message);
-            if (source !== "merge") {
-                this.localButton.setDisabled(false);
-                this.remoteButton.setDisabled(false);
-                this.picker.setDisabled(false);
-            }
-        }
-        finally { this.submitting = false; }
+        catch (error) {
+            this.message.setText(error.message);
+            for (const input of inputs) input.disabled=false;
+        } finally { this.submitting=false; }
     }
     onClose() { this.generation++; this.contentEl.empty(); this.closed?.(); }
 }

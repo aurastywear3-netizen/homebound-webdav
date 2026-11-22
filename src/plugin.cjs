@@ -8,6 +8,7 @@ const {ChunkTransfer, TransferCache, blockSize} = require("./transfer.cjs");
 const {seedSnapshot, checkJoin} = require("./personal.cjs");
 const {PendingUploads} = require("./pending.cjs");
 const {ConflictReview} = require("./review.cjs");
+const {notePlan,isNote} = require("./merge.cjs");
 const {HomeboundSettings} = require("./settings.cjs");
 const {VersionWatch} = require("./version.cjs");
 
@@ -79,6 +80,11 @@ module.exports = class HomeboundPlugin extends Plugin {
         this.conflicts = conflicts;
         this.status = {lastSuccess:Date.now(), conflicts};
         this.app.saveLocalStorage(stateKey + "-status-" + this.state.current.id, this.status);
+        const modal = this.reviewModal;
+        if (modal && modal.review.vaultId === this.state.current.id &&
+            !modal.submitting && !conflicts.includes(modal.review.path)) {
+            modal.close();
+        }
         this.settingsTab.refreshStatus();
     }
     fileChanged(event, file, oldPath) {
@@ -327,7 +333,8 @@ module.exports = class HomeboundPlugin extends Plugin {
                 const c = this.state.current;
                 if (!c || this.state.pending) throw Error(tr("Finish vault setup first.","请先完成建库。"));
                 const {store} = await this.connect(c, this.secret(c,"dav"), this.secret(c,"key"));
-                const heads = core.headsByPath(await store.history(this.cache)).get(path) || [];
+                const history = await store.history(this.cache);
+                const heads = core.headsByPath(history).get(path) || [];
                 if (new Set(heads.map(r => r.hash)).size < 2) throw Error(tr("This conflict changed. Sync again.","冲突已变化，请重新同步。"));
                 const local = this.local(), bytes = await local.read(path);
                 const readVersion = async rev => {
@@ -335,8 +342,10 @@ module.exports = class HomeboundPlugin extends Plugin {
                     if (copy !== null && await core.sha(copy) === rev.hash) return copy;
                     return this.exclusive(() => store.readBody(rev));
                 };
-                return {path, vaultId:c.id, heads, headIds:heads.map(r => r.id).sort(), bytes,
-                    localHash:bytes === null ? null : await core.sha(bytes), readVersion};
+                const localHash=bytes===null ? null : await core.sha(bytes);
+                const planFor=(peer,left,right)=>isNote(path)
+                    ? notePlan(history,heads,localHash,peer.hash,left,right,readVersion) : null;
+                return {path, vaultId:c.id, heads, headIds:heads.map(r => r.id).sort(), bytes,localHash,readVersion,planFor};
             });
             if (this.closed || this.state.current?.id !== review.vaultId) return;
             const modal = new ConflictReview(this.app, review, async (source,text,peerId) => {

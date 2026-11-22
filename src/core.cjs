@@ -1,5 +1,7 @@
 "use strict";
 
+const {isNote,asText,notePlan} = require("./merge.cjs");
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 const conflictFolder = "Homebound conflicts";
@@ -209,8 +211,8 @@ async function synchronize({ store, local, baseline, cache, checkpoint, resolve,
     for (const path of paths) {
         if (!active()) throw Error("Sync stopped.");
         let heads = groups.get(path) ?? [];
-        const base = baseline.get(path);
-        const bytes = await local.read(path);
+        let base = baseline.get(path);
+        let bytes = await local.read(path);
         let hash = bytes === null ? null : await sha(bytes);
         const matching = heads.some(rev => rev.hash === hash);
         const changed = base ? hash !== base.hash : bytes !== null;
@@ -223,7 +225,7 @@ async function synchronize({ store, local, baseline, cache, checkpoint, resolve,
                 throw Error("正文或冲突版本已变化，请重新同步并比较。");
             }
         }
-        if (changed && !matching && !alreadySplit) {
+        if (changed && !matching && (!alreadySplit || (!reviewing && resolve !== path))) {
             const parents = base?.ids ?? [];
             const rev = await store.publish(path, parents, bytes);
             history.set(rev.id, rev);
@@ -231,51 +233,65 @@ async function synchronize({ store, local, baseline, cache, checkpoint, resolve,
             sent++;
         }
 
-        if (new Set(heads.map(rev => rev.hash)).size > 1) {
-            for (const rev of heads) {
-                if (rev.hash !== null) await local.archive(rev, () => store.readBody(rev));
-            }
+        let appliedSelection = false;
+        while (new Set(heads.map(rev => rev.hash)).size > 1) {
             // Remember which published branch the local file represents. Otherwise a peer
             // can re-upload its losing version as a new edit after someone resolves it.
             const matchingIds = heads.filter(rev => rev.hash === hash).map(rev => rev.id).sort();
             if (matchingIds.length && (bytes !== null || base) &&
                 JSON.stringify(base?.ids) !== JSON.stringify(matchingIds)) {
-                baseline.set(path, { ids: matchingIds, hash });
+                base = {ids:matchingIds,hash};
+                baseline.set(path,base);
                 checkpoint(baseline);
             }
-            if (!reviewing && (resolve !== path || bytes === null)) {
-                // Give a device with an empty vault a file it can open to resolve the dispute.
-                if (!base && bytes === null) {
-                    const candidate = heads.filter(r => r.hash !== null).sort((a,b) => a.id.localeCompare(b.id))[0];
-                    if (candidate) {
-                        await local.apply(path, null, await store.readBody(candidate));
-                        baseline.set(path, { ids: [candidate.id], hash: candidate.hash });
+            const manual = reviewing && !appliedSelection;
+            let chosen = bytes, parents = heads;
+            if (!manual && (resolve !== path || bytes === null)) {
+                // A new or lagging client may not hold either head. Compare two
+                // actual branches, then apply against the bytes this client read.
+                const ordered = heads.slice().sort((a,b) => a.id.localeCompare(b.id));
+                const left = ordered.find(r=>r.hash===hash) || ordered[0];
+                const right = ordered.find(r=>r.hash!==left.hash);
+                let plan = null;
+                if (isNote(path) && left.hash!==null && right.hash!==null) {
+                    const leftText = asText(left.hash===hash ? bytes : await store.readBody(left));
+                    const rightText = asText(await store.readBody(right));
+                    plan = await notePlan(history,heads,left.hash,right.hash,leftText,rightText,r=>store.readBody(r));
+                }
+                if (!plan || plan.some(part=>typeof part!=="string")) {
+                    for (const rev of heads) {
+                        if (rev.hash!==null) await local.archive(rev,()=>store.readBody(rev));
+                    }
+                    if ((!base && bytes===null) || (!matchingIds.length && (!base || base.hash===hash))) {
+                        const candidate=ordered.find(r=>r.hash!==null);
+                        await local.apply(path,hash,await store.readBody(candidate));
+                        baseline.set(path,{ids:heads.filter(r=>r.hash===candidate.hash).map(r=>r.id).sort(),hash:candidate.hash});
                         checkpoint(baseline);
                     }
+                    conflicts.push(path);
+                    break;
                 }
-                conflicts.push(path);
-                continue;
-            }
-            let chosen = bytes, parents = heads;
-            if (reviewing && selection.source === "merge") {
-                if (typeof selection.text !== "string") throw Error("缺少合并正文。");
-                const peer = heads.find(rev => rev.id === selection.peerId);
-                if (!peer) throw Error("所选副本已变化，请重新比较。");
-                // A two-way editor only resolves the versions actually compared.
-                parents = heads.filter(rev => rev.hash === hash || rev.hash === peer.hash);
-                chosen = encoder.encode(selection.text).buffer;
-            } else if (reviewing && selection.source !== "local") {
-                const source = heads.find(rev => rev.id === selection.source);
-                if (!source) throw Error("所选副本已变化，请重新比较。");
-                if (source.hash !== hash) {
-                    chosen = source.hash === null ? null : await store.readBody(source);
+                parents = heads.filter(r=>r.hash===left.hash || r.hash===right.hash);
+                chosen = encoder.encode(plan.join("")).buffer;
+            } else if (manual) {
+                // A choice only resolves the two branches displayed in this review.
+                if (selection.peerId || selection.source === "merge") {
+                    const peer = heads.find(rev => rev.id === selection.peerId);
+                    if (!peer) throw Error("所选副本已变化，请重新比较。");
+                    parents = heads.filter(rev => rev.hash === hash || rev.hash === peer.hash);
+                }
+                if (selection.source === "merge") {
+                    if (typeof selection.text !== "string") throw Error("缺少合并正文。");
+                    chosen = encoder.encode(selection.text).buffer;
+                } else if (selection.source !== "local") {
+                    const source = heads.find(rev => rev.id === selection.source);
+                    if (!source || (selection.peerId && source.id !== selection.peerId)) throw Error("所选副本已变化，请重新比较。");
+                    if (source.hash !== hash) chosen = source.hash === null ? null : await store.readBody(source);
                 }
             }
-            if (reviewing) {
-                const current = await local.read(path);
-                if ((current === null ? null : await sha(current)) !== selection.localHash)
-                    throw Error("比较期间正文已变化，请重新比较。");
-            }
+            const current = await local.read(path);
+            if ((current === null ? null : await sha(current)) !== hash)
+                throw Error("比较期间正文已变化，请重新比较。");
             if (!active()) throw Error("Sync stopped.");
             const parentIds = parents.map(r => r.id);
             const rev = await store.publish(path, parentIds, chosen);
@@ -285,17 +301,14 @@ async function synchronize({ store, local, baseline, cache, checkpoint, resolve,
                 if (!active()) throw Error("Sync stopped.");
                 await local.apply(path,hash,chosen);
                 hash = rev.hash;
+                bytes = chosen;
             }
             history.set(rev.id, rev);
             heads = [rev, ...heads.filter(head => !parentIds.includes(head.id))];
             sent++;
-            if (heads.some(head => head.hash !== hash)) {
-                baseline.set(path, {ids:heads.filter(head => head.hash === hash).map(head => head.id).sort(), hash});
-                checkpoint(baseline);
-                conflicts.push(path);
-                continue;
-            }
+            appliedSelection = appliedSelection || manual;
         }
+        if (new Set(heads.map(rev=>rev.hash)).size>1) continue;
         if (!heads.length) continue;
         const target = heads[0];
         if (target.hash !== hash) {

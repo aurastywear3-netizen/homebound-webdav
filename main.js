@@ -235,10 +235,288 @@ var __commonJS = (cb, mod) => function __require() {
   }
 };
 
+// src/diff.cjs
+var require_diff = __commonJS({
+  "src/diff.cjs"(exports2, module2) {
+    "use strict";
+    var lines = (text) => text.match(/[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+$/g) || [];
+    function lineDiff(before, after) {
+      return sequenceDiff(lines(before), lines(after));
+    }
+    function sequenceDiff(a, b, depth = 0) {
+      const rows = [];
+      const row = (kind, text) => rows.push({ kind, text });
+      let start = 0, endA = a.length, endB = b.length;
+      while (start < endA && start < endB && a[start] === b[start]) row("same", a[start++]);
+      while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) {
+        endA--;
+        endB--;
+      }
+      const width = endB - start + 1, height = endA - start + 1;
+      let i = start, j = start;
+      if (width * height <= 3e5) {
+        const lcs = new Uint16Array(width * height);
+        for (let x = endA - 1; x >= start; x--) {
+          for (let y = endB - 1; y >= start; y--) {
+            const n = (x - start) * width + y - start;
+            lcs[n] = a[x] === b[y] ? 1 + lcs[n + width + 1] : Math.max(lcs[n + 1], lcs[n + width]);
+          }
+        }
+        while (i < endA && j < endB) {
+          const n = (i - start) * width + j - start;
+          if (a[i] === b[j]) {
+            row("same", a[i++]);
+            j++;
+          } else if (lcs[n + width] >= lcs[n + 1]) row("remove", a[i++]);
+          else row("add", b[j++]);
+        }
+      } else {
+        const sparse = sparseDiff(a, start, endA, b, endB);
+        if (sparse) {
+          for (const change of sparse) rows.push(change);
+          i = endA;
+          j = endB;
+        } else if (depth < 12) {
+          const anchor = sharedAnchor(a, b, start, endA, endB);
+          if (anchor) {
+            const [x, y] = anchor;
+            for (const change of sequenceDiff(a.slice(start, x), b.slice(start, y), depth + 1)) rows.push(change);
+            row("same", a[x]);
+            for (const change of sequenceDiff(a.slice(x + 1, endA), b.slice(y + 1, endB), depth + 1)) rows.push(change);
+            i = endA;
+            j = endB;
+          }
+        }
+      }
+      while (i < endA) row("remove", a[i++]);
+      while (j < endB) row("add", b[j++]);
+      for (i = endA; i < a.length; i++) row("same", a[i]);
+      return rows;
+    }
+    function sharedAnchor(a, b, start, endA, endB) {
+      function uniquePositions(tokens, end) {
+        const positions = /* @__PURE__ */ new Map();
+        for (let i = start; i < end; i++) positions.set(tokens[i], positions.has(tokens[i]) ? -1 : i);
+        return positions;
+      }
+      const left = uniquePositions(a, endA), right = uniquePositions(b, endB);
+      let best = null, distance = Infinity;
+      for (const [token, x] of left) {
+        const y = right.get(token);
+        if (x < 0 || y === void 0 || y < 0) continue;
+        const score = Math.max(Math.abs((x - start) / (endA - start) - 0.5), Math.abs((y - start) / (endB - start) - 0.5));
+        if (score < distance) {
+          best = [x, y];
+          distance = score;
+        }
+      }
+      return best;
+    }
+    function sparseDiff(a, start, endA, b, endB) {
+      const n = endA - start, m = endB - start, limit = 128;
+      if (Math.abs(n - m) > limit) return null;
+      const offset = limit + 1, v = new Int32Array(2 * limit + 3), trace = [];
+      for (let d = 0; d <= limit; d++) {
+        trace.push(v.slice());
+        for (let k = -d; k <= d; k += 2) {
+          const at = offset + k;
+          let x = k === -d || k !== d && v[at - 1] < v[at + 1] ? v[at + 1] : v[at - 1] + 1;
+          let y = x - k;
+          while (x < n && y < m && a[start + x] === b[start + y]) {
+            x++;
+            y++;
+          }
+          v[at] = x;
+          if (x !== n || y !== m) continue;
+          const reversed = [];
+          for (let depth = d; depth > 0; depth--) {
+            const diag = x - y, prev = trace[depth];
+            const down = diag === -depth || diag !== depth && prev[offset + diag - 1] < prev[offset + diag + 1];
+            const prevDiag = diag + (down ? 1 : -1), prevX = prev[offset + prevDiag], prevY = prevX - prevDiag;
+            while (x > prevX && y > prevY) {
+              x--;
+              y--;
+              reversed.push({ kind: "same", text: a[start + x] });
+            }
+            if (down) reversed.push({ kind: "add", text: b[start + --y] });
+            else reversed.push({ kind: "remove", text: a[start + --x] });
+          }
+          while (x > 0) reversed.push({ kind: "same", text: a[start + --x] });
+          return reversed.reverse();
+        }
+      }
+      return null;
+    }
+    function contextRows(rows) {
+      const result = [];
+      for (let i = 0; i < rows.length; ) {
+        if (rows[i].kind !== "same") {
+          result.push(rows[i++]);
+          continue;
+        }
+        let end = i + 1;
+        while (end < rows.length && rows[end].kind === "same") end++;
+        if (end - i > 7) {
+          result.push(...rows.slice(i, i + 3), { kind: "gap", count: end - i - 6 }, ...rows.slice(end - 3, end));
+        } else result.push(...rows.slice(i, end));
+        i = end;
+      }
+      return result;
+    }
+    function textWindow(buffer, offset) {
+      const bytes = new Uint8Array(buffer);
+      const limit = Math.min(offset + 65536, bytes.length);
+      let end = offset, lines2 = 0, lastBreak = offset;
+      while (end < limit && lines2 < 160) {
+        if (bytes[end++] === 10) {
+          lines2++;
+          lastBreak = end;
+        }
+      }
+      if (end < bytes.length && lastBreak > offset) end = lastBreak;
+      else while (end > offset && end < bytes.length && (bytes[end] & 192) === 128) end--;
+      if (end === offset && limit > offset) end = limit;
+      return { slice: bytes.subarray(offset, end), end };
+    }
+    module2.exports = { lines, sequenceDiff, lineDiff, contextRows, textWindow };
+  }
+});
+
+// src/merge.cjs
+var require_merge = __commonJS({
+  "src/merge.cjs"(exports2, module2) {
+    "use strict";
+    var { lines, sequenceDiff } = require_diff();
+    var isNote2 = (path) => /\.(md|txt)$/i.test(path);
+    var words = (text) => text.match(/[\p{L}\p{M}\p{N}_]+(?:[.'’][\p{L}\p{M}\p{N}_]+)*|\r\n|[\s\S]/gu) || [];
+    function asText(bytes) {
+      if (bytes === null) return null;
+      try {
+        const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+        return /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text) ? null : text;
+      } catch {
+        return null;
+      }
+    }
+    function commonBase(history, heads) {
+      let common;
+      for (const head of heads) {
+        const reachable = /* @__PURE__ */ new Set(), pending = [head.id];
+        while (pending.length) {
+          const id = pending.pop();
+          if (reachable.has(id)) continue;
+          reachable.add(id);
+          for (const parent of history.get(id).parents) pending.push(parent);
+        }
+        if (!common) common = reachable;
+        else for (const id of common) if (!reachable.has(id)) common.delete(id);
+        if (!common.size) return null;
+      }
+      const latest = new Set(common);
+      for (const id of common) for (const parent of history.get(id).parents) latest.delete(parent);
+      const candidates = Array.from(latest, (id) => history.get(id));
+      return candidates.length && candidates.every((r) => r.hash === candidates[0].hash) ? candidates[0] : null;
+    }
+    function changes(base, variant, side, byLine) {
+      const edits = [];
+      let at = 0, edit = null;
+      function finish() {
+        if (!edit) return;
+        const count = edit.end - edit.start;
+        if (byLine && count > 1 && count === edit.add.length) {
+          for (let i = 0; i < count; i++) edits.push({ side, start: edit.start + i, end: edit.start + i + 1, add: [edit.add[i]] });
+        } else edits.push(edit);
+        edit = null;
+      }
+      for (const row of sequenceDiff(base, variant)) {
+        if (row.kind === "same") {
+          finish();
+          at++;
+          continue;
+        }
+        if (!edit) edit = { side, start: at, end: at, add: [] };
+        if (row.kind === "remove") edit.end = ++at;
+        else edit.add.push(row.text);
+      }
+      finish();
+      return edits;
+    }
+    function renderSide(base, start, end, edits) {
+      let at = start, text = "";
+      for (const edit of edits) {
+        text += base.slice(at, edit.start).join("") + edit.add.join("");
+        at = edit.end;
+      }
+      return text + base.slice(at, end).join("");
+    }
+    function mergeUnits(base, left, right, byLine) {
+      const ranges = [...changes(base, left, "local", byLine), ...changes(base, right, "remote", byLine)];
+      const insertedAt = new Set(ranges.filter((e) => e.start === e.end).map((e) => e.start));
+      const edits = [];
+      for (const edit of ranges) {
+        if (!byLine || edit.add.length || edit.end - edit.start < 2) {
+          edits.push(edit);
+          continue;
+        }
+        let start = edit.start;
+        for (let end = start + 1; end <= edit.end; end++) {
+          if (end < edit.end && insertedAt.has(end)) continue;
+          edits.push({ ...edit, start, end });
+          start = end;
+        }
+      }
+      edits.sort((a, b) => a.start - b.start || a.end - b.end);
+      const parts = [];
+      let cursor = 0, i = 0;
+      while (i < edits.length) {
+        const first = edits[i++], start = first.start, group = [first];
+        let end = first.end;
+        while (i < edits.length && (edits[i].start < end || start === end && edits[i].start === start && edits[i].end === start)) {
+          const edit = edits[i++];
+          group.push(edit);
+          end = Math.max(end, edit.end);
+        }
+        if (cursor < start) parts.push(base.slice(cursor, start).join(""));
+        const local = group.filter((e) => e.side === "local"), remote = group.filter((e) => e.side === "remote");
+        const a = renderSide(base, start, end, local), b = renderSide(base, start, end, remote);
+        const original = base.slice(start, end).join("");
+        if (!remote.length || a === b || b === original) parts.push(a);
+        else if (!local.length || a === original) parts.push(b);
+        else if (group.every((edit) => !edit.add.length)) parts.push("");
+        else {
+          if (byLine && end === start + 1 && lines(a).length === 1 && lines(b).length === 1) {
+            const refined = mergeUnits(words(base[start]), words(a), words(b), false);
+            for (const part of refined) {
+              parts.push(typeof part === "string" ? part : { ...part, line: start + 1, context: base[start] });
+            }
+          } else parts.push({ local: a, remote: b, line: start + 1 });
+        }
+        cursor = end;
+      }
+      if (cursor < base.length) parts.push(base.slice(cursor).join(""));
+      return parts;
+    }
+    function threeWay(base, local, remote) {
+      if (local === remote || remote === base) return [local];
+      if (local === base) return [remote];
+      return mergeUnits(lines(base), lines(local), lines(remote), true);
+    }
+    async function notePlan2(history, heads, leftHash, rightHash, local, remote, readBody) {
+      if (local === null || remote === null || !heads.some((r) => r.hash === leftHash)) return null;
+      const base = commonBase(history, heads.filter((r) => r.hash === leftHash || r.hash === rightHash));
+      if (!base || base.hash === null) return null;
+      const original = base.hash === leftHash ? local : base.hash === rightHash ? remote : asText(await readBody(base));
+      return original === null ? null : threeWay(original, local, remote);
+    }
+    module2.exports = { isNote: isNote2, asText, commonBase, threeWay, notePlan: notePlan2 };
+  }
+});
+
 // src/core.cjs
 var require_core = __commonJS({
   "src/core.cjs"(exports2, module2) {
     "use strict";
+    var { isNote: isNote2, asText, notePlan: notePlan2 } = require_merge();
     var encoder = new TextEncoder();
     var decoder = new TextDecoder("utf-8", { fatal: true });
     var conflictFolder = "Homebound conflicts";
@@ -435,8 +713,8 @@ var require_core = __commonJS({
       for (const path of paths) {
         if (!active()) throw Error("Sync stopped.");
         let heads = groups.get(path) ?? [];
-        const base = baseline.get(path);
-        const bytes = await local.read(path);
+        let base = baseline.get(path);
+        let bytes = await local.read(path);
         let hash = bytes === null ? null : await sha(bytes);
         const matching = heads.some((rev) => rev.hash === hash);
         const changed = base ? hash !== base.hash : bytes !== null;
@@ -448,53 +726,66 @@ var require_core = __commonJS({
             throw Error("\u6B63\u6587\u6216\u51B2\u7A81\u7248\u672C\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u540C\u6B65\u5E76\u6BD4\u8F83\u3002");
           }
         }
-        if (changed && !matching && !alreadySplit) {
+        if (changed && !matching && (!alreadySplit || !reviewing && resolve !== path)) {
           const parents = base?.ids ?? [];
           const rev = await store.publish(path, parents, bytes);
           history.set(rev.id, rev);
           heads = [...heads.filter((r) => !parents.includes(r.id)), rev];
           sent++;
         }
-        if (new Set(heads.map((rev) => rev.hash)).size > 1) {
-          for (const rev2 of heads) {
-            if (rev2.hash !== null) await local.archive(rev2, () => store.readBody(rev2));
-          }
+        let appliedSelection = false;
+        while (new Set(heads.map((rev) => rev.hash)).size > 1) {
           const matchingIds = heads.filter((rev2) => rev2.hash === hash).map((rev2) => rev2.id).sort();
           if (matchingIds.length && (bytes !== null || base) && JSON.stringify(base?.ids) !== JSON.stringify(matchingIds)) {
-            baseline.set(path, { ids: matchingIds, hash });
+            base = { ids: matchingIds, hash };
+            baseline.set(path, base);
             checkpoint(baseline);
           }
-          if (!reviewing && (resolve !== path || bytes === null)) {
-            if (!base && bytes === null) {
-              const candidate = heads.filter((r) => r.hash !== null).sort((a, b) => a.id.localeCompare(b.id))[0];
-              if (candidate) {
-                await local.apply(path, null, await store.readBody(candidate));
-                baseline.set(path, { ids: [candidate.id], hash: candidate.hash });
+          const manual = reviewing && !appliedSelection;
+          let chosen = bytes, parents = heads;
+          if (!manual && (resolve !== path || bytes === null)) {
+            const ordered = heads.slice().sort((a, b) => a.id.localeCompare(b.id));
+            const left = ordered.find((r) => r.hash === hash) || ordered[0];
+            const right = ordered.find((r) => r.hash !== left.hash);
+            let plan = null;
+            if (isNote2(path) && left.hash !== null && right.hash !== null) {
+              const leftText = asText(left.hash === hash ? bytes : await store.readBody(left));
+              const rightText = asText(await store.readBody(right));
+              plan = await notePlan2(history, heads, left.hash, right.hash, leftText, rightText, (r) => store.readBody(r));
+            }
+            if (!plan || plan.some((part) => typeof part !== "string")) {
+              for (const rev2 of heads) {
+                if (rev2.hash !== null) await local.archive(rev2, () => store.readBody(rev2));
+              }
+              if (!base && bytes === null || !matchingIds.length && (!base || base.hash === hash)) {
+                const candidate = ordered.find((r) => r.hash !== null);
+                await local.apply(path, hash, await store.readBody(candidate));
+                baseline.set(path, { ids: heads.filter((r) => r.hash === candidate.hash).map((r) => r.id).sort(), hash: candidate.hash });
                 checkpoint(baseline);
               }
+              conflicts.push(path);
+              break;
             }
-            conflicts.push(path);
-            continue;
-          }
-          let chosen = bytes, parents = heads;
-          if (reviewing && selection.source === "merge") {
-            if (typeof selection.text !== "string") throw Error("\u7F3A\u5C11\u5408\u5E76\u6B63\u6587\u3002");
-            const peer = heads.find((rev2) => rev2.id === selection.peerId);
-            if (!peer) throw Error("\u6240\u9009\u526F\u672C\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u6BD4\u8F83\u3002");
-            parents = heads.filter((rev2) => rev2.hash === hash || rev2.hash === peer.hash);
-            chosen = encoder.encode(selection.text).buffer;
-          } else if (reviewing && selection.source !== "local") {
-            const source = heads.find((rev2) => rev2.id === selection.source);
-            if (!source) throw Error("\u6240\u9009\u526F\u672C\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u6BD4\u8F83\u3002");
-            if (source.hash !== hash) {
-              chosen = source.hash === null ? null : await store.readBody(source);
+            parents = heads.filter((r) => r.hash === left.hash || r.hash === right.hash);
+            chosen = encoder.encode(plan.join("")).buffer;
+          } else if (manual) {
+            if (selection.peerId || selection.source === "merge") {
+              const peer = heads.find((rev2) => rev2.id === selection.peerId);
+              if (!peer) throw Error("\u6240\u9009\u526F\u672C\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u6BD4\u8F83\u3002");
+              parents = heads.filter((rev2) => rev2.hash === hash || rev2.hash === peer.hash);
+            }
+            if (selection.source === "merge") {
+              if (typeof selection.text !== "string") throw Error("\u7F3A\u5C11\u5408\u5E76\u6B63\u6587\u3002");
+              chosen = encoder.encode(selection.text).buffer;
+            } else if (selection.source !== "local") {
+              const source = heads.find((rev2) => rev2.id === selection.source);
+              if (!source || selection.peerId && source.id !== selection.peerId) throw Error("\u6240\u9009\u526F\u672C\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u6BD4\u8F83\u3002");
+              if (source.hash !== hash) chosen = source.hash === null ? null : await store.readBody(source);
             }
           }
-          if (reviewing) {
-            const current = await local.read(path);
-            if ((current === null ? null : await sha(current)) !== selection.localHash)
-              throw Error("\u6BD4\u8F83\u671F\u95F4\u6B63\u6587\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u6BD4\u8F83\u3002");
-          }
+          const current = await local.read(path);
+          if ((current === null ? null : await sha(current)) !== hash)
+            throw Error("\u6BD4\u8F83\u671F\u95F4\u6B63\u6587\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u6BD4\u8F83\u3002");
           if (!active()) throw Error("Sync stopped.");
           const parentIds = parents.map((r) => r.id);
           const rev = await store.publish(path, parentIds, chosen);
@@ -502,17 +793,14 @@ var require_core = __commonJS({
             if (!active()) throw Error("Sync stopped.");
             await local.apply(path, hash, chosen);
             hash = rev.hash;
+            bytes = chosen;
           }
           history.set(rev.id, rev);
           heads = [rev, ...heads.filter((head) => !parentIds.includes(head.id))];
           sent++;
-          if (heads.some((head) => head.hash !== hash)) {
-            baseline.set(path, { ids: heads.filter((head) => head.hash === hash).map((head) => head.id).sort(), hash });
-            checkpoint(baseline);
-            conflicts.push(path);
-            continue;
-          }
+          appliedSelection = appliedSelection || manual;
         }
+        if (new Set(heads.map((rev) => rev.hash)).size > 1) continue;
         if (!heads.length) continue;
         const target = heads[0];
         if (target.hash !== hash) {
@@ -12898,118 +13186,15 @@ var require_pending = __commonJS({
   }
 });
 
-// src/diff.cjs
-var require_diff = __commonJS({
-  "src/diff.cjs"(exports2, module2) {
-    "use strict";
-    function lineDiff(before, after) {
-      const lines = (text) => text.match(/[^\n]*\n|[^\n]+$/g) || [];
-      const a = lines(before), b = lines(after), rows = [];
-      const row = (kind, text) => rows.push({ kind, text });
-      let start = 0, endA = a.length, endB = b.length;
-      while (start < endA && start < endB && a[start] === b[start]) row("same", a[start++]);
-      while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) {
-        endA--;
-        endB--;
-      }
-      const width = endB - start + 1, height = endA - start + 1;
-      let i = start, j = start;
-      if (width * height <= 3e5) {
-        const lcs = new Uint16Array(width * height);
-        for (let x = endA - 1; x >= start; x--) {
-          for (let y = endB - 1; y >= start; y--) {
-            const n = (x - start) * width + y - start;
-            lcs[n] = a[x] === b[y] ? 1 + lcs[n + width + 1] : Math.max(lcs[n + 1], lcs[n + width]);
-          }
-        }
-        while (i < endA && j < endB) {
-          const n = (i - start) * width + j - start;
-          if (a[i] === b[j]) {
-            row("same", a[i++]);
-            j++;
-          } else if (lcs[n + width] >= lcs[n + 1]) row("remove", a[i++]);
-          else row("add", b[j++]);
-        }
-      }
-      while (i < endA) row("remove", a[i++]);
-      while (j < endB) row("add", b[j++]);
-      for (i = endA; i < a.length; i++) row("same", a[i]);
-      return rows;
-    }
-    function contextRows(rows) {
-      const result = [];
-      for (let i = 0; i < rows.length; ) {
-        if (rows[i].kind !== "same") {
-          result.push(rows[i++]);
-          continue;
-        }
-        let end = i + 1;
-        while (end < rows.length && rows[end].kind === "same") end++;
-        if (end - i > 7) {
-          result.push(...rows.slice(i, i + 3), { kind: "gap", count: end - i - 6 }, ...rows.slice(end - 3, end));
-        } else result.push(...rows.slice(i, end));
-        i = end;
-      }
-      return result;
-    }
-    function mergeParts(left, right) {
-      const parts = [];
-      for (const { kind, text } of lineDiff(left, right)) {
-        let part = parts[parts.length - 1];
-        const changed = kind !== "same";
-        if (!part || part.changed !== changed) {
-          part = { changed, local: "", selected: "", choice: "local" };
-          parts.push(part);
-        }
-        if (kind !== "add") part.local += text;
-        if (kind === "add") part.selected += text;
-      }
-      return parts;
-    }
-    function mergedText(parts) {
-      return parts.map((part) => {
-        if (!part.changed || part.choice === "local") return part.local;
-        if (part.choice === "selected") return part.selected;
-        const join = part.local && part.selected && !part.local.endsWith("\n") ? part.local.includes("\r\n") || part.selected.includes("\r\n") ? "\r\n" : "\n" : "";
-        return part.local + join + part.selected;
-      }).join("");
-    }
-    function textWindow(buffer, offset) {
-      const bytes = new Uint8Array(buffer);
-      const limit = Math.min(offset + 65536, bytes.length);
-      let end = offset, lines = 0, lastBreak = offset;
-      while (end < limit && lines < 160) {
-        if (bytes[end++] === 10) {
-          lines++;
-          lastBreak = end;
-        }
-      }
-      if (end < bytes.length && lastBreak > offset) end = lastBreak;
-      else while (end > offset && end < bytes.length && (bytes[end] & 192) === 128) end--;
-      if (end === offset && limit > offset) end = limit;
-      return { slice: bytes.subarray(offset, end), end };
-    }
-    module2.exports = { lineDiff, contextRows, textWindow, mergeParts, mergedText };
-  }
-});
-
 // src/review.cjs
 var require_review = __commonJS({
   "src/review.cjs"(exports2, module2) {
     "use strict";
     var { Modal, Setting, getLanguage: getLanguage2 } = require("obsidian");
-    var { lineDiff, contextRows, textWindow, mergeParts, mergedText } = require_diff();
+    var { lineDiff, contextRows, textWindow } = require_diff();
+    var { asText } = require_merge();
     var tr2 = (en, zh) => getLanguage2().startsWith("zh") ? zh : en;
     var previewLimit = 256 * 1024;
-    function asText(bytes) {
-      if (bytes === null) return "";
-      try {
-        const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
-        return /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text) ? null : text;
-      } catch {
-        return null;
-      }
-    }
     function describe(hash, size) {
       if (hash === null) return tr2("Deleted", "\u5DF2\u5220\u9664");
       return size + tr2(" bytes \xB7 SHA-256 ", " \u5B57\u8282 \xB7 SHA-256 ") + hash;
@@ -13060,163 +13245,124 @@ var require_review = __commonJS({
         this.generation = 0;
       }
       onOpen() {
-        const { path, heads, localHash, bytes } = this.review;
-        this.setTitle(tr2("Compare conflict", "\u6BD4\u8F83\u51B2\u7A81\u7248\u672C"));
-        const el = this.contentEl;
+        const { path, heads, localHash } = this.review, el = this.contentEl;
+        this.setTitle(tr2("Resolve conflict", "\u5904\u7406\u51B2\u7A81"));
         el.addClass("homebound-review");
         el.createEl("p", { text: path, cls: "homebound-review-path" });
-        const first = heads.find((r) => r.hash !== localHash) || heads[0];
-        new Setting(el).setName(tr2("Compare local file with", "\u4E0E\u672C\u673A\u6587\u4EF6\u6BD4\u8F83")).addDropdown((d) => {
-          this.picker = d;
-          for (const rev of heads) {
-            const label = rev.hash === null ? tr2("Deletion", "\u5220\u9664\u7248\u672C") : tr2("Version", "\u7248\u672C");
-            d.addOption(rev.id, label + " \xB7 " + rev.id.slice(0, 12));
-          }
-          d.setValue(first.id).onChange((id) => this.preview(heads.find((r) => r.id === id)));
-        });
+        const peers = [...new Map(heads.filter((r) => r.hash !== localHash).map((r) => [r.hash, r])).values()];
+        if (peers.length > 1) {
+          new Setting(el).setName(tr2("Remote version", "\u8FDC\u7AEF\u7248\u672C")).addDropdown((d) => {
+            this.picker = d;
+            for (const peer of peers) d.addOption(peer.id, peer.id.slice(0, 12));
+            d.setValue(peers[0].id).onChange((id) => this.preview(peers.find((r) => r.id === id)));
+          });
+        }
         this.body = el.createDiv();
+        this.actions = el.createDiv();
         this.message = el.createDiv({ attr: { role: "status" } });
-        this.actions = new Setting(el).addButton((b) => b.setButtonText(tr2("Close", "\u5173\u95ED")).onClick(() => this.close())).addButton((b) => {
-          this.localButton = b.setButtonText(bytes === null ? tr2("Keep local deletion", "\u4FDD\u7559\u672C\u673A\u5220\u9664") : tr2("Keep local file", "\u4FDD\u7559\u672C\u673A\u6587\u4EF6")).onClick(() => this.choose("local"));
-        }).addButton((b) => {
-          this.remoteButton = b.setCta().onClick(() => this.choose(this.selected.id));
-        });
-        this.preview(first);
+        this.preview(peers[0]);
       }
-      async preview(rev) {
+      async preview(peer) {
         const generation = ++this.generation;
-        const { bytes, localHash, readVersion } = this.review;
-        this.selected = rev;
+        this.selected = peer;
+        this.actions.empty();
         this.body.empty();
-        this.localButton.setDisabled(true);
-        this.remoteButton.setDisabled(true).setButtonText(rev.hash === null ? tr2("Use selected deletion", "\u91C7\u7528\u6240\u9009\u5220\u9664\u7248\u672C") : tr2("Use selected file", "\u91C7\u7528\u6240\u9009\u6587\u4EF6"));
         this.message.setText(tr2("Loading comparison\u2026", "\u6B63\u5728\u8BFB\u53D6\u5DEE\u5F02\u2026"));
+        const { bytes, path, localHash, readVersion, planFor } = this.review;
         try {
-          let remote = null, size = rev.parts?.size;
-          if (rev.hash !== null && size === void 0) {
-            remote = rev.hash === localHash ? bytes : await readVersion(rev);
-            size = remote.byteLength;
-          }
+          const binaryAttachment = peer.parts && !/\.(md|txt|canvas|json|csv|tsv|yaml|yml|xml|html|css|js|ts|tex|log)$/i.test(path);
+          const data = peer.hash === null || binaryAttachment ? null : await readVersion(peer);
+          const left = asText(bytes), right = asText(data);
+          const parts = await planFor(peer, left, right);
           if (generation !== this.generation) return;
-          for (const [label, hash, n] of [[tr2("Local", "\u672C\u673A"), localHash, bytes?.byteLength], [tr2("Selected", "\u6240\u9009\u7248\u672C"), rev.hash, size]]) {
-            const p = this.body.createEl("p", { cls: "homebound-version" });
-            p.createEl("strong", { text: label + " \xB7 " });
-            p.createSpan({ text: describe(hash, n) });
-          }
-          if (rev.hash === localHash) {
-            this.body.createEl("p", { text: tr2("Identical content.", "\u5185\u5BB9\u76F8\u540C\u3002") });
-          } else {
-            const large = (bytes?.byteLength || 0) > previewLimit || size > previewLimit;
-            const left = large ? null : asText(bytes), right = large ? null : asText(remote);
-            if (large && /\.(md|txt|canvas|json|csv|tsv|yaml|yml|xml|html|css|js|ts|tex|log)$/i.test(rev.path)) {
-              const section = this.body.createDiv();
-              new Setting(section).addButton((b) => b.setButtonText(tr2("Compare text in sections", "\u5206\u6BB5\u6BD4\u8F83\u6587\u672C")).onClick(async () => {
-                b.setDisabled(true);
-                try {
-                  const data = rev.parts ? await readVersion(rev) : remote;
-                  if (generation === this.generation) {
-                    drawWindows(section, bytes, data);
-                    const a = asText(bytes), b2 = asText(data);
-                    if (a !== null && b2 !== null) this.offerMerge(a, b2);
-                  }
-                } catch (error) {
-                  if (generation === this.generation) {
-                    this.message.setText(error.message);
-                    b.setDisabled(false);
-                  }
-                }
-              }));
-            } else if (left === null || right === null) {
-              this.body.createEl("p", { text: tr2("Compare file sizes and SHA-256 above.", "\u53EF\u901A\u8FC7\u4E0A\u65B9\u7684\u5927\u5C0F\u548C SHA-256 \u6BD4\u8F83\u6587\u4EF6\u3002") });
-            } else {
-              drawText(this.body, left, right);
-              this.offerMerge(left, right);
-              if (bytes !== null && remote !== null && left.endsWith("\n") !== right.endsWith("\n")) {
-                this.body.createEl("p", { text: left.endsWith("\n") ? tr2("Only the local file ends with a newline.", "\u4EC5\u672C\u673A\u6587\u4EF6\u4EE5\u6362\u884C\u7ED3\u675F\u3002") : tr2("Only the selected file ends with a newline.", "\u4EC5\u6240\u9009\u7248\u672C\u4EE5\u6362\u884C\u7ED3\u675F\u3002") });
-              }
-            }
-          }
           this.message.empty();
-          this.localButton.setDisabled(false);
-          this.remoteButton.setDisabled(false);
+          if (parts && parts.some((p) => typeof p !== "string")) {
+            this.reviewRegions(parts);
+          } else if (parts) {
+            await this.choose("merge", parts.join(""));
+          } else {
+            const size = peer.parts?.size ?? data?.byteLength;
+            for (const [label, hash, n] of [[tr2("Local", "\u672C\u5730"), localHash, bytes?.byteLength], [tr2("Remote", "\u8FDC\u7AEF"), peer.hash, size]]) {
+              this.body.createEl("p", { cls: "homebound-version", text: label + " \xB7 " + describe(hash, n) });
+            }
+            const editable = !binaryAttachment && (bytes === null || left !== null) && (peer.hash === null || right !== null);
+            if (editable) {
+              if ((bytes?.byteLength || 0) + (data?.byteLength || 0) > previewLimit) drawWindows(this.body.createDiv(), bytes, data);
+              else drawText(this.body, left ?? "", right ?? "");
+            }
+            this.choices(() => this.choose(peer.id), () => this.choose("local"), editable ? () => this.edit(left ?? right ?? "", (value) => this.choose("merge", value)) : null);
+          }
         } catch (error) {
           if (generation === this.generation) this.message.setText(error.message);
         }
       }
-      offerMerge(left, right) {
-        new Setting(this.body).addButton((b) => b.setButtonText(tr2("Merge text\u2026", "\u5408\u5E76\u6587\u672C\u2026")).onClick(() => this.startMerge(left, right)));
+      choices(remote, local, edit) {
+        this.actions.empty();
+        const controls = new Setting(this.actions);
+        controls.addButton((b) => b.setButtonText(tr2("Keep remote", "\u4FDD\u7559\u8FDC\u7AEF")).onClick(remote));
+        controls.addButton((b) => b.setButtonText(tr2("Keep local", "\u4FDD\u7559\u672C\u5730")).onClick(local));
+        if (edit) controls.addButton((b) => b.setButtonText(tr2("Edit", "\u7F16\u8F91")).onClick(edit));
       }
-      startMerge(left, right) {
-        const parts = mergeParts(left, right), changes = parts.filter((part) => part.changed);
-        this.picker.setDisabled(true);
-        this.actions.settingEl.hidden = true;
-        this.body.empty();
-        const pane = this.body.createDiv();
-        if (this.review.heads.some((rev) => rev.hash !== this.review.localHash && rev.hash !== this.selected.hash)) {
-          this.body.createEl("p", { text: tr2("After saving, compare the merged file with the remaining versions.", "\u4FDD\u5B58\u540E\u5C06\u7EE7\u7EED\u6BD4\u8F83\u5408\u5E76\u7ED3\u679C\u4E0E\u5176\u4F59\u7248\u672C\u3002") });
-        }
-        const reviewAgain = () => {
-          if (this.submitting) return;
-          this.actions.settingEl.hidden = false;
-          this.picker.setDisabled(false);
-          this.preview(this.selected);
-        };
-        new Setting(this.body).addButton((b) => b.setButtonText(tr2("Discard draft and return", "\u653E\u5F03\u8349\u7A3F\u5E76\u8FD4\u56DE\u6BD4\u8F83")).onClick(reviewAgain));
-        const edit = () => {
-          pane.empty();
-          const draft = mergedText(parts);
-          const label = pane.createEl("label", { text: tr2("Merged text", "\u5408\u5E76\u540E\u7684\u6B63\u6587") });
-          const input = label.createEl("textarea", { cls: "homebound-merge-text" });
-          input.value = draft;
-          const initial = input.value;
-          new Setting(pane).addButton((b) => b.setCta().setButtonText(tr2("Save merged file", "\u4FDD\u5B58\u5408\u5E76\u6587\u4EF6")).onClick(async () => {
-            b.setDisabled(true);
-            let text = draft;
-            if (input.value !== initial) {
-              const crlf = draft.includes("\r\n") && !/(^|[^\r])\n/.test(draft);
-              text = crlf ? input.value.replace(/\n/g, "\r\n") : input.value;
-            }
-            input.readOnly = true;
-            await this.choose("merge", text);
-            input.readOnly = false;
-            b.setDisabled(false);
-          }));
-        };
+      reviewRegions(parts) {
+        const indices = parts.map((part, i) => typeof part === "string" ? -1 : i).filter((i) => i >= 0);
+        const result = parts.slice();
         const show = (index) => {
-          pane.empty();
-          const part = changes[index];
-          const controls = new Setting(pane).setName(tr2("Change ", "\u5DEE\u5F02 ") + (index + 1) + " / " + changes.length);
-          controls.addButton((b) => b.setButtonText(tr2("Previous", "\u4E0A\u4E00\u5904")).setDisabled(index === 0).onClick(() => show(index - 1)));
-          controls.addButton((b) => b.setButtonText(tr2("Next", "\u4E0B\u4E00\u5904")).setDisabled(index + 1 === changes.length).onClick(() => show(index + 1)));
-          if (part.local.length + part.selected.length > previewLimit) {
-            const encoder = new TextEncoder();
-            drawWindows(pane.createDiv(), encoder.encode(part.local), encoder.encode(part.selected));
-          } else drawText(pane, part.local, part.selected);
-          new Setting(pane).setName(tr2("Include in merge", "\u5408\u5E76\u65F6\u91C7\u7528")).addDropdown((d) => d.addOption("local", tr2("Local", "\u672C\u673A")).addOption("selected", tr2("Selected version", "\u6240\u9009\u7248\u672C")).addOption("both", tr2("Both (local first)", "\u4E24\u8005\u90FD\u4FDD\u7559\uFF08\u672C\u673A\u5728\u524D\uFF09")).setValue(part.choice).onChange((value) => {
-            part.choice = value;
-          }));
-          new Setting(pane).addButton((b) => b.setCta().setButtonText(tr2("Review and edit result", "\u9884\u89C8\u5E76\u7F16\u8F91\u5408\u5E76\u7ED3\u679C")).onClick(edit));
+          const position = indices[index], part = parts[position];
+          this.body.empty();
+          this.body.createEl("p", { text: tr2("Conflict ", "\u51B2\u7A81 ") + (index + 1) + " / " + indices.length + tr2(" \xB7 original line ", " \xB7 \u539F\u6587\u7B2C ") + part.line + tr2("", " \u884C") });
+          if (part.context) {
+            this.body.createEl("strong", { text: tr2("Original line", "\u539F\u6587") });
+            this.body.createEl("pre", { cls: "homebound-merge-region", text: part.context });
+          }
+          for (const [label, text, cls] of [[tr2("Local", "\u672C\u5730"), part.local, "remove"], [tr2("Remote", "\u8FDC\u7AEF"), part.remote, "add"]]) {
+            this.body.createEl("strong", { text: label });
+            this.body.createEl("pre", {
+              cls: "homebound-merge-region homebound-diff-" + cls,
+              text: text || tr2("(deleted)", "\uFF08\u5DF2\u5220\u9664\uFF09")
+            });
+          }
+          const take = (value) => {
+            result[position] = value;
+            this.picker?.setDisabled(true);
+            if (index + 1 < indices.length) show(index + 1);
+            else return this.choose("merge", result.join(""));
+          };
+          const eol = part.local.match(/\r?\n$/)?.[0];
+          const separator = position + 1 < parts.length && eol && part.remote.endsWith(eol) ? eol : "";
+          const draft = separator ? part.local.slice(0, -separator.length) : part.local;
+          this.choices(() => take(part.remote), () => take(part.local), () => this.edit(draft, (value) => take(value + separator)));
+          if (index > 0) new Setting(this.actions).addButton((b) => b.setButtonText(tr2("Previous", "\u4E0A\u4E00\u5904")).onClick(() => show(index - 1)));
         };
-        if (changes.length) show(0);
-        else edit();
+        show(0);
+      }
+      edit(draft, save) {
+        this.picker?.setDisabled(true);
+        this.actions.empty();
+        const label = this.actions.createEl("label", { text: tr2("Edit result", "\u7F16\u8F91\u7ED3\u679C") });
+        const input = label.createEl("textarea", { cls: "homebound-merge-text" });
+        input.value = draft;
+        const initial = input.value;
+        new Setting(this.actions).addButton((b) => b.setCta().setButtonText(tr2("Apply edit", "\u91C7\u7528\u7F16\u8F91\u7ED3\u679C")).onClick(() => {
+          let text = input.value;
+          if (text === initial) text = draft;
+          else if (draft.includes("\r\n") && !/(^|[^\r])\n/.test(draft)) text = text.replace(/\n/g, "\r\n");
+          return save(text);
+        }));
+        input.focus();
       }
       async choose(source, text) {
         if (this.submitting) return;
         this.submitting = true;
-        this.localButton.setDisabled(true);
-        this.remoteButton.setDisabled(true);
-        this.picker.setDisabled(true);
-        this.message.setText(tr2("Resolving\u2026", "\u6B63\u5728\u63D0\u4EA4\u2026"));
+        this.picker?.setDisabled(true);
+        const inputs = this.actions.querySelectorAll("button, textarea");
+        for (const input of inputs) input.disabled = true;
+        this.message.setText(tr2("Saving\u2026", "\u6B63\u5728\u4FDD\u5B58\u2026"));
         try {
           await this.submit(source, text, this.selected.id);
           this.close();
-        } catch (e) {
-          this.message.setText(e.message);
-          if (source !== "merge") {
-            this.localButton.setDisabled(false);
-            this.remoteButton.setDisabled(false);
-            this.picker.setDisabled(false);
-          }
+        } catch (error) {
+          this.message.setText(error.message);
+          for (const input of inputs) input.disabled = false;
         } finally {
           this.submitting = false;
         }
@@ -13593,6 +13739,7 @@ var { ChunkTransfer, TransferCache, blockSize } = require_transfer();
 var { seedSnapshot, checkJoin } = require_personal();
 var { PendingUploads } = require_pending();
 var { ConflictReview } = require_review();
+var { notePlan, isNote } = require_merge();
 var { HomeboundSettings } = require_settings();
 var { VersionWatch } = require_version();
 var tr = (en, zh) => getLanguage().startsWith("zh") ? zh : en;
@@ -13661,6 +13808,10 @@ module.exports = class HomeboundPlugin extends Plugin {
     this.conflicts = conflicts;
     this.status = { lastSuccess: Date.now(), conflicts };
     this.app.saveLocalStorage(stateKey + "-status-" + this.state.current.id, this.status);
+    const modal = this.reviewModal;
+    if (modal && modal.review.vaultId === this.state.current.id && !modal.submitting && !conflicts.includes(modal.review.path)) {
+      modal.close();
+    }
     this.settingsTab.refreshStatus();
   }
   fileChanged(event, file, oldPath) {
@@ -13921,7 +14072,8 @@ module.exports = class HomeboundPlugin extends Plugin {
         const c = this.state.current;
         if (!c || this.state.pending) throw Error(tr("Finish vault setup first.", "\u8BF7\u5148\u5B8C\u6210\u5EFA\u5E93\u3002"));
         const { store } = await this.connect(c, this.secret(c, "dav"), this.secret(c, "key"));
-        const heads = core.headsByPath(await store.history(this.cache)).get(path) || [];
+        const history = await store.history(this.cache);
+        const heads = core.headsByPath(history).get(path) || [];
         if (new Set(heads.map((r) => r.hash)).size < 2) throw Error(tr("This conflict changed. Sync again.", "\u51B2\u7A81\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u540C\u6B65\u3002"));
         const local = this.local(), bytes = await local.read(path);
         const readVersion = async (rev) => {
@@ -13929,15 +14081,9 @@ module.exports = class HomeboundPlugin extends Plugin {
           if (copy !== null && await core.sha(copy) === rev.hash) return copy;
           return this.exclusive(() => store.readBody(rev));
         };
-        return {
-          path,
-          vaultId: c.id,
-          heads,
-          headIds: heads.map((r) => r.id).sort(),
-          bytes,
-          localHash: bytes === null ? null : await core.sha(bytes),
-          readVersion
-        };
+        const localHash = bytes === null ? null : await core.sha(bytes);
+        const planFor = (peer, left, right) => isNote(path) ? notePlan(history, heads, localHash, peer.hash, left, right, readVersion) : null;
+        return { path, vaultId: c.id, heads, headIds: heads.map((r) => r.id).sort(), bytes, localHash, readVersion, planFor };
       });
       if (this.closed || this.state.current?.id !== review.vaultId) return;
       const modal = new ConflictReview(this.app, review, async (source, text, peerId) => {

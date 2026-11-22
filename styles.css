@@ -27,29 +27,19 @@
         padding-inline: 0;
     }
 }
-.homebound-conflict-copies {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr));
-    gap: var(--size-4-3);
-}
-.homebound-conflict-copy {
-    min-width: 0;
-    padding: var(--size-4-2);
-    border: 1px solid var(--background-modifier-border);
-    border-radius: var(--radius-s);
-}
-.homebound-conflict-preview {
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-    max-height: 45vh;
-    overflow: auto;
-    user-select: text;
-}
-
 .homebound-invite-qr {
     display: block;
     width: min(100%, 23rem);
     height: auto;
     margin-inline: auto;
     image-rendering: pixelated;
+}
+.homebound-camera {
+    width: min(100%, 30rem);
+    max-height: 50vh;
+}
+.homebound-backup {
+    width: 100%;
+    min-height: 5em;
+    font-family: var(--font-monospace);
 }

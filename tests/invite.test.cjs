@@ -1,29 +1,32 @@
 "use strict";
-const {test}=require("node:test");
-const assert=require("node:assert/strict");
-const invites=require("../src/pairing-invite.cjs");
+const {test} = require("node:test");
+const assert = require("node:assert/strict");
+const jsQR = require("jsqr");
+const sharing = require("../src/pairing-invite.cjs");
+const core = require("../src/core.cjs");
 
-test("invitation preserves the vault base path and discloses only public rendezvous details",()=>{
-    const gateway="https://dav.example/my-vault";
-    const snapshot={policies:[{p:{anchor:"a".repeat(32)},digest:"b".repeat(64)}]};
-    const invite=invites.create(gateway,gateway+"/homebound-pqc-ledger",snapshot);
-    const url=new URL(invite.url);
-    assert.deepEqual([...url.searchParams.keys()].sort(),["address","anchor","head","slot","until","v"]);
-    assert.equal(invites.parse(invite.url).address,gateway);
-    url.searchParams.set("ledger","https://other.example/ledger");
-    assert.throws(()=>invites.parse(url.href),/同源/);
-    url.searchParams.delete("ledger");url.searchParams.set("until",String(Date.now()-1));
-    assert.throws(()=>invites.parse(url.href),/过期/);
-    assert.throws(()=>invites.parse("https://untrusted.example/"),/管理员/);
-});
-
-test("passwordless QR uses a versioned invitation with no device or storage credential in its payload",()=>{
-    const base="https://example.org/independent";
-    const s={deviceDav:true,policies:[{p:{anchor:"1".repeat(32)},digest:"2".repeat(64)}]};
-    const made=invites.create(base,base+"/homebound-pqc-ledger",s);
-    const url=new URL(made.url);
-    assert.equal(url.searchParams.get("v"),"2");
-    assert.deepEqual([...url.searchParams.keys()].sort(),["address","anchor","head","slot","until","v"]);
-    assert.equal(invites.parse(made.url).automatic,true);
-    url.searchParams.set("v","1");assert.equal(invites.parse(url.href).automatic,false);
+test("draw and optically decode a personal QR with Unicode credentials and paths", () => {
+    const fields = {v:2,address:"https://dav.example/base",folder:"笔记/100% 记录",username:"用户",
+        password:"synthetic-測試-%&?#",id:core.randomId(),key:core.generateKey()};
+    const payload = sharing.create({...fields,secretId:"local-only",otherVault:"unrelated"});
+    let pixels;
+    const canvas = {getContext() {
+        pixels = new Uint8ClampedArray(canvas.width * canvas.height * 4);
+        return {fillRect(x,y,w,h) {
+            const val = this.fillStyle === "black" ? 0 : 255;
+            for (let row = y; row < y+h; row++) for (let col=x; col<x+w; col++) {
+                const i = 4 * (row * canvas.width + col);
+                pixels.fill(val,i,i+3); pixels[i+3] = 255;
+            }
+        }};
+    }};
+    sharing.draw(canvas,payload);
+    const decoded = jsQR(pixels,canvas.width,canvas.height);
+    assert.deepEqual(sharing.parse(decoded.data),fields);
+    assert.deepEqual(sharing.recover(sharing.backup(fields.id,fields.key)),{id:fields.id,key:fields.key});
+    for (const address of ["http://dav.example","https://user:pass@dav.example"])
+        assert.throws(() => sharing.create({...fields,address}));
+    assert.throws(() => sharing.parse("obsidian://homebound-join?x"));
+    assert.throws(() => sharing.create({...fields,password:"a".repeat(3000)}));
+    assert.throws(() => sharing.recover(fields.key));
 });

@@ -82,30 +82,20 @@ class ChunkTransfer {
             }
         }
     }
-    async upload({objects,scope,epoch,wrapKey,deviceKey,path,parents,hash,bytes}) {
+    async upload({objects,scope,wrapKey,path,parents,hash,bytes}) {
         const data = new Uint8Array(bytes.buffer ?? bytes, bytes.byteOffset ?? 0, bytes.byteLength);
-        const slot = [scope,deviceKey ? "put-device" : "put",path];
-        const legacySlot = [scope,"put",path];
-        const binding = JSON.stringify(["upload-1",scope,epoch,path,hash,[...parents].sort()]);
+        const slot = [scope,"put",path];
+        const binding = JSON.stringify(["upload-2",scope,path,hash,[...parents].sort()]);
         let pending = await this.cache.get(slot);
-        const migrated = !pending && deviceKey ? await this.cache.get(legacySlot) : null;
-        pending ??= migrated;
         let raw;
         if (pending?.binding === binding) {
-            raw = await core.unseal(pending.deviceWrapped ? deviceKey : wrapKey,binding,pending.wrapped);
-            // Upgrade an existing rc.2 checkpoint without retransmitting acknowledged chunks.
-            if (deviceKey && !pending.deviceWrapped) {
-                pending.wrapped = await core.seal(deviceKey,binding,raw);
-                pending.deviceWrapped = true;
-                await this.cache.put(slot,pending);
-            }
+            raw = await core.unseal(wrapKey,binding,pending.wrapped);
         } else {
             raw = crypto.getRandomValues(new Uint8Array(32));
             pending = {binding,id:core.randomId(),parts:{v:1,size:data.length,seed:core.randomId()},done:0,inFlight:false,
-                deviceWrapped:Boolean(deviceKey),wrapped:await core.seal(deviceKey ?? wrapKey,binding,raw)};
+                wrapped:await core.seal(wrapKey,binding,raw)};
             await this.cache.put(slot,pending);
         }
-        if (migrated) await this.cache.remove(legacySlot);
         const {id,parts} = pending, total = Math.ceil(data.length / blockSize);
         if (!validParts(parts) || parts.size !== data.length || !Number.isInteger(pending.done) ||
             pending.done < 0 || pending.done > total) throw Error("分块上传记录损坏。");
@@ -172,6 +162,6 @@ class ChunkTransfer {
         if (!audit) await this.cache.clearDownload(scope,id);
         return output.buffer;
     }
-    uploaded(scope,path,deviceKey) { return this.cache.remove([scope,deviceKey ? "put-device" : "put",path]); }
+    uploaded(scope,path) { return this.cache.remove([scope,"put",path]); }
 }
 module.exports = {ChunkTransfer,TransferCache,blockSize,threshold,validParts};

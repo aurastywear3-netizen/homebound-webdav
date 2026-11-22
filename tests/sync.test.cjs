@@ -42,13 +42,14 @@ test("Unicode folder input, literal percent signs and HTTPS rules", () => {
     assert.throws(() => core.endpoint("https://u:p@dav.example.org/test"));
 });
 
-test("key verifier rejects another vault, wrong passphrase, and tampering", async () => {
-    const header = await core.newHeader("a long test phrase");
-    await core.unlock(header, "a long test phrase", header.id);
-    await assert.rejects(core.unlock(header, "wrong", header.id));
-    await assert.rejects(core.unlock(header, "a long test phrase", core.randomId()));
+test("key verifier rejects another vault, wrong random key, and tampering", async () => {
+    const material = core.generateKey();
+    const header = await core.newHeader(material, core.randomId());
+    await core.unlock(header, material, header.id);
+    await assert.rejects(core.unlock(header, core.generateKey(), header.id));
+    await assert.rejects(core.unlock(header, material, core.randomId()));
     const altered = { ...header, proof: header.proof.slice(0, -1) + (header.proof.endsWith("a") ? "b" : "a") };
-    await assert.rejects(core.unlock(altered, "a long test phrase", header.id));
+    await assert.rejects(core.unlock(altered, material, header.id));
 });
 
 test("two devices upload, restore, modify and propagate a deletion", async () => {
@@ -160,11 +161,13 @@ test("interrupted initialization and lost MOVE response are retriable; an existi
             throw Error("lost response after MOVE");
         }
     }
-    const setup = () => core.createVault(new Dav(""), "nested/中文", "a long test passphrase", "homebound-v1");
+    const material = core.generateKey(), id = core.randomId();
+    const setup = (target = id) => core.createVault(new Dav(""), "nested/中文", material, target);
     await assert.rejects(setup(), /offline/);
     const header = await setup();
-    assert.equal(core.parseBytes(files.get("/nested/中文/homebound-v1/vault.json")).id, header.id);
-    await assert.rejects(setup(), /empty remote folder/);
+    assert.equal(core.parseBytes(files.get("/nested/中文/homebound-v2/vault.json")).id, header.id);
+    assert.deepEqual(await setup(), header);
+    await assert.rejects(setup(core.randomId()), /不匹配/);
 });
 
 async function offlineConflict() {

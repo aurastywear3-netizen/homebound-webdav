@@ -24,12 +24,8 @@ function directory(input) {
     return path;
 }
 
-function gatewayAddress(config) {
-    return config.address ?? config.away ?? "";
-}
-
-function gatewayUrl(input) {
-    if (typeof input !== "string" || !input.trim()) throw Error("请填写 WebDAV 地址（VPS 的 HTTPS 地址）。");
+function davAddress(input) {
+    if (typeof input !== "string" || !input.trim()) throw Error("请填写 WebDAV HTTPS 地址。");
     let url;
     try { url = endpoint(input); } catch { throw Error("WebDAV 地址无效，请填写完整的 HTTPS 地址。"); }
     if (!url.startsWith("https://")) throw Error("WebDAV 地址必须使用 HTTPS。");
@@ -49,11 +45,12 @@ function endpoint(input) {
 const encodePath = path => path.split("/").map(encodeURIComponent).join("/");
 const isRecovery = path => path.split("/")[0].toLowerCase() === conflictFolder.toLowerCase();
 
-async function derive(passphrase, salt) {
-    const material = await crypto.subtle.importKey("raw", encoder.encode(passphrase), "PBKDF2", false, ["deriveKey"]);
-    const bytes = Uint8Array.from(salt.match(/../g), pair => parseInt(pair, 16));
-    return crypto.subtle.deriveKey({ name: "PBKDF2", hash: "SHA-256", salt: bytes, iterations: 600000 },
-        material, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+const generateKey = () => hex(crypto.getRandomValues(new Uint8Array(32)));
+
+async function importKey(material) {
+    if (typeof material !== "string" || !/^[a-f0-9]{64}$/.test(material)) throw Error("库密钥格式错误。");
+    const bytes = Uint8Array.from(material.match(/../g), part => parseInt(part, 16));
+    return crypto.subtle.importKey("raw", bytes, "AES-GCM", false, ["encrypt", "decrypt"]);
 }
 
 async function seal(key, label, data) {
@@ -71,23 +68,26 @@ async function unseal(key, label, data) {
         key, bytes.subarray(12));
 }
 
-async function newHeader(passphrase) {
-    const id = randomId();
-    const salt = randomId();
-    const key = await derive(passphrase, salt);
-    const proof = hex(await seal(key, "homebound:1:" + id, encoder.encode("vault")));
-    return { format: 1, id, salt, proof };
+const namespace = "homebound-v2";
+const headerLabel = id => "homebound:2:" + id;
+
+async function newHeader(material, id, previous = "") {
+    const key = await importKey(material);
+    const proof = hex(await seal(key, headerLabel(id), jsonBytes({id, previous})));
+    return {format: 2, id, previous, proof};
 }
 
-async function unlock(header, passphrase, pinned) {
-    if (header?.format !== 1 || !idPattern.test(header.id) || !idPattern.test(header.salt) ||
-        !/^[0-9a-f]{66}$/.test(header.proof)) throw Error("Unrecognized WebDAV vault header.");
-    if (pinned && pinned !== header.id) throw Error("This address leads to a different vault. Check the WebDAV address.");
-    const key = await derive(passphrase, header.salt);
+async function unlock(header, material, pinned) {
+    if (header?.format !== 2 || !idPattern.test(header.id) || header.id !== pinned ||
+        !(header.previous === "" || idPattern.test(header.previous)) ||
+        typeof header.proof !== "string" || !/^(?:[0-9a-f]{2}){28,180}$/.test(header.proof))
+        throw Error("远端库标识或格式不匹配。请核对地址、目录和恢复密钥。");
+    const key = await importKey(material);
     try {
-        const proof = Uint8Array.from(header.proof.match(/../g), pair => parseInt(pair, 16));
-        if (decoder.decode(await unseal(key, "homebound:1:" + header.id, proof)) !== "vault") throw Error();
-    } catch { throw Error("Vault passphrase or authenticated header is incorrect."); }
+        const packet = Uint8Array.from(header.proof.match(/../g), pair => parseInt(pair, 16));
+        const proof = parseBytes(await unseal(key, headerLabel(pinned), packet));
+        if (proof.id !== pinned || proof.previous !== header.previous) throw Error();
+    } catch { throw Error("库密钥或远端库头校验失败。"); }
     return key;
 }
 
@@ -108,9 +108,9 @@ class Store {
     }
     async publish(path, parents, bytes) {
         const hash = bytes === null ? null : await sha(bytes);
-        const scope = "legacy/" + this.id;
+        const scope = "personal/" + this.id;
         const staged = this.transfer?.shouldSplit(bytes) ? await this.transfer.upload({
-            objects:this.chunkObjects(), scope, epoch:"passphrase", wrapKey:this.key, path, parents, hash, bytes
+            objects:this.chunkObjects(), scope, wrapKey:this.key, path, parents, hash, bytes
         }) : null;
         const id = staged?.id || randomId();
         if (bytes !== null && !staged) await this.writeObject("b-" + id, bytes);
@@ -127,7 +127,7 @@ class Store {
     async readBody(rev,options) {
         if (rev.parts) {
             if (!this.transfer) throw Error("此附件需要支持分块的客户端。");
-            return this.transfer.download(this.chunkObjects(),"legacy/"+this.id,rev,options);
+            return this.transfer.download(this.chunkObjects(),"personal/"+this.id,rev,options);
         }
         const bytes = await this.readObject("b-" + rev.id);
         if (await sha(bytes) !== rev.hash) throw Error("File integrity check failed: " + rev.path);
@@ -287,7 +287,7 @@ async function synchronize({ store, local, baseline, cache, checkpoint, resolve,
     return { history, sent, received, conflicts };
 }
 
-async function createVault(home, folder, passphrase, namespace) {
+async function createVault(home, folder, material, id, previous = "") {
     let current = home;
     for (const part of folder.split("/")) {
         try { await current.mkdir(part); }
@@ -295,10 +295,16 @@ async function createVault(home, folder, passphrase, namespace) {
         current = current.child(part);
     }
     const entries = await current.list();
+    if (entries.includes(namespace)) {
+        const existing = parseBytes(await current.child(namespace).read("vault.json"));
+        await unlock(existing, material, id);
+        if (existing.previous !== previous) throw Error("目标目录已绑定其他库。");
+        return existing;
+    }
     if (entries.some(name => !/^homebound-init-[0-9a-f]{32}$/.test(name))) {
         throw Error("Please choose an empty remote folder, or connect the existing vault. 请选择空目录，或连接已有库。");
     }
-    const header = await newHeader(passphrase);
+    const header = await newHeader(material, id, previous);
     const staging = "homebound-init-" + randomId();
     await current.mkdir(staging);
     const store = current.child(staging);
@@ -312,9 +318,11 @@ async function createVault(home, folder, passphrase, namespace) {
         let existing;
         try { existing = parseBytes(await current.child(namespace).read("vault.json")); } catch { /* Preserve the original failure. */ }
         if (existing?.id !== header.id) throw error;
+        await unlock(existing, material, id);
+        if (existing.previous !== previous) throw error;
     }
     return header;
 }
 
-module.exports = { createVault, Store, synchronize, headsByPath, safePath, isRecovery, conflictFolder, directory, endpoint, gatewayAddress, gatewayUrl, encodePath,
-    newHeader, unlock, randomId, sha, jsonBytes, parseBytes, seal, unseal };
+module.exports = { createVault, Store, synchronize, headsByPath, safePath, isRecovery, conflictFolder, directory, endpoint, davAddress, encodePath,
+    namespace, newHeader, unlock, generateKey, checkAliases, randomId, sha, jsonBytes, parseBytes, seal, unseal };

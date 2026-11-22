@@ -2,40 +2,41 @@
 const qr = require("qrcode-generator");
 const decodeQR = require("jsqr");
 const core = require("./core.cjs");
-const pq = require("./pqc.cjs");
+const prefix = "HB-DAV2.";
+const backupPrefix = "HB-KEY2.";
 
-const action = "homebound-join";
-const shortId = /^[0-9a-f]{32}$/;
-
-function validate(params, now = Date.now()) {
-    const {v, address, anchor, slot, head, until, ledger} = params;
-    if (!["1","2"].includes(v) || !shortId.test(anchor) || !shortId.test(slot) || !/^[0-9a-f]{64}$/.test(head))
-        throw Error("无效的 Homebound 设备邀请。");
-    const expires = Number(until);
-    if (!Number.isSafeInteger(expires) || expires <= now || expires > now + pq.lifetime + 60000)
-        throw Error("邀请已过期或设备时间不一致，请重新扫码。");
-    const gateway = core.gatewayUrl(address);
-    const service = ledger === undefined ? gateway + "/homebound-pqc-ledger" : core.gatewayUrl(ledger);
-    if (new URL(service).origin !== new URL(gateway).origin) throw Error("邀请中的提交服务必须与网关同源。");
-    return {address:gateway, ledger:service, anchor, slot, head, expires, automatic:v==="2"};
+function backup(id, key) {
+    if (typeof id !== "string" || typeof key !== "string" || !/^[0-9a-f]{32}$/.test(id) || !/^[0-9a-f]{64}$/.test(key)) throw Error("库标识或密钥无效。");
+    return backupPrefix + id + "." + key;
 }
 
-function create(address, ledger, snapshot) {
-    const {p,digest} = pq.membershipHead(snapshot);
-    const params = {v:snapshot.deviceDav?"2":"1", address, anchor:p.anchor, slot:core.randomId(), head:digest, until:String(Date.now()+pq.lifetime)};
-    if (ledger !== address+"/homebound-pqc-ledger") params.ledger = ledger;
-    const invite = validate(params);
-    const url = "obsidian://"+action+"?"+new URLSearchParams(params);
-    if (url.length > 1500) throw Error("网关地址过长，请使用手动配对。");
-    return {...invite,url};
+function recover(text) {
+    const match = /^HB-KEY2\.([0-9a-f]{32})\.([0-9a-f]{64})$/.exec(text.trim());
+    if (!match) throw Error("请输入此库的完整恢复密钥。");
+    return {id:match[1], key:match[2]};
+}
+
+function validate(fields) {
+    if (!fields || fields.v !== 2 || typeof fields.folder !== "string" ||
+        typeof fields.username !== "string" || !fields.username || fields.username.includes(":") ||
+        typeof fields.password !== "string" || !fields.password) throw Error("无效的 Homebound 共享码。");
+    const address = core.davAddress(fields.address), folder = core.directory(fields.folder);
+    backup(fields.id, fields.key);
+    return {v:2, address, folder, username:fields.username, password:fields.password, id:fields.id, key:fields.key};
+}
+
+function create(fields) {
+    const bytes = new TextEncoder().encode(JSON.stringify(validate({...fields, v:2})));
+    if (bytes.length > 1680) throw Error("配置过长，无法生成二维码。请用恢复密钥和 WebDAV 配置连接。");
+    return prefix + btoa(String.fromCharCode(...bytes));
 }
 
 function parse(text) {
-    if (typeof text !== "string" || text.length > 1500) throw Error("二维码格式无效。");
-    const url = new URL(text);
-    if (url.protocol !== "obsidian:" || url.host !== action || url.username || url.password || url.pathname || url.hash)
-        throw Error("请扫描管理员显示的 Homebound 邀请码。");
-    return validate(Object.fromEntries(url.searchParams));
+    if (typeof text !== "string" || !text.startsWith(prefix) || text.length > 2300) throw Error("请扫描 Homebound 个人库共享码。");
+    try {
+        const bytes = Uint8Array.from(atob(text.slice(prefix.length)), c => c.charCodeAt(0));
+        return validate(JSON.parse(new TextDecoder("utf-8",{fatal:true}).decode(bytes)));
+    } catch { throw Error("共享码内容无效。"); }
 }
 
 function draw(canvas, text) {
@@ -50,20 +51,23 @@ function draw(canvas, text) {
         if (code.isDark(y,x)) ctx.fillRect((x+quiet)*cell,(y+quiet)*cell,cell,cell);
 }
 
+function scanPixels(canvas, source, width, height) {
+    const scale = Math.min(1, 1920 / Math.max(width,height));
+    canvas.width = Math.max(1,Math.round(width*scale));
+    canvas.height = Math.max(1,Math.round(height*scale));
+    const ctx = canvas.getContext("2d",{willReadFrequently:true});
+    ctx.drawImage(source,0,0,canvas.width,canvas.height);
+    const pixels = ctx.getImageData(0,0,canvas.width,canvas.height);
+    return decodeQR(pixels.data,pixels.width,pixels.height);
+}
+
 async function readPhoto(file) {
     const url = URL.createObjectURL(file);
     try {
         const img = new Image(); img.src = url; await img.decode();
-        const scale = Math.min(1, 1920 / Math.max(img.naturalWidth,img.naturalHeight));
-        const canvas = document.createElement("canvas");
-        canvas.width = Math.max(1,Math.round(img.naturalWidth*scale));
-        canvas.height = Math.max(1,Math.round(img.naturalHeight*scale));
-        const ctx = canvas.getContext("2d",{willReadFrequently:true});
-        ctx.drawImage(img,0,0,canvas.width,canvas.height);
-        const pixels = ctx.getImageData(0,0,canvas.width,canvas.height);
-        const result = decodeQR(pixels.data,pixels.width,pixels.height);
+        const result = scanPixels(document.createElement("canvas"), img, img.naturalWidth, img.naturalHeight);
         if (!result) throw Error("未识别到二维码，请拍清楚整个二维码或选择截图。");
         return parse(result.data);
     } finally { URL.revokeObjectURL(url); }
 }
-module.exports = {action,validate,create,parse,draw,readPhoto};
+module.exports = {backup,recover,create,parse,draw,scanPixels,readPhoto};

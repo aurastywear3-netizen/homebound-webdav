@@ -43,3 +43,27 @@
     min-height: 5em;
     font-family: var(--font-monospace);
 }
+.homebound-status dl {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: var(--size-4-1) var(--size-4-4);
+}
+.homebound-status dt, .homebound-version {
+    color: var(--text-muted);
+}
+.homebound-status dd { margin: 0; }
+.homebound-status .setting-item-name, .homebound-review-path, .homebound-version { overflow-wrap: anywhere; }
+.homebound-review .setting-item-control { flex-wrap: wrap; }
+.homebound-diff {
+    max-height: 45vh;
+    overflow: auto;
+    font-family: var(--font-monospace);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    border: 1px solid var(--background-modifier-border);
+    border-radius: var(--radius-s);
+}
+.homebound-diff > div { padding-inline: var(--size-4-2); }
+.homebound-diff-add { background-color: var(--background-modifier-success); }
+.homebound-diff-remove { background-color: var(--background-modifier-error); }
+.homebound-diff-gap { color: var(--text-muted); }

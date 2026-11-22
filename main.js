@@ -12797,6 +12797,295 @@ var require_personal = __commonJS({
   }
 });
 
+// src/pending.cjs
+var require_pending = __commonJS({
+  "src/pending.cjs"(exports2, module2) {
+    "use strict";
+    var { sha } = require_core();
+    var PendingUploads2 = class {
+      constructor() {
+        this.files = /* @__PURE__ */ new Set();
+        this.candidates = /* @__PURE__ */ new Set();
+        this.full = true;
+        this.known = false;
+      }
+      refresh(local, readBaseline, active) {
+        if (!this.work) {
+          this.work = this.inspect(local, readBaseline, active).finally(() => {
+            this.work = null;
+          });
+        }
+        return this.work;
+      }
+      async inspect(local, readBaseline, active) {
+        if (!this.full && !this.candidates.size) return;
+        const baseline = readBaseline();
+        const paths = this.full ? /* @__PURE__ */ new Set([...local.paths(), ...baseline.keys()]) : this.candidates;
+        const next = this.full ? /* @__PURE__ */ new Set() : new Set(this.files);
+        this.full = false;
+        this.candidates = /* @__PURE__ */ new Set();
+        try {
+          for (const path of paths) {
+            if (!active()) return;
+            if (!local.allowed(path)) continue;
+            const bytes = await local.read(path);
+            const hash = bytes === null ? null : await sha(bytes);
+            if (hash !== (baseline.get(path)?.hash ?? null)) next.add(path);
+            else next.delete(path);
+          }
+          this.files = next;
+          this.known = true;
+          this.failed = false;
+        } catch (error) {
+          this.full = true;
+          this.known = false;
+          this.failed = true;
+          throw error;
+        }
+      }
+    };
+    module2.exports = { PendingUploads: PendingUploads2 };
+  }
+});
+
+// src/diff.cjs
+var require_diff = __commonJS({
+  "src/diff.cjs"(exports2, module2) {
+    "use strict";
+    function lineDiff(before, after) {
+      const lines = (text) => text.match(/[^\n]*\n|[^\n]+$/g) || [];
+      const a = lines(before), b = lines(after), rows = [];
+      const row = (kind, text) => rows.push({ kind, text });
+      let start = 0, endA = a.length, endB = b.length;
+      while (start < endA && start < endB && a[start] === b[start]) row("same", a[start++]);
+      while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) {
+        endA--;
+        endB--;
+      }
+      const width = endB - start + 1, height = endA - start + 1;
+      let i = start, j = start;
+      if (width * height <= 3e5) {
+        const lcs = new Uint16Array(width * height);
+        for (let x = endA - 1; x >= start; x--) {
+          for (let y = endB - 1; y >= start; y--) {
+            const n = (x - start) * width + y - start;
+            lcs[n] = a[x] === b[y] ? 1 + lcs[n + width + 1] : Math.max(lcs[n + 1], lcs[n + width]);
+          }
+        }
+        while (i < endA && j < endB) {
+          const n = (i - start) * width + j - start;
+          if (a[i] === b[j]) {
+            row("same", a[i++]);
+            j++;
+          } else if (lcs[n + width] >= lcs[n + 1]) row("remove", a[i++]);
+          else row("add", b[j++]);
+        }
+      }
+      while (i < endA) row("remove", a[i++]);
+      while (j < endB) row("add", b[j++]);
+      for (i = endA; i < a.length; i++) row("same", a[i]);
+      return rows;
+    }
+    function contextRows(rows) {
+      const result = [];
+      for (let i = 0; i < rows.length; ) {
+        if (rows[i].kind !== "same") {
+          result.push(rows[i++]);
+          continue;
+        }
+        let end = i + 1;
+        while (end < rows.length && rows[end].kind === "same") end++;
+        if (end - i > 7) {
+          result.push(...rows.slice(i, i + 3), { kind: "gap", count: end - i - 6 }, ...rows.slice(end - 3, end));
+        } else result.push(...rows.slice(i, end));
+        i = end;
+      }
+      return result;
+    }
+    function textWindow(buffer, offset) {
+      const bytes = new Uint8Array(buffer);
+      const limit = Math.min(offset + 65536, bytes.length);
+      let end = offset, lines = 0, lastBreak = offset;
+      while (end < limit && lines < 160) {
+        if (bytes[end++] === 10) {
+          lines++;
+          lastBreak = end;
+        }
+      }
+      if (end < bytes.length && lastBreak > offset) end = lastBreak;
+      else while (end > offset && end < bytes.length && (bytes[end] & 192) === 128) end--;
+      if (end === offset && limit > offset) end = limit;
+      return { slice: bytes.subarray(offset, end), end };
+    }
+    module2.exports = { lineDiff, contextRows, textWindow };
+  }
+});
+
+// src/review.cjs
+var require_review = __commonJS({
+  "src/review.cjs"(exports2, module2) {
+    "use strict";
+    var { Modal, Setting, getLanguage: getLanguage2 } = require("obsidian");
+    var { lineDiff, contextRows, textWindow } = require_diff();
+    var tr2 = (en, zh) => getLanguage2().startsWith("zh") ? zh : en;
+    var previewLimit = 256 * 1024;
+    function asText(bytes) {
+      if (bytes === null) return "";
+      try {
+        const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+        return /[\u0000-\u0008\u000e-\u001f]/.test(text) ? null : text;
+      } catch {
+        return null;
+      }
+    }
+    function describe(hash, size) {
+      if (hash === null) return tr2("Deleted", "\u5DF2\u5220\u9664");
+      return size + tr2(" bytes \xB7 SHA-256 ", " \u5B57\u8282 \xB7 SHA-256 ") + hash;
+    }
+    function drawText(el, left, right) {
+      const rows = contextRows(lineDiff(left, right));
+      el.createEl("p", { text: tr2("\u2212 Local lines   + Selected lines", "\u2212 \u672C\u673A\u884C\u3000+ \u6240\u9009\u7248\u672C\u884C") });
+      const view = el.createDiv({ cls: "homebound-diff" });
+      let index = 0;
+      function more() {
+        const end = Math.min(index + 400, rows.length);
+        for (; index < end; index++) {
+          const r = rows[index];
+          const prefix = { add: "+ ", remove: "\u2212 ", same: "  " }[r.kind];
+          const line = r.kind === "gap" ? "\u2026 " + r.count + tr2(" unchanged lines", " \u884C\u76F8\u540C") : prefix + r.text.replace(/\n$/, "").replace(/\r$/, " \u240D");
+          view.createDiv({ cls: "homebound-diff-" + r.kind, text: line });
+        }
+        return index < rows.length;
+      }
+      if (more()) new Setting(el).addButton((b) => b.setButtonText(tr2("Show more lines", "\u663E\u793A\u66F4\u591A\u884C")).onClick(() => {
+        if (!more()) b.buttonEl.remove();
+      }));
+    }
+    function drawWindows(el, left, right) {
+      const pages = [{ left: 0, right: 0 }];
+      const show = (index) => {
+        el.empty();
+        const a = textWindow(left, pages[index].left), b = textWindow(right, pages[index].right);
+        const x = asText(a.slice), y = asText(b.slice);
+        const controls = new Setting(el).setName(tr2("Text section ", "\u6587\u672C\u7247\u6BB5 ") + (index + 1));
+        controls.addButton((btn) => btn.setButtonText(tr2("Previous", "\u4E0A\u4E00\u6BB5")).setDisabled(index === 0).onClick(() => show(index - 1)));
+        const hasMore = a.end < (left?.byteLength || 0) || b.end < (right?.byteLength || 0);
+        controls.addButton((btn) => btn.setButtonText(tr2("Next", "\u4E0B\u4E00\u6BB5")).setDisabled(!hasMore).onClick(() => {
+          pages[index + 1] = { left: a.end, right: b.end };
+          show(index + 1);
+        }));
+        if (x === null || y === null) el.createEl("p", { text: tr2("This section contains binary data.", "\u6B64\u7247\u6BB5\u5305\u542B\u4E8C\u8FDB\u5236\u6570\u636E\u3002") });
+        else drawText(el, x, y);
+      };
+      show(0);
+    }
+    var ConflictReview2 = class extends Modal {
+      constructor(app, review, submit) {
+        super(app);
+        this.review = review;
+        this.submit = submit;
+        this.generation = 0;
+      }
+      onOpen() {
+        const { path, heads, localHash, bytes } = this.review;
+        this.setTitle(tr2("Compare conflict", "\u6BD4\u8F83\u51B2\u7A81\u7248\u672C"));
+        const el = this.contentEl;
+        el.addClass("homebound-review");
+        el.createEl("p", { text: path, cls: "homebound-review-path" });
+        const first = heads.find((r) => r.hash !== localHash) || heads[0];
+        new Setting(el).setName(tr2("Compare local file with", "\u4E0E\u672C\u673A\u6587\u4EF6\u6BD4\u8F83")).addDropdown((d) => {
+          this.picker = d;
+          for (const rev of heads) {
+            const label = rev.hash === null ? tr2("Deletion", "\u5220\u9664\u7248\u672C") : tr2("Version", "\u7248\u672C");
+            d.addOption(rev.id, label + " \xB7 " + rev.id.slice(0, 12));
+          }
+          d.setValue(first.id).onChange((id) => this.preview(heads.find((r) => r.id === id)));
+        });
+        this.body = el.createDiv();
+        this.message = el.createDiv({ attr: { role: "status" } });
+        new Setting(el).addButton((b) => b.setButtonText(tr2("Close", "\u5173\u95ED")).onClick(() => this.close())).addButton((b) => {
+          this.localButton = b.setButtonText(bytes === null ? tr2("Keep local deletion", "\u4FDD\u7559\u672C\u673A\u5220\u9664") : tr2("Keep local file", "\u4FDD\u7559\u672C\u673A\u6587\u4EF6")).onClick(() => this.choose("local"));
+        }).addButton((b) => {
+          this.remoteButton = b.setCta().onClick(() => this.choose(this.selected.id));
+        });
+        this.preview(first);
+      }
+      async preview(rev) {
+        const generation = ++this.generation;
+        const { bytes, localHash, readVersion } = this.review;
+        this.selected = rev;
+        this.body.empty();
+        this.localButton.setDisabled(true);
+        this.remoteButton.setDisabled(true).setButtonText(rev.hash === null ? tr2("Use selected deletion", "\u91C7\u7528\u6240\u9009\u5220\u9664\u7248\u672C") : tr2("Use selected file", "\u91C7\u7528\u6240\u9009\u6587\u4EF6"));
+        this.message.setText(tr2("Loading comparison\u2026", "\u6B63\u5728\u8BFB\u53D6\u5DEE\u5F02\u2026"));
+        try {
+          let remote = null, size = rev.parts?.size;
+          if (rev.hash !== null && size === void 0) {
+            remote = rev.hash === localHash ? bytes : await readVersion(rev);
+            size = remote.byteLength;
+          }
+          if (generation !== this.generation) return;
+          for (const [label, hash, n] of [[tr2("Local", "\u672C\u673A"), localHash, bytes?.byteLength], [tr2("Selected", "\u6240\u9009\u7248\u672C"), rev.hash, size]]) {
+            const p = this.body.createEl("p", { cls: "homebound-version" });
+            p.createEl("strong", { text: label + " \xB7 " });
+            p.createSpan({ text: describe(hash, n) });
+          }
+          if (rev.hash === localHash) {
+            this.body.createEl("p", { text: tr2("Identical content.", "\u5185\u5BB9\u76F8\u540C\u3002") });
+          } else {
+            const large = (bytes?.byteLength || 0) > previewLimit || size > previewLimit;
+            const left = large ? null : asText(bytes), right = large ? null : asText(remote);
+            if (large && /\.(md|txt|canvas|json|csv|tsv|yaml|yml|xml|html|css|js|ts|tex|log)$/i.test(rev.path)) {
+              const section = this.body.createDiv();
+              new Setting(section).addButton((b) => b.setButtonText(tr2("Compare text in sections", "\u5206\u6BB5\u6BD4\u8F83\u6587\u672C")).onClick(async () => {
+                b.setDisabled(true);
+                try {
+                  const data = rev.parts ? await readVersion(rev) : remote;
+                  if (generation === this.generation) drawWindows(section, bytes, data);
+                } catch (error) {
+                  if (generation === this.generation) {
+                    this.message.setText(error.message);
+                    b.setDisabled(false);
+                  }
+                }
+              }));
+            } else if (left === null || right === null) {
+              this.body.createEl("p", { text: tr2("Compare file sizes and SHA-256 above.", "\u53EF\u901A\u8FC7\u4E0A\u65B9\u7684\u5927\u5C0F\u548C SHA-256 \u6BD4\u8F83\u6587\u4EF6\u3002") });
+            } else {
+              drawText(this.body, left, right);
+              if (bytes !== null && remote !== null && left.endsWith("\n") !== right.endsWith("\n")) {
+                this.body.createEl("p", { text: left.endsWith("\n") ? tr2("Only the local file ends with a newline.", "\u4EC5\u672C\u673A\u6587\u4EF6\u4EE5\u6362\u884C\u7ED3\u675F\u3002") : tr2("Only the selected file ends with a newline.", "\u4EC5\u6240\u9009\u7248\u672C\u4EE5\u6362\u884C\u7ED3\u675F\u3002") });
+              }
+            }
+          }
+          this.message.empty();
+          this.localButton.setDisabled(false);
+          this.remoteButton.setDisabled(false);
+        } catch (error) {
+          if (generation === this.generation) this.message.setText(error.message);
+        }
+      }
+      async choose(source) {
+        this.localButton.setDisabled(true);
+        this.remoteButton.setDisabled(true);
+        this.picker.setDisabled(true);
+        this.message.setText(tr2("Resolving\u2026", "\u6B63\u5728\u63D0\u4EA4\u2026"));
+        try {
+          await this.submit(source);
+          this.close();
+        } catch (e) {
+          this.message.setText(e.message + " " + tr2("Close and compare again.", "\u8BF7\u5173\u95ED\u7A97\u53E3\u540E\u91CD\u65B0\u6BD4\u8F83\u3002"));
+        }
+      }
+      onClose() {
+        this.generation++;
+        this.contentEl.empty();
+      }
+    };
+    module2.exports = { ConflictReview: ConflictReview2 };
+  }
+});
+
 // src/settings.cjs
 var require_settings = __commonJS({
   "src/settings.cjs"(exports2, module2) {
@@ -12981,11 +13270,47 @@ var require_settings = __commonJS({
         qr.draw(modal.contentEl.createEl("canvas", { cls: "homebound-invite-qr" }), payload);
         modal.open();
       }
+      statusVisible() {
+        return Boolean(this.statusEl?.isConnected);
+      }
+      refreshStatus() {
+        if (!this.statusVisible()) return;
+        const p = this.plugin;
+        const time = p.status.lastSuccess;
+        this.successEl.setText(time ? new Date(time).toLocaleString() : tr2("No successful sync recorded", "\u6682\u65E0\u6210\u529F\u540C\u6B65\u8BB0\u5F55"));
+        const unknown = p.uploads.failed ? tr2("Unavailable", "\u6682\u65F6\u65E0\u6CD5\u7EDF\u8BA1") : tr2("Checking\u2026", "\u6838\u5BF9\u4E2D\u2026");
+        this.countEl.setText(p.uploads.known ? String(p.uploads.files.size) : unknown);
+        this.conflictEl.setText(p.status.conflicts ? p.conflicts.length ? String(p.conflicts.length) : tr2("None", "\u65E0\u51B2\u7A81") : tr2("Awaiting first check", "\u5F85\u9996\u6B21\u68C0\u67E5"));
+        this.resultEl.setText(p.last || "");
+        if (this.listedConflicts === p.conflicts) return;
+        this.listedConflicts = p.conflicts;
+        this.conflictList.empty();
+        for (const path of p.conflicts) {
+          new Setting(this.conflictList).setName(path).addButton((b) => b.setButtonText(tr2("Compare", "\u6BD4\u8F83\u5DEE\u5F02")).onClick(() => p.openConflict(path)));
+        }
+      }
+      showStatus(el) {
+        this.statusEl = el.createDiv({ cls: "homebound-status" });
+        const list = this.statusEl.createEl("dl");
+        const value = (label) => {
+          list.createEl("dt", { text: label });
+          return list.createEl("dd");
+        };
+        this.successEl = value(tr2("Last successful sync", "\u6700\u540E\u6210\u529F\u540C\u6B65"));
+        this.countEl = value(tr2("Pending uploads", "\u5F85\u4E0A\u4F20\u6587\u4EF6"));
+        this.conflictEl = value(tr2("Conflicts", "\u51B2\u7A81\u72B6\u6001"));
+        this.resultEl = this.statusEl.createDiv({ attr: { role: "status" } });
+        this.conflictList = this.statusEl.createDiv();
+        this.listedConflicts = null;
+        this.refreshStatus();
+        this.plugin.scheduleCount();
+      }
       display() {
         const p = this.plugin, el = this.containerEl;
         const { current, pending } = p.state;
         el.empty();
         el.addClass("homebound-settings");
+        if (current) this.showStatus(el);
         if (pending) {
           el.createEl("p", { text: tr2("Setup awaiting verification: ", "\u5F85\u5B8C\u6210\u4E0A\u4F20\u548C\u6821\u9A8C\uFF1A") + pending.address + "/" + pending.folder });
           let password = "";
@@ -13017,16 +13342,12 @@ var require_settings = __commonJS({
         ) });
         if (current) {
           el.createEl("p", { text: current.address + "/" + current.folder + " \xB7 " + current.username });
-          button(el, tr2("Sync now", "\u7ACB\u5373\u540C\u6B65"), async () => {
-            await p.run();
-            this.display();
-          });
+          button(el, tr2("Sync now", "\u7ACB\u5373\u540C\u6B65"), () => p.run());
           new Setting(el).setName(tr2("Sync while open", "\u6253\u5F00\u671F\u95F4\u81EA\u52A8\u540C\u6B65")).addToggle((t) => t.setValue(Boolean(current.auto)).onChange((value) => {
-            if (p.state.current === current && !p.state.pending) p.save({ current: { ...current, auto: value } });
+            if (p.state.current?.id === current.id) p.setAuto(value);
           }));
           button(el, tr2("Show sharing QR code", "\u663E\u793A\u5171\u4EAB\u4E8C\u7EF4\u7801"), () => this.showCode());
           button(el, tr2("Back up vault key", "\u5907\u4EFD\u5E93\u5BC6\u94A5"), () => this.showBackup());
-          if (p.last) el.createEl("p", { text: p.last });
         }
         button(el, tr2("Scan to join", "\u626B\u7801\u52A0\u5165"), () => new Scanner(this.app, (f) => this.reviewJoin(f)).open());
         const form = el.createEl("details");
@@ -13084,6 +13405,8 @@ var sharing = require_pairing_invite();
 var { Dav, VaultFiles, credentials } = require_adapter();
 var { ChunkTransfer, TransferCache, blockSize } = require_transfer();
 var { seedSnapshot, checkJoin } = require_personal();
+var { PendingUploads } = require_pending();
+var { ConflictReview } = require_review();
 var { HomeboundSettings } = require_settings();
 var tr = (en, zh) => getLanguage().startsWith("zh") ? zh : en;
 var stateKey = "homebound-personal-v2";
@@ -13100,6 +13423,7 @@ module.exports = class HomeboundPlugin extends Plugin {
     this.closed = false;
     this.cache = /* @__PURE__ */ new Map();
     this.state = this.app.loadLocalStorage(stateKey) || {};
+    this.restoreStatus();
     this.oldFormat = !this.state.current && Boolean((await this.loadData())?.id || this.app.loadLocalStorage("homebound-webdav-pqc-config")?.anchor);
     this.transfer = new ChunkTransfer(new TransferCache(this.app.appId), {
       enabled: true,
@@ -13109,19 +13433,106 @@ module.exports = class HomeboundPlugin extends Plugin {
     this.settingsTab = new HomeboundSettings(this.app, this);
     this.addSettingTab(this.settingsTab);
     this.addCommand({ id: "sync", name: tr("Sync now", "\u7ACB\u5373\u540C\u6B65"), callback: () => this.run() });
-    this.addCommand({ id: "resolve", name: tr("Resolve conflict using the active file", "\u4F7F\u7528\u5F53\u524D\u6587\u4EF6\u89E3\u51B3\u51B2\u7A81"), checkCallback: (checking) => {
+    this.addCommand({ id: "resolve", name: tr("Compare and resolve file conflict", "\u6BD4\u8F83\u5E76\u89E3\u51B3\u6587\u4EF6\u51B2\u7A81"), checkCallback: (checking) => {
       const path = this.app.workspace.getActiveFile()?.path;
-      if (!this.conflicts?.includes(path)) return false;
-      if (!checking) this.run(path);
+      if (!this.conflicts.includes(path)) return false;
+      if (!checking) this.openConflict(path);
       return true;
     } });
-    const syncIfEnabled = () => {
-      if (!this.closed && !this.state.pending && this.state.current?.auto && !this.busy && document.visibilityState === "visible") this.run(null, true);
-    };
-    this.app.workspace.onLayoutReady(syncIfEnabled);
-    this.registerDomEvent(document, "visibilitychange", syncIfEnabled);
-    this.registerDomEvent(window, "online", syncIfEnabled);
-    this.registerInterval(window.setInterval(syncIfEnabled, 3e5));
+    const check = () => this.requestAuto(true);
+    this.app.workspace.onLayoutReady(() => {
+      if (this.closed) return;
+      this.ready = true;
+      const vault = this.app.vault;
+      for (const event of ["create", "modify", "delete", "rename"]) {
+        this.registerEvent(vault.on(event, (file, oldPath) => this.fileChanged(event, file, oldPath)));
+      }
+      this.scheduleCount();
+      check();
+    });
+    this.registerDomEvent(document, "visibilitychange", check);
+    this.registerDomEvent(window, "online", check);
+    this.registerInterval(window.setInterval(check, 3e5));
+  }
+  restoreStatus() {
+    this.uploads = new PendingUploads();
+    const id = this.state.current?.id;
+    this.status = id && this.app.loadLocalStorage(stateKey + "-status-" + id) || {};
+    this.conflicts = this.status.conflicts || [];
+    this.autoDue = null;
+    clearTimeout(this.editTimer);
+    this.editTimer = null;
+  }
+  recordSuccess(conflicts) {
+    this.conflicts = conflicts;
+    this.status = { lastSuccess: Date.now(), conflicts };
+    this.app.saveLocalStorage(stateKey + "-status-" + this.state.current.id, this.status);
+    this.settingsTab.refreshStatus();
+  }
+  fileChanged(event, file, oldPath) {
+    if (!this.state.current || this.closed) return;
+    const local = this.local();
+    const paths = [file.path, oldPath].filter((path) => path && local.allowed(path));
+    if (!paths.length) return;
+    if (Array.isArray(file.children)) {
+      if (event !== "rename" && event !== "delete") return;
+      this.uploads.full = true;
+    } else {
+      for (const path of paths) this.uploads.candidates.add(path);
+    }
+    this.scheduleCount();
+    if (!this.state.current.auto) return;
+    clearTimeout(this.editTimer);
+    if (this.autoDue === "edit") this.autoDue = null;
+    this.editTimer = setTimeout(() => {
+      this.editTimer = null;
+      this.requestAuto(false);
+    }, 4e3);
+  }
+  scheduleCount() {
+    clearTimeout(this.countTimer);
+    if (!this.ready || this.busy || this.closed || !this.settingsTab.statusVisible()) return;
+    this.countTimer = setTimeout(() => this.refreshCount(), 200);
+  }
+  async refreshCount() {
+    const id = this.state.current?.id, uploads = this.uploads;
+    if (!id || this.busy || this.closed) return;
+    try {
+      do {
+        await uploads.refresh(this.local(), () => this.baseline(id), () => uploads === this.uploads && !this.closed);
+      } while ((uploads.full || uploads.candidates.size) && uploads === this.uploads && !this.closed && !this.busy);
+    } catch {
+    }
+    if (uploads === this.uploads && !this.closed) this.settingsTab.refreshStatus();
+  }
+  autoEnabled() {
+    return !this.closed && this.state.current?.auto && !this.state.pending && document.visibilityState === "visible";
+  }
+  async requestAuto(force) {
+    if (!this.autoEnabled()) return;
+    if (this.busy) {
+      if (force || !this.autoDue) this.autoDue = force ? "check" : "edit";
+      return;
+    }
+    if (!force) {
+      const uploads = this.uploads;
+      await this.refreshCount();
+      if (!this.autoEnabled() || uploads !== this.uploads || this.editTimer) return;
+      if (this.busy) {
+        this.autoDue ||= "edit";
+        return;
+      }
+      if (uploads.known && !uploads.files.size) return;
+    }
+    await this.run(null, true);
+  }
+  setAuto(value) {
+    if (!this.state.current || this.state.pending) return;
+    this.save({ current: { ...this.state.current, auto: value } });
+    clearTimeout(this.editTimer);
+    this.editTimer = null;
+    this.autoDue = null;
+    if (value) this.requestAuto(true);
   }
   save(state) {
     this.app.saveLocalStorage(stateKey, state);
@@ -13168,10 +13579,17 @@ module.exports = class HomeboundPlugin extends Plugin {
     if (this.closed || this.busy) throw Error("\u8BF7\u7B49\u5F53\u524D\u64CD\u4F5C\u5B8C\u6210\u540E\u518D\u8BD5\u3002");
     this.busy = true;
     try {
+      if (this.uploads.work) await this.uploads.work.catch(() => {
+      });
       return await action();
     } finally {
       this.busy = false;
       this.showTransfer(null);
+      for (const path of this.uploads.files) this.uploads.candidates.add(path);
+      this.scheduleCount();
+      const due = this.autoDue;
+      this.autoDue = null;
+      if (due) queueMicrotask(() => this.requestAuto(due === "check"));
     }
   }
   activate(config) {
@@ -13180,7 +13598,8 @@ module.exports = class HomeboundPlugin extends Plugin {
     this.save({ current: config });
     if (former && former.secretId !== config.secretId) this.forgetSecrets(former);
     this.cache.clear();
-    this.conflicts = [];
+    this.restoreStatus();
+    this.last = "";
     this.oldFormat = false;
   }
   // Persist the key and target before the first WebDAV write. A lost response or
@@ -13215,6 +13634,7 @@ module.exports = class HomeboundPlugin extends Plugin {
     this.checkpoint(config.id, baseline);
     this.activate(config);
     this.last = tr("Upload and readback verified.", "\u5DF2\u5B8C\u6210\u4E0A\u4F20\u548C\u8BFB\u56DE\u6821\u9A8C\u3002");
+    this.recordSuccess([]);
     new Notice(this.last);
   }
   async join(fields, material, id) {
@@ -13254,9 +13674,47 @@ module.exports = class HomeboundPlugin extends Plugin {
   }
   onunload() {
     this.closed = true;
+    clearTimeout(this.editTimer);
+    clearTimeout(this.countTimer);
     this.showTransfer(null);
   }
-  async run(resolve = null, quiet = false) {
+  async openConflict(path) {
+    try {
+      const review = await this.exclusive(async () => {
+        const c = this.state.current;
+        if (!c || this.state.pending) throw Error(tr("Finish vault setup first.", "\u8BF7\u5148\u5B8C\u6210\u5EFA\u5E93\u3002"));
+        const { store } = await this.connect(c, this.secret(c, "dav"), this.secret(c, "key"));
+        const heads = core.headsByPath(await store.history(this.cache)).get(path) || [];
+        if (new Set(heads.map((r) => r.hash)).size < 2) throw Error(tr("This conflict changed. Sync again.", "\u51B2\u7A81\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u540C\u6B65\u3002"));
+        const local = this.local(), bytes = await local.read(path);
+        const readVersion = async (rev) => {
+          const copy = await local.read(core.conflictFolder + "/" + rev.id + "/" + rev.path);
+          if (copy !== null && await core.sha(copy) === rev.hash) return copy;
+          return this.exclusive(() => store.readBody(rev));
+        };
+        return {
+          path,
+          vaultId: c.id,
+          heads,
+          headIds: heads.map((r) => r.id).sort(),
+          bytes,
+          localHash: bytes === null ? null : await core.sha(bytes),
+          readVersion
+        };
+      });
+      if (!this.closed) new ConflictReview(this.app, review, async (source) => {
+        if (this.state.current?.id !== review.vaultId || this.closed) throw Error(tr("Vault changed.", "\u5F53\u524D\u5E93\u5DF2\u53D8\u5316\u3002"));
+        if (this.busy) throw Error(tr("Sync in progress. Try again.", "\u6B63\u5728\u540C\u6B65\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002"));
+        const selection = { path, headIds: review.headIds, localHash: review.localHash, source };
+        const result = await this.run(selection);
+        if (!result) throw Error(this.last);
+      }).open();
+    } catch (error) {
+      new Notice(error.message);
+    }
+  }
+  async run(selection = null, quiet = false) {
+    if (typeof selection === "string") return this.openConflict(selection);
     if (this.closed || this.busy) return;
     try {
       return await this.exclusive(async () => {
@@ -13283,23 +13741,32 @@ module.exports = class HomeboundPlugin extends Plugin {
           local,
           cache: this.cache,
           baseline: this.baseline(c.id),
-          resolve,
+          selection,
           active: () => !this.closed,
           checkpoint: (data) => this.checkpoint(c.id, data)
         });
         result.received += reconciled;
         this.cache = result.history;
-        this.conflicts = result.conflicts;
+        const newConflict = result.conflicts.some((path) => !this.conflicts.includes(path));
         this.last = tr("Uploaded ", "\u5DF2\u4E0A\u4F20 ") + result.sent + tr(" \xB7 received ", " \xB7 \u5DF2\u63A5\u6536 ") + result.received;
-        if (result.conflicts.length) this.last += "\n" + tr(
-          "Compare copies in Homebound conflicts, then resolve the active file: ",
-          "\u8BF7\u6BD4\u8F83 Homebound conflicts \u4E2D\u7684\u526F\u672C\uFF0C\u518D\u6253\u5F00\u539F\u6587\u4EF6\u89E3\u51B3\u51B2\u7A81\uFF1A"
-        ) + result.conflicts.join(", ");
-        if (!quiet || result.conflicts.length) new Notice(this.last, 9e3);
+        if (result.conflicts.length) this.last += "\n" + tr("Review conflicts in Homebound settings: ", "\u8BF7\u5728 Homebound \u8BBE\u7F6E\u4E2D\u6BD4\u8F83\u51B2\u7A81\uFF1A") + result.conflicts.length;
+        this.recordSuccess(result.conflicts);
+        if (!quiet || newConflict) {
+          if (result.conflicts.length) {
+            const message = document.createDocumentFragment();
+            message.append(this.last + " ");
+            const compare = document.createElement("button");
+            compare.textContent = tr("Compare conflict", "\u6BD4\u8F83\u51B2\u7A81");
+            compare.addEventListener("click", () => this.openConflict(result.conflicts[0]));
+            message.append(compare);
+            new Notice(message, 9e3);
+          } else new Notice(this.last, 9e3);
+        }
         return result;
       });
     } catch (e) {
       this.last = tr("Sync stopped: ", "\u540C\u6B65\u5DF2\u505C\u6B62\uFF1A") + e.message;
+      this.settingsTab.refreshStatus();
       if (!quiet) new Notice(this.last, 1e4);
     }
   }

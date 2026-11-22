@@ -126,10 +126,43 @@ class HomeboundSettings extends PluginSettingTab {
         qr.draw(modal.contentEl.createEl("canvas",{cls:"homebound-invite-qr"}),payload);
         modal.open();
     }
+    statusVisible() { return Boolean(this.statusEl?.isConnected); }
+    refreshStatus() {
+        if (!this.statusVisible()) return;
+        const p = this.plugin;
+        const time = p.status.lastSuccess;
+        this.successEl.setText(time ? new Date(time).toLocaleString() : tr("No successful sync recorded","暂无成功同步记录"));
+        const unknown = p.uploads.failed ? tr("Unavailable","暂时无法统计") : tr("Checking…","核对中…");
+        this.countEl.setText(p.uploads.known ? String(p.uploads.files.size) : unknown);
+        this.conflictEl.setText(p.status.conflicts ? (p.conflicts.length ? String(p.conflicts.length) : tr("None","无冲突"))
+            : tr("Awaiting first check","待首次检查"));
+        this.resultEl.setText(p.last || "");
+        if (this.listedConflicts === p.conflicts) return;
+        this.listedConflicts = p.conflicts;
+        this.conflictList.empty();
+        for (const path of p.conflicts) {
+            new Setting(this.conflictList).setName(path).addButton(b => b.setButtonText(tr("Compare","比较差异"))
+                .onClick(() => p.openConflict(path)));
+        }
+    }
+    showStatus(el) {
+        this.statusEl = el.createDiv({cls:"homebound-status"});
+        const list = this.statusEl.createEl("dl");
+        const value = label => { list.createEl("dt",{text:label}); return list.createEl("dd"); };
+        this.successEl = value(tr("Last successful sync","最后成功同步"));
+        this.countEl = value(tr("Pending uploads","待上传文件"));
+        this.conflictEl = value(tr("Conflicts","冲突状态"));
+        this.resultEl = this.statusEl.createDiv({attr:{role:"status"}});
+        this.conflictList = this.statusEl.createDiv();
+        this.listedConflicts = null;
+        this.refreshStatus();
+        this.plugin.scheduleCount();
+    }
     display() {
         const p = this.plugin, el = this.containerEl;
         const {current, pending} = p.state;
         el.empty(); el.addClass("homebound-settings");
+        if (current) this.showStatus(el);
         if (pending) {
             el.createEl("p",{text:tr("Setup awaiting verification: ","待完成上传和校验：") + pending.address + "/" + pending.folder});
             let password = "";
@@ -150,12 +183,11 @@ class HomeboundSettings extends PluginSettingTab {
             "同步当前库的笔记和附件。隐藏文件、空目录和 Obsidian 配置目录会跳过。")});
         if (current) {
             el.createEl("p",{text:current.address + "/" + current.folder + " · " + current.username});
-            button(el,tr("Sync now","立即同步"),async () => { await p.run(); this.display(); });
+            button(el,tr("Sync now","立即同步"),() => p.run());
             new Setting(el).setName(tr("Sync while open","打开期间自动同步")).addToggle(t => t.setValue(Boolean(current.auto))
-                .onChange(value => { if (p.state.current === current && !p.state.pending) p.save({current:{...current,auto:value}}); }));
+                .onChange(value => { if (p.state.current?.id === current.id) p.setAuto(value); }));
             button(el,tr("Show sharing QR code","显示共享二维码"),() => this.showCode());
             button(el,tr("Back up vault key","备份库密钥"),() => this.showBackup());
-            if (p.last) el.createEl("p",{text:p.last});
         }
         button(el,tr("Scan to join","扫码加入"),() => new Scanner(this.app,f => this.reviewJoin(f)).open());
 

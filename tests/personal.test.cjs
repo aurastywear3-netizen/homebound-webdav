@@ -144,3 +144,28 @@ test("built plugin creates independent vaults, shares one key, rotates after los
         await mac.connect(next,next.password,next.key);
     } finally { Object.assign(global,prior); }
 });
+
+test("a failed sync and a restart preserve the last completed sync and conflict list for this vault", async () => {
+    const prior = {window:global.window,document:global.document};
+    global.window = {setInterval:()=>0};
+    global.document = {createDocumentFragment:()=>({append(){}}), createElement:()=>({addEventListener(){}})};
+    try {
+        const srv=server(), disk=new Map(), secrets=new Map(), files=new Map([["note.md",bytes("original")]]);
+        const mac=await device(srv,files,disk,secrets);
+        await mac.startSetup({address:"https://dav.example",folder:"sync",username:"tester"},srv.password);
+        const config=mac.state.current;
+        const {store}=await mac.connect(config,srv.password,mac.secret(config,"key"));
+        await store.publish("note.md",mac.baseline(config.id).get("note.md").ids,bytes("remote"));
+        files.set("note.md",bytes("local"));
+        const local=mac.local();
+        mac.local=()=>({...local,archive:async()=>{}});
+        assert.deepEqual((await mac.run()).conflicts,["note.md"]);
+        const success=mac.status.lastSuccess;
+        srv.password="rotated-password";
+        assert.equal(await mac.run(),undefined);
+        assert.equal(mac.status.lastSuccess,success);
+        const restored=await device(srv,files,disk,secrets);
+        assert.equal(restored.status.lastSuccess,success);
+        assert.deepEqual(restored.conflicts,["note.md"]);
+    } finally { Object.assign(global,prior); }
+});

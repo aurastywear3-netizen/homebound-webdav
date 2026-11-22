@@ -1,10 +1,23 @@
 # Homebound WebDAV 0.3.0
 
+Homebound WebDAV syncs encrypted notes and attachments between your Obsidian devices using an HTTPS WebDAV server you control. Each vault has its own folder and encryption key.
+
 个人多 Vault 加密同步插件。每个本地 Obsidian 库连接一个远端子目录。多个库可以共用一个 HTTPS WebDAV 地址和账号，各自使用独立随机密钥。插件直接读写标准 WebDAV 服务。外出时设备也需要能访问这个 HTTPS 地址。
 
 **从 0.2.2 或更早版本升级前**，请先用旧版完成同步，保留完整本地副本和旧库恢复材料。0.3.0 使用新的远端格式，迁移时请选择新的空目录。
 
 **Upgrading from 0.2.2 or earlier?** Finish syncing with the old plugin and back up your complete local vault and recovery materials first. Version 0.3.0 uses a new remote format. Create the new vault in an empty WebDAV folder, then scan its QR code on your other devices. Keep the old remote folder and recovery materials if you need the previous revision history.
+
+## Installation
+
+Open **Settings → Community plugins → Browse** in Obsidian 1.11.4 or later. Search for **Homebound WebDAV**, choose **Install**, then **Enable**. Install the plugin in each local vault you want to sync.
+
+## Usage
+
+1. On your first device, open **Settings → Homebound WebDAV**, enter the WebDAV address, account and password, and choose a new, empty remote folder. Select **Create encrypted vault** and wait for upload verification.
+2. Select **Back up vault key** and save the recovery key in your password manager. Keep the WebDAV credentials and folder name available for recovery.
+3. Open an empty local vault on the second device. Choose **Scan to join** in the plugin settings, scan the first device’s **Show sharing QR code**, confirm the destination and select **Verify and sync**. The QR code contains the WebDAV password and this vault’s encryption key. Show it only to devices you trust.
+4. Choose **Sync now** to transfer changes, or enable **Sync while open**. Repeat setup in another vault with a different remote folder to keep its notes and key separate.
 
 ## 创建与加入
 

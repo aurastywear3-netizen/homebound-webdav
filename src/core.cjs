@@ -118,6 +118,7 @@ class Store {
         if (staged) Object.assign(rev, {parts:staged.parts, key:staged.key});
         await this.writeObject("r-" + id, jsonBytes(rev));
         await this.dav.mkdir("commits/" + id);
+        this.lastPublished = id;
         if (staged) await this.transfer.uploaded(scope,path);
         return rev;
     }
@@ -133,8 +134,8 @@ class Store {
         if (await sha(bytes) !== rev.hash) throw Error("File integrity check failed: " + rev.path);
         return bytes;
     }
-    async history(cache) {
-        const names = await this.dav.list("commits");
+    async history(cache, names) {
+        names ??= await this.dav.list("commits");
         const visible = new Set(names);
         for (const id of cache.keys()) {
             if (!visible.has(id)) throw Error("Previously seen history is missing from this server.");
@@ -185,8 +186,8 @@ function checkAliases(paths) {
     }
 }
 
-async function synchronize({ store, local, baseline, cache, checkpoint, resolve, selection, active = () => true }) {
-    const history = await store.history(cache);
+async function synchronize({ store, local, baseline, cache, checkpoint, resolve, selection, commitNames, active = () => true }) {
+    const history = await store.history(cache, commitNames);
     const groups = headsByPath(history);
     if (selection && !groups.has(selection.path)) throw Error("冲突版本已变化，请重新同步并比较。");
     const localPaths = local.paths();
@@ -255,21 +256,45 @@ async function synchronize({ store, local, baseline, cache, checkpoint, resolve,
                 conflicts.push(path);
                 continue;
             }
-            let chosen = bytes;
-            if (reviewing && selection.source !== "local") {
+            let chosen = bytes, parents = heads;
+            if (reviewing && selection.source === "merge") {
+                if (typeof selection.text !== "string") throw Error("缺少合并正文。");
+                const peer = heads.find(rev => rev.id === selection.peerId);
+                if (!peer) throw Error("所选副本已变化，请重新比较。");
+                // A two-way editor only resolves the versions actually compared.
+                parents = heads.filter(rev => rev.hash === hash || rev.hash === peer.hash);
+                chosen = encoder.encode(selection.text).buffer;
+            } else if (reviewing && selection.source !== "local") {
                 const source = heads.find(rev => rev.id === selection.source);
                 if (!source) throw Error("所选副本已变化，请重新比较。");
                 if (source.hash !== hash) {
                     chosen = source.hash === null ? null : await store.readBody(source);
-                    await local.apply(path, hash, chosen);
-                    hash = source.hash;
                 }
             }
+            if (reviewing) {
+                const current = await local.read(path);
+                if ((current === null ? null : await sha(current)) !== selection.localHash)
+                    throw Error("比较期间正文已变化，请重新比较。");
+            }
             if (!active()) throw Error("Sync stopped.");
-            const rev = await store.publish(path, heads.map(r => r.id), chosen);
+            const parentIds = parents.map(r => r.id);
+            const rev = await store.publish(path, parentIds, chosen);
+            // A failed publish leaves the local file and the editable draft intact.
+            // apply checks the expected bytes again in case an edit raced the upload.
+            if (rev.hash !== hash) {
+                if (!active()) throw Error("Sync stopped.");
+                await local.apply(path,hash,chosen);
+                hash = rev.hash;
+            }
             history.set(rev.id, rev);
-            heads = [rev];
+            heads = [rev, ...heads.filter(head => !parentIds.includes(head.id))];
             sent++;
+            if (heads.some(head => head.hash !== hash)) {
+                baseline.set(path, {ids:heads.filter(head => head.hash === hash).map(head => head.id).sort(), hash});
+                checkpoint(baseline);
+                conflicts.push(path);
+                continue;
+            }
         }
         if (!heads.length) continue;
         const target = heads[0];

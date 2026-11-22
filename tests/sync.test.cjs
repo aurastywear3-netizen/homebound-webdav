@@ -201,6 +201,23 @@ test("keep the resolver's version without a losing peer re-uploading its offline
     assert.deepEqual((await mac.sync()).conflicts, []);
 });
 
+test("an edited text merge publishes one revision with all reviewed parents; stale drafts cannot overwrite edits", async () => {
+    const {mac, ipad, note, selection, f} = await offlineConflict();
+    const merged = {...selection, source:"merge", peerId:selection.source, text:"Mac\r\niPad\r\n补充 😊\r\n"};
+    mac.contents.set(note,text("another edit"));
+    await assert.rejects(mac.sync(undefined,merged),/已变化/);
+    assert.deepEqual(mac.contents.get(note),text("another edit"));
+    mac.contents.set(note,text("Mac"));
+    const result = await mac.sync(undefined,merged);
+    assert.deepEqual(result.conflicts,[]);
+    const [head] = core.headsByPath(await f.store.history(new Map())).get(note);
+    assert.deepEqual(head.parents.sort(),selection.headIds);
+    assert.deepEqual(await f.store.readBody(head),text(merged.text));
+    await ipad.sync();
+    assert.deepEqual(ipad.contents.get(note),mac.contents.get(note));
+    assert.equal((await ipad.sync()).sent,0);
+});
+
 test("a stale comparison cannot replace a newer edit or resolve a different set of heads", async () => {
     const {mac, f, note, selection} = await offlineConflict();
     mac.contents.set(note, text("unsaved in comparison"));
@@ -210,6 +227,38 @@ test("a stale comparison cannot replace a newer edit or resolve a different set 
     await f.store.publish(note, [], text("offline third device"));
     await assert.rejects(mac.sync(undefined, selection), /已变化/);
     assert.equal(core.headsByPath(await f.store.history(new Map())).get(note).length, 3);
+});
+
+test("an interrupted merge leaves the original local file and both remote versions available for retry", async () => {
+    const {mac, ipad, f, note, selection} = await offlineConflict();
+    const draft = {...selection, source:"merge", peerId:selection.source, text:"Mac and iPad"};
+    const mkdir = f.dav.mkdir;
+    f.dav.mkdir = async () => { throw Error("offline before commit"); };
+    await assert.rejects(mac.sync(undefined,draft),/offline before commit/);
+    assert.deepEqual(mac.contents.get(note),text("Mac"));
+    const heads = core.headsByPath(await f.store.history(new Map())).get(note);
+    assert.deepEqual(heads.map(r=>r.id).sort(),selection.headIds);
+    f.dav.mkdir = mkdir;
+    await mac.sync(undefined,draft); await ipad.sync();
+    assert.deepEqual(ipad.contents.get(note),text(draft.text));
+});
+
+test("merging two copies keeps a third independent version pending until the next comparison", async () => {
+    const {mac, ipad, f, note, selection} = await offlineConflict();
+    const third = await f.store.publish(note,[],text("third device"));
+    const first = {...selection, headIds:[...selection.headIds,third.id].sort(),
+        source:"merge", peerId:selection.source, text:"Mac and iPad"};
+    const result = await mac.sync(undefined,first);
+    assert.deepEqual(result.conflicts,[note]);
+    const heads = core.headsByPath(result.history).get(note);
+    assert.equal(heads.length,2);
+    assert.deepEqual(heads.find(r=>r.id!==third.id).parents.sort(),selection.headIds);
+    assert.deepEqual(mac.contents.get(note),text(first.text));
+    const next = {...first, headIds:heads.map(r=>r.id).sort(), peerId:third.id,
+        localHash:await core.sha(text(first.text)), text:"all three edits"};
+    assert.deepEqual((await mac.sync(undefined,next)).conflicts,[]);
+    await ipad.sync();
+    assert.deepEqual(ipad.contents.get(note),text(next.text));
 });
 
 test("a selected deletion supersedes all reviewed conflict heads", async () => {

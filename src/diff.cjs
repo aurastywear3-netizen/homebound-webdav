@@ -46,6 +46,31 @@ function contextRows(rows) {
     }
     return result;
 }
+
+function mergeParts(left, right) {
+    const parts = [];
+    for (const {kind,text} of lineDiff(left,right)) {
+        let part = parts[parts.length-1];
+        const changed = kind !== "same";
+        if (!part || part.changed !== changed) {
+            part = {changed, local:"", selected:"", choice:"local"};
+            parts.push(part);
+        }
+        if (kind !== "add") part.local += text;
+        if (kind === "add") part.selected += text;
+    }
+    return parts;
+}
+
+function mergedText(parts) {
+    return parts.map(part => {
+        if (!part.changed || part.choice === "local") return part.local;
+        if (part.choice === "selected") return part.selected;
+        const join = part.local && part.selected && !part.local.endsWith("\n") ?
+            (part.local.includes("\r\n") || part.selected.includes("\r\n") ? "\r\n" : "\n") : "";
+        return part.local + join + part.selected;
+    }).join("");
+}
 // Keep each large-file preview bounded. Prefer whole lines, and never cut a
 // UTF-8 character when a single line is longer than the byte budget.
 function textWindow(buffer, offset) {
@@ -61,4 +86,4 @@ function textWindow(buffer, offset) {
     if (end === offset && limit > offset) end = limit;
     return {slice:bytes.subarray(offset,end), end};
 }
-module.exports = {lineDiff, contextRows, textWindow};
+module.exports = {lineDiff, contextRows, textWindow, mergeParts, mergedText};

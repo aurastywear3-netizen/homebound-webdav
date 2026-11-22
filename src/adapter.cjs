@@ -5,6 +5,7 @@ const core = require("./core.cjs");
 const tr = (en, zh) => getLanguage().startsWith("zh") ? zh : en;
 
 const paused = () => new Error(tr("File changed during sync. Run sync again.", "文件在同步期间发生变化，请再同步一次。"));
+const pathSegments = pathname => pathname.replace(/\/+$/, "").split("/").map(x => decodeURIComponent(x).normalize("NFC"));
 
 class Dav {
     constructor(root, authorization) {
@@ -31,6 +32,33 @@ class Dav {
         await this.call("PUT", path, [200, 201, 204], { body, contentType: "application/octet-stream" });
     }
     async mkdir(path) { await this.call("MKCOL", path, [201]); }
+    async collectionMarker() {
+        const result = await this.call("PROPFIND", "commits", [207,405,501], {
+            headers: {Depth:"0", "Cache-Control":"no-cache"}, contentType:"application/xml; charset=utf-8",
+            body:'<d:propfind xmlns:d="DAV:"><d:prop><d:sync-token/><d:getetag/><d:getlastmodified/></d:prop></d:propfind>'
+        });
+        if (result.status !== 207) return null;
+        const xml = new DOMParser().parseFromString(result.text, "application/xml");
+        const responses = xml.getElementsByTagNameNS("DAV:", "response");
+        if (xml.documentElement.namespaceURI !== "DAV:" || xml.documentElement.localName !== "multistatus" || responses.length !== 1)
+            throw Error("Invalid WebDAV version response.");
+        const expected = new URL(this.child("commits").root);
+        const href = responses[0].getElementsByTagNameNS("DAV:", "href")[0]?.textContent;
+        if (!href || JSON.stringify(pathSegments(new URL(href, expected.href + "/").pathname)) !== JSON.stringify(pathSegments(expected.pathname)))
+            throw Error("Unexpected WebDAV version path.");
+        const props = new Map();
+        for (const group of responses[0].getElementsByTagNameNS("DAV:", "propstat")) {
+            const status = group.getElementsByTagNameNS("DAV:", "status")[0]?.textContent.trim();
+            if (!/^HTTP\/\S+ 200\b/.test(status)) continue;
+            for (const prop of group.getElementsByTagNameNS("DAV:", "prop")[0]?.children || []) {
+                if (prop.namespaceURI === "DAV:" && prop.textContent.trim()) props.set(prop.localName, prop.textContent.trim());
+            }
+        }
+        if (props.has("sync-token")) return {tag:"sync:"+props.get("sync-token")};
+        const etag = props.get("getetag"), modified = props.get("getlastmodified");
+        if (etag || modified) return {tag:JSON.stringify([etag,modified]), coarse:true};
+        return null;
+    }
     async list(path = "") {
         const result = await this.call("PROPFIND", path, [207], {
             headers: { Depth: "1" }, contentType: "application/xml; charset=utf-8",
@@ -42,15 +70,14 @@ class Dav {
             throw Error("Invalid WebDAV directory response.");
         }
         const url = new URL(path ? this.child(path).root : this.root);
-        const segments = pathname => pathname.replace(/\/+$/, "").split("/").map(x => decodeURIComponent(x).normalize("NFC"));
-        const base = segments(url.pathname);
+        const base = pathSegments(url.pathname);
         let self = false;
         const names = [];
         for (const entry of docs(xml, "response")) {
             const href = docs(entry, "href")[0]?.textContent;
             const successful = docs(entry, "status").some(s => /^HTTP\/\S+ 2\d\d\b/i.test(s.textContent.trim()));
             if (!href || !successful) throw Error("Incomplete WebDAV directory response.");
-            const item = segments(new URL(href, url.href.replace(/\/+$/, "") + "/").pathname);
+            const item = pathSegments(new URL(href, url.href.replace(/\/+$/, "") + "/").pathname);
             if (!base.every((part, i) => part === item[i])) throw Error("WebDAV returned an unexpected directory.");
             if (item.length === base.length) { self = true; continue; }
             if (item.length !== base.length + 1) throw Error("WebDAV returned an unexpected child path.");

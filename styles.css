@@ -54,6 +54,7 @@
 .homebound-status dd { margin: 0; }
 .homebound-status .setting-item-name, .homebound-review-path, .homebound-version { overflow-wrap: anywhere; }
 .homebound-review .setting-item-control { flex-wrap: wrap; }
+.homebound-review .setting-item[hidden] { display: none; }
 .homebound-diff {
     max-height: 45vh;
     overflow: auto;
@@ -67,3 +68,12 @@
 .homebound-diff-add { background-color: var(--background-modifier-success); }
 .homebound-diff-remove { background-color: var(--background-modifier-error); }
 .homebound-diff-gap { color: var(--text-muted); }
+.homebound-merge-text {
+    display: block;
+    width: 100%;
+    min-height: 12em;
+    max-height: 50vh;
+    margin-top: var(--size-4-2);
+    resize: vertical;
+    box-sizing: border-box;
+}

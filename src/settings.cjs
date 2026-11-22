@@ -136,7 +136,7 @@ class HomeboundSettings extends PluginSettingTab {
         this.countEl.setText(p.uploads.known ? String(p.uploads.files.size) : unknown);
         this.conflictEl.setText(p.status.conflicts ? (p.conflicts.length ? String(p.conflicts.length) : tr("None","无冲突"))
             : tr("Awaiting first check","待首次检查"));
-        this.resultEl.setText(p.last || "");
+        this.resultEl.setText(p.pollError || p.last || "");
         if (this.listedConflicts === p.conflicts) return;
         this.listedConflicts = p.conflicts;
         this.conflictList.empty();
@@ -184,8 +184,6 @@ class HomeboundSettings extends PluginSettingTab {
         if (current) {
             el.createEl("p",{text:current.address + "/" + current.folder + " · " + current.username});
             button(el,tr("Sync now","立即同步"),() => p.run());
-            new Setting(el).setName(tr("Sync while open","打开期间自动同步")).addToggle(t => t.setValue(Boolean(current.auto))
-                .onChange(value => { if (p.state.current?.id === current.id) p.setAuto(value); }));
             button(el,tr("Show sharing QR code","显示共享二维码"),() => this.showCode());
             button(el,tr("Back up vault key","备份库密钥"),() => this.showBackup());
         }

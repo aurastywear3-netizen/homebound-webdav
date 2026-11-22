@@ -9,6 +9,7 @@ const {seedSnapshot, checkJoin} = require("./personal.cjs");
 const {PendingUploads} = require("./pending.cjs");
 const {ConflictReview} = require("./review.cjs");
 const {HomeboundSettings} = require("./settings.cjs");
+const {VersionWatch} = require("./version.cjs");
 
 const tr = (en, zh) => getLanguage().startsWith("zh") ? zh : en;
 const stateKey = "homebound-personal-v2";
@@ -56,9 +57,16 @@ module.exports = class HomeboundPlugin extends Plugin {
         this.registerDomEvent(document, "visibilitychange", check);
         this.registerDomEvent(window, "online", check);
         this.registerInterval(window.setInterval(check, 300000));
+        this.registerInterval(window.setInterval(() => this.pollRemote(), 5000));
     }
 
     restoreStatus() {
+        this.watch = new VersionWatch();
+        this.pollError = "";
+        this.syncSerial = 0;
+        this.reviewed = new Map();
+        this.conflictVersions = new Map();
+        this.reviewModal?.close();
         this.uploads = new PendingUploads();
         const id = this.state.current?.id;
         this.status = (id && this.app.loadLocalStorage(stateKey + "-status-" + id)) || {};
@@ -85,13 +93,14 @@ module.exports = class HomeboundPlugin extends Plugin {
             for (const path of paths) this.uploads.candidates.add(path);
         }
         this.scheduleCount();
-        if (!this.state.current.auto) return;
         clearTimeout(this.editTimer);
         if (this.autoDue === "edit") this.autoDue = null;
         this.editTimer = setTimeout(() => {
             this.editTimer = null;
-            this.requestAuto(false);
-        }, 4000);
+            const check = this.autoDue === "check";
+            this.autoDue = null;
+            this.requestAuto(check);
+        }, 2000);
     }
     scheduleCount() {
         clearTimeout(this.countTimer);
@@ -111,11 +120,41 @@ module.exports = class HomeboundPlugin extends Plugin {
         if (uploads === this.uploads && !this.closed) this.settingsTab.refreshStatus();
     }
     autoEnabled() {
-        return !this.closed && this.state.current?.auto && !this.state.pending &&
+        return !this.closed && this.ready && this.state.current && !this.state.pending &&
             document.visibilityState === "visible";
+    }
+    async pollRemote() {
+        if (!this.autoEnabled() || this.busy || this.probing) return;
+        const c = this.state.current, watch = this.watch, serial = this.syncSerial;
+        const usable = () => this.autoEnabled() && this.watch === watch && this.syncSerial === serial && !this.busy && !this.editTimer;
+        this.probing = true;
+        try {
+            const dav = this.vaultDav(c,this.secret(c,"dav"));
+            const sample = await watch.read(dav);
+            if (!usable()) return;
+            if (this.pollError) {
+                this.pollError = "";
+                this.settingsTab.refreshStatus();
+            }
+            if (!watch.changed(sample)) return;
+            const names = await dav.list("commits");
+            if (!usable()) return;
+            const ids = new Set(names);
+            if (watch.accepted && ids.size === this.cache.size && [...ids].every(id => this.cache.has(id))) {
+                watch.accepted = sample;
+                return;
+            }
+            await this.run(null,true,{sample,names});
+        } catch (error) {
+            if (usable()) {
+                this.pollError = tr("Remote check failed: ","远端检查失败：") + error.message;
+                this.settingsTab.refreshStatus();
+            }
+        } finally { this.probing = false; }
     }
     async requestAuto(force) {
         if (!this.autoEnabled()) return;
+        if (force && this.editTimer) { this.autoDue = "check"; return; }
         if (this.busy) {
             if (force || !this.autoDue) this.autoDue = force ? "check" : "edit";
             return;
@@ -128,14 +167,6 @@ module.exports = class HomeboundPlugin extends Plugin {
             if (uploads.known && !uploads.files.size) return;
         }
         await this.run(null, true);
-    }
-    setAuto(value) {
-        if (!this.state.current || this.state.pending) return;
-        this.save({current:{...this.state.current,auto:value}});
-        clearTimeout(this.editTimer);
-        this.editTimer = null;
-        this.autoDue = null;
-        if (value) this.requestAuto(true);
     }
     save(state) {
         this.app.saveLocalStorage(stateKey, state);
@@ -164,8 +195,9 @@ module.exports = class HomeboundPlugin extends Plugin {
     checkpoint(id, data) { this.app.saveLocalStorage(baselineKey(id), Array.from(data)); }
     local() { return new VaultFiles(this.app); }
     dav(config, password) { return new Dav(config.address, credentials(config.username, password)); }
+    vaultDav(config, password) { return this.dav(config,password).child(config.folder).child(core.namespace); }
     async connect(config, password, material) {
-        const dav = this.dav(config, password).child(config.folder).child(core.namespace);
+        const dav = this.vaultDav(config,password);
         const header = core.parseBytes(await dav.read("vault.json"));
         const key = await core.unlock(header, material, config.id);
         return {store:new core.Store(dav, header.id, key, this.transfer), previous:header.previous};
@@ -211,7 +243,7 @@ module.exports = class HomeboundPlugin extends Plugin {
             if (this.conflicts?.length) throw Error("请先解决已发现的冲突，再用完整本地副本换钥。");
         }
         const password = this.passwordFor(target, enteredPassword);
-        const config = {...target, id:core.randomId(), secretId:core.randomId(), auto:false};
+        const config = {...target, id:core.randomId(), secretId:core.randomId(), auto:true};
         this.storeSecrets(config, core.generateKey(), password);
         this.save({...this.state, pending:config});
         return this.resumeSetup();
@@ -225,7 +257,7 @@ module.exports = class HomeboundPlugin extends Plugin {
         if (enteredPassword) this.storeSecrets(config, material, password);
         await core.createVault(this.dav(config,password), config.folder, material, config.id, previous);
         const {store} = await this.connect(config,password,material);
-        const baseline = await seedSnapshot(store, this.local(), () => !this.closed);
+        const baseline = await new VersionWatch().trackWrites(store, () => seedSnapshot(store, this.local(), () => !this.closed));
         this.checkpoint(config.id, baseline);
         this.activate(config);
         this.last = tr("Upload and readback verified.","已完成上传和读回校验。");
@@ -238,7 +270,7 @@ module.exports = class HomeboundPlugin extends Plugin {
         const target = location(fields);
         const password = this.passwordFor(target, fields.password);
         const current = this.state.current;
-        const config = {...target, id, secretId:core.randomId(), auto:Boolean(current?.id === id && current.auto)};
+        const config = {...target, id, secretId:core.randomId(), auto:true};
         const {store, previous} = await this.connect(config, password, material);
         if (current?.id !== id) {
             if (current && current.id !== previous) throw Error("当前本地库已绑定另一个库。请打开对应的独立本地库。");
@@ -271,12 +303,25 @@ module.exports = class HomeboundPlugin extends Plugin {
     }
     onunload() {
         this.closed = true;
+        this.reviewModal?.close();
         clearTimeout(this.editTimer);
         clearTimeout(this.countTimer);
         this.showTransfer(null);
     }
 
+    showNextConflict() {
+        if (!this.autoEnabled() || this.busy || this.openingReview || this.reviewModal) return;
+        for (const [path, version] of this.conflictVersions) {
+            if (this.reviewed.get(path) !== version) {
+                void this.openConflict(path);
+                return;
+            }
+        }
+    }
+
     async openConflict(path) {
+        if (this.closed || this.openingReview || this.reviewModal) return;
+        this.openingReview = true;
         try {
             const review = await this.exclusive(async () => {
                 const c = this.state.current;
@@ -293,26 +338,41 @@ module.exports = class HomeboundPlugin extends Plugin {
                 return {path, vaultId:c.id, heads, headIds:heads.map(r => r.id).sort(), bytes,
                     localHash:bytes === null ? null : await core.sha(bytes), readVersion};
             });
-            if (!this.closed) new ConflictReview(this.app, review, async source => {
+            if (this.closed || this.state.current?.id !== review.vaultId) return;
+            const modal = new ConflictReview(this.app, review, async (source,text,peerId) => {
                 if (this.state.current?.id !== review.vaultId || this.closed) throw Error(tr("Vault changed.","当前库已变化。"));
                 if (this.busy) throw Error(tr("Sync in progress. Try again.","正在同步，请稍后重试。"));
-                const selection = {path, headIds:review.headIds, localHash:review.localHash, source};
+                const selection = {path, headIds:review.headIds, localHash:review.localHash, source, text, peerId};
                 const result = await this.run(selection);
                 if (!result) throw Error(this.last);
-            }).open();
-        } catch (error) { new Notice(error.message); }
+            }, () => {
+                if (this.reviewModal === modal) this.reviewModal = null;
+                queueMicrotask(() => this.showNextConflict());
+            });
+            this.reviewModal = modal;
+            modal.open();
+            this.reviewed.set(path,review.headIds.join(","));
+        } catch (error) {
+            this.reviewModal = null;
+            if (!this.closed) new Notice(error.message);
+        } finally { this.openingReview = false; }
     }
 
-    async run(selection = null, quiet = false) {
+    async run(selection = null, quiet = false, probe = null) {
         if (typeof selection === "string") return this.openConflict(selection);
         if (this.closed || this.busy) return;
+        this.syncSerial++;
         try {
-            return await this.exclusive(async () => {
+            const result = await this.exclusive(async () => {
                 const c = this.state.current;
                 if (this.state.pending) throw Error("请先完成建库或换钥。");
                 if (!c) throw Error("请先创建或扫码加入笔记库。");
                 const {store} = await this.connect(c, this.secret(c,"dav"), this.secret(c,"key"));
                 const local = this.local();
+                // Sample before listing commits. A post-sync marker could acknowledge
+                // a concurrent revision that was never part of this sync.
+                const watch = this.watch;
+                const sample = probe?.sample ?? await watch.read(store.dav).catch(() => null);
                 let reconciled = 0;
                 if (c.joinedFrom) {
                     const updates = await checkJoin(store, local, this.baseline(c.joinedFrom));
@@ -327,28 +387,25 @@ module.exports = class HomeboundPlugin extends Plugin {
                     delete updated.joinedFrom;
                     this.save({current:updated});
                 }
-                const result = await core.synchronize({store, local, cache:this.cache, baseline:this.baseline(c.id),
-                    selection, active:() => !this.closed, checkpoint:data => this.checkpoint(c.id,data)});
+                const result = await watch.trackWrites(store, () => core.synchronize({store, local, cache:this.cache, baseline:this.baseline(c.id),
+                    selection, commitNames:probe?.names, active:() => !this.closed, checkpoint:data => this.checkpoint(c.id,data)}));
                 result.received += reconciled;
                 this.cache = result.history;
-                const newConflict = result.conflicts.some(path => !this.conflicts.includes(path));
+                watch.accepted = sample;
+                const heads = result.conflicts.length ? core.headsByPath(result.history) : new Map();
+                this.conflictVersions = new Map(result.conflicts.map(path => [path,heads.get(path).map(r => r.id).sort().join(",")]));
+                for (const path of this.reviewed.keys()) if (!this.conflictVersions.has(path)) this.reviewed.delete(path);
                 this.last = tr("Uploaded ","已上传 ") + result.sent + tr(" · received "," · 已接收 ") + result.received;
-                if (result.conflicts.length) this.last += "\n" + tr("Review conflicts in Homebound settings: ","请在 Homebound 设置中比较冲突：") + result.conflicts.length;
+                this.pollError = "";
+                if (result.conflicts.length) this.last += "\n" + tr("Unresolved conflicts: ","待处理冲突：") + result.conflicts.length;
                 this.recordSuccess(result.conflicts);
-                if (!quiet || newConflict) {
-                    if (result.conflicts.length) {
-                        const message = document.createDocumentFragment();
-                        message.append(this.last + " ");
-                        const compare = document.createElement("button");
-                        compare.textContent = tr("Compare conflict","比较冲突");
-                        compare.addEventListener("click", () => this.openConflict(result.conflicts[0]));
-                        message.append(compare);
-                        new Notice(message, 9000);
-                    } else new Notice(this.last, 9000);
-                }
+                if (!quiet && !result.conflicts.length) new Notice(this.last, 9000);
                 return result;
             });
+            this.showNextConflict();
+            return result;
         } catch (e) {
+            this.watch.accepted = null;
             this.last = tr("Sync stopped: ","同步已停止：") + e.message;
             this.settingsTab.refreshStatus();
             if (!quiet) new Notice(this.last, 10000);

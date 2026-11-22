@@ -352,6 +352,7 @@ var require_core = __commonJS({
         if (staged) Object.assign(rev, { parts: staged.parts, key: staged.key });
         await this.writeObject("r-" + id, jsonBytes(rev));
         await this.dav.mkdir("commits/" + id);
+        this.lastPublished = id;
         if (staged) await this.transfer.uploaded(scope, path);
         return rev;
       }
@@ -367,8 +368,8 @@ var require_core = __commonJS({
         if (await sha(bytes) !== rev.hash) throw Error("File integrity check failed: " + rev.path);
         return bytes;
       }
-      async history(cache) {
-        const names = await this.dav.list("commits");
+      async history(cache, names) {
+        names ??= await this.dav.list("commits");
         const visible = new Set(names);
         for (const id of cache.keys()) {
           if (!visible.has(id)) throw Error("Previously seen history is missing from this server.");
@@ -414,8 +415,8 @@ var require_core = __commonJS({
         }
       }
     }
-    async function synchronize({ store, local, baseline, cache, checkpoint, resolve, selection, active = () => true }) {
-      const history = await store.history(cache);
+    async function synchronize({ store, local, baseline, cache, checkpoint, resolve, selection, commitNames, active = () => true }) {
+      const history = await store.history(cache, commitNames);
       const groups = headsByPath(history);
       if (selection && !groups.has(selection.path)) throw Error("\u51B2\u7A81\u7248\u672C\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u540C\u6B65\u5E76\u6BD4\u8F83\u3002");
       const localPaths = local.paths();
@@ -475,21 +476,42 @@ var require_core = __commonJS({
             conflicts.push(path);
             continue;
           }
-          let chosen = bytes;
-          if (reviewing && selection.source !== "local") {
+          let chosen = bytes, parents = heads;
+          if (reviewing && selection.source === "merge") {
+            if (typeof selection.text !== "string") throw Error("\u7F3A\u5C11\u5408\u5E76\u6B63\u6587\u3002");
+            const peer = heads.find((rev2) => rev2.id === selection.peerId);
+            if (!peer) throw Error("\u6240\u9009\u526F\u672C\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u6BD4\u8F83\u3002");
+            parents = heads.filter((rev2) => rev2.hash === hash || rev2.hash === peer.hash);
+            chosen = encoder.encode(selection.text).buffer;
+          } else if (reviewing && selection.source !== "local") {
             const source = heads.find((rev2) => rev2.id === selection.source);
             if (!source) throw Error("\u6240\u9009\u526F\u672C\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u6BD4\u8F83\u3002");
             if (source.hash !== hash) {
               chosen = source.hash === null ? null : await store.readBody(source);
-              await local.apply(path, hash, chosen);
-              hash = source.hash;
             }
           }
+          if (reviewing) {
+            const current = await local.read(path);
+            if ((current === null ? null : await sha(current)) !== selection.localHash)
+              throw Error("\u6BD4\u8F83\u671F\u95F4\u6B63\u6587\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u6BD4\u8F83\u3002");
+          }
           if (!active()) throw Error("Sync stopped.");
-          const rev = await store.publish(path, heads.map((r) => r.id), chosen);
+          const parentIds = parents.map((r) => r.id);
+          const rev = await store.publish(path, parentIds, chosen);
+          if (rev.hash !== hash) {
+            if (!active()) throw Error("Sync stopped.");
+            await local.apply(path, hash, chosen);
+            hash = rev.hash;
+          }
           history.set(rev.id, rev);
-          heads = [rev];
+          heads = [rev, ...heads.filter((head) => !parentIds.includes(head.id))];
           sent++;
+          if (heads.some((head) => head.hash !== hash)) {
+            baseline.set(path, { ids: heads.filter((head) => head.hash === hash).map((head) => head.id).sort(), hash });
+            checkpoint(baseline);
+            conflicts.push(path);
+            continue;
+          }
         }
         if (!heads.length) continue;
         const target = heads[0];
@@ -12365,6 +12387,7 @@ var require_adapter = __commonJS({
     var core2 = require_core();
     var tr2 = (en, zh) => getLanguage2().startsWith("zh") ? zh : en;
     var paused = () => new Error(tr2("File changed during sync. Run sync again.", "\u6587\u4EF6\u5728\u540C\u6B65\u671F\u95F4\u53D1\u751F\u53D8\u5316\uFF0C\u8BF7\u518D\u540C\u6B65\u4E00\u6B21\u3002"));
+    var pathSegments = (pathname) => pathname.replace(/\/+$/, "").split("/").map((x) => decodeURIComponent(x).normalize("NFC"));
     var Dav2 = class _Dav {
       constructor(root, authorization) {
         this.root = root;
@@ -12400,6 +12423,34 @@ var require_adapter = __commonJS({
       async mkdir(path) {
         await this.call("MKCOL", path, [201]);
       }
+      async collectionMarker() {
+        const result = await this.call("PROPFIND", "commits", [207, 405, 501], {
+          headers: { Depth: "0", "Cache-Control": "no-cache" },
+          contentType: "application/xml; charset=utf-8",
+          body: '<d:propfind xmlns:d="DAV:"><d:prop><d:sync-token/><d:getetag/><d:getlastmodified/></d:prop></d:propfind>'
+        });
+        if (result.status !== 207) return null;
+        const xml = new DOMParser().parseFromString(result.text, "application/xml");
+        const responses = xml.getElementsByTagNameNS("DAV:", "response");
+        if (xml.documentElement.namespaceURI !== "DAV:" || xml.documentElement.localName !== "multistatus" || responses.length !== 1)
+          throw Error("Invalid WebDAV version response.");
+        const expected = new URL(this.child("commits").root);
+        const href = responses[0].getElementsByTagNameNS("DAV:", "href")[0]?.textContent;
+        if (!href || JSON.stringify(pathSegments(new URL(href, expected.href + "/").pathname)) !== JSON.stringify(pathSegments(expected.pathname)))
+          throw Error("Unexpected WebDAV version path.");
+        const props = /* @__PURE__ */ new Map();
+        for (const group of responses[0].getElementsByTagNameNS("DAV:", "propstat")) {
+          const status = group.getElementsByTagNameNS("DAV:", "status")[0]?.textContent.trim();
+          if (!/^HTTP\/\S+ 200\b/.test(status)) continue;
+          for (const prop of group.getElementsByTagNameNS("DAV:", "prop")[0]?.children || []) {
+            if (prop.namespaceURI === "DAV:" && prop.textContent.trim()) props.set(prop.localName, prop.textContent.trim());
+          }
+        }
+        if (props.has("sync-token")) return { tag: "sync:" + props.get("sync-token") };
+        const etag = props.get("getetag"), modified = props.get("getlastmodified");
+        if (etag || modified) return { tag: JSON.stringify([etag, modified]), coarse: true };
+        return null;
+      }
       async list(path = "") {
         const result = await this.call("PROPFIND", path, [207], {
           headers: { Depth: "1" },
@@ -12412,15 +12463,14 @@ var require_adapter = __commonJS({
           throw Error("Invalid WebDAV directory response.");
         }
         const url = new URL(path ? this.child(path).root : this.root);
-        const segments = (pathname) => pathname.replace(/\/+$/, "").split("/").map((x) => decodeURIComponent(x).normalize("NFC"));
-        const base = segments(url.pathname);
+        const base = pathSegments(url.pathname);
         let self2 = false;
         const names = [];
         for (const entry of docs(xml, "response")) {
           const href = docs(entry, "href")[0]?.textContent;
           const successful = docs(entry, "status").some((s) => /^HTTP\/\S+ 2\d\d\b/i.test(s.textContent.trim()));
           if (!href || !successful) throw Error("Incomplete WebDAV directory response.");
-          const item = segments(new URL(href, url.href.replace(/\/+$/, "") + "/").pathname);
+          const item = pathSegments(new URL(href, url.href.replace(/\/+$/, "") + "/").pathname);
           if (!base.every((part, i) => part === item[i])) throw Error("WebDAV returned an unexpected directory.");
           if (item.length === base.length) {
             self2 = true;
@@ -12902,6 +12952,28 @@ var require_diff = __commonJS({
       }
       return result;
     }
+    function mergeParts(left, right) {
+      const parts = [];
+      for (const { kind, text } of lineDiff(left, right)) {
+        let part = parts[parts.length - 1];
+        const changed = kind !== "same";
+        if (!part || part.changed !== changed) {
+          part = { changed, local: "", selected: "", choice: "local" };
+          parts.push(part);
+        }
+        if (kind !== "add") part.local += text;
+        if (kind === "add") part.selected += text;
+      }
+      return parts;
+    }
+    function mergedText(parts) {
+      return parts.map((part) => {
+        if (!part.changed || part.choice === "local") return part.local;
+        if (part.choice === "selected") return part.selected;
+        const join = part.local && part.selected && !part.local.endsWith("\n") ? part.local.includes("\r\n") || part.selected.includes("\r\n") ? "\r\n" : "\n" : "";
+        return part.local + join + part.selected;
+      }).join("");
+    }
     function textWindow(buffer, offset) {
       const bytes = new Uint8Array(buffer);
       const limit = Math.min(offset + 65536, bytes.length);
@@ -12917,7 +12989,7 @@ var require_diff = __commonJS({
       if (end === offset && limit > offset) end = limit;
       return { slice: bytes.subarray(offset, end), end };
     }
-    module2.exports = { lineDiff, contextRows, textWindow };
+    module2.exports = { lineDiff, contextRows, textWindow, mergeParts, mergedText };
   }
 });
 
@@ -12926,14 +12998,14 @@ var require_review = __commonJS({
   "src/review.cjs"(exports2, module2) {
     "use strict";
     var { Modal, Setting, getLanguage: getLanguage2 } = require("obsidian");
-    var { lineDiff, contextRows, textWindow } = require_diff();
+    var { lineDiff, contextRows, textWindow, mergeParts, mergedText } = require_diff();
     var tr2 = (en, zh) => getLanguage2().startsWith("zh") ? zh : en;
     var previewLimit = 256 * 1024;
     function asText(bytes) {
       if (bytes === null) return "";
       try {
         const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
-        return /[\u0000-\u0008\u000e-\u001f]/.test(text) ? null : text;
+        return /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text) ? null : text;
       } catch {
         return null;
       }
@@ -12980,10 +13052,11 @@ var require_review = __commonJS({
       show(0);
     }
     var ConflictReview2 = class extends Modal {
-      constructor(app, review, submit) {
+      constructor(app, review, submit, closed) {
         super(app);
         this.review = review;
         this.submit = submit;
+        this.closed = closed;
         this.generation = 0;
       }
       onOpen() {
@@ -13003,7 +13076,7 @@ var require_review = __commonJS({
         });
         this.body = el.createDiv();
         this.message = el.createDiv({ attr: { role: "status" } });
-        new Setting(el).addButton((b) => b.setButtonText(tr2("Close", "\u5173\u95ED")).onClick(() => this.close())).addButton((b) => {
+        this.actions = new Setting(el).addButton((b) => b.setButtonText(tr2("Close", "\u5173\u95ED")).onClick(() => this.close())).addButton((b) => {
           this.localButton = b.setButtonText(bytes === null ? tr2("Keep local deletion", "\u4FDD\u7559\u672C\u673A\u5220\u9664") : tr2("Keep local file", "\u4FDD\u7559\u672C\u673A\u6587\u4EF6")).onClick(() => this.choose("local"));
         }).addButton((b) => {
           this.remoteButton = b.setCta().onClick(() => this.choose(this.selected.id));
@@ -13041,7 +13114,11 @@ var require_review = __commonJS({
                 b.setDisabled(true);
                 try {
                   const data = rev.parts ? await readVersion(rev) : remote;
-                  if (generation === this.generation) drawWindows(section, bytes, data);
+                  if (generation === this.generation) {
+                    drawWindows(section, bytes, data);
+                    const a = asText(bytes), b2 = asText(data);
+                    if (a !== null && b2 !== null) this.offerMerge(a, b2);
+                  }
                 } catch (error) {
                   if (generation === this.generation) {
                     this.message.setText(error.message);
@@ -13053,6 +13130,7 @@ var require_review = __commonJS({
               this.body.createEl("p", { text: tr2("Compare file sizes and SHA-256 above.", "\u53EF\u901A\u8FC7\u4E0A\u65B9\u7684\u5927\u5C0F\u548C SHA-256 \u6BD4\u8F83\u6587\u4EF6\u3002") });
             } else {
               drawText(this.body, left, right);
+              this.offerMerge(left, right);
               if (bytes !== null && remote !== null && left.endsWith("\n") !== right.endsWith("\n")) {
                 this.body.createEl("p", { text: left.endsWith("\n") ? tr2("Only the local file ends with a newline.", "\u4EC5\u672C\u673A\u6587\u4EF6\u4EE5\u6362\u884C\u7ED3\u675F\u3002") : tr2("Only the selected file ends with a newline.", "\u4EC5\u6240\u9009\u7248\u672C\u4EE5\u6362\u884C\u7ED3\u675F\u3002") });
               }
@@ -13065,21 +13143,88 @@ var require_review = __commonJS({
           if (generation === this.generation) this.message.setText(error.message);
         }
       }
-      async choose(source) {
+      offerMerge(left, right) {
+        new Setting(this.body).addButton((b) => b.setButtonText(tr2("Merge text\u2026", "\u5408\u5E76\u6587\u672C\u2026")).onClick(() => this.startMerge(left, right)));
+      }
+      startMerge(left, right) {
+        const parts = mergeParts(left, right), changes = parts.filter((part) => part.changed);
+        this.picker.setDisabled(true);
+        this.actions.settingEl.hidden = true;
+        this.body.empty();
+        const pane = this.body.createDiv();
+        if (this.review.heads.some((rev) => rev.hash !== this.review.localHash && rev.hash !== this.selected.hash)) {
+          this.body.createEl("p", { text: tr2("After saving, compare the merged file with the remaining versions.", "\u4FDD\u5B58\u540E\u5C06\u7EE7\u7EED\u6BD4\u8F83\u5408\u5E76\u7ED3\u679C\u4E0E\u5176\u4F59\u7248\u672C\u3002") });
+        }
+        const reviewAgain = () => {
+          if (this.submitting) return;
+          this.actions.settingEl.hidden = false;
+          this.picker.setDisabled(false);
+          this.preview(this.selected);
+        };
+        new Setting(this.body).addButton((b) => b.setButtonText(tr2("Discard draft and return", "\u653E\u5F03\u8349\u7A3F\u5E76\u8FD4\u56DE\u6BD4\u8F83")).onClick(reviewAgain));
+        const edit = () => {
+          pane.empty();
+          const draft = mergedText(parts);
+          const label = pane.createEl("label", { text: tr2("Merged text", "\u5408\u5E76\u540E\u7684\u6B63\u6587") });
+          const input = label.createEl("textarea", { cls: "homebound-merge-text" });
+          input.value = draft;
+          const initial = input.value;
+          new Setting(pane).addButton((b) => b.setCta().setButtonText(tr2("Save merged file", "\u4FDD\u5B58\u5408\u5E76\u6587\u4EF6")).onClick(async () => {
+            b.setDisabled(true);
+            let text = draft;
+            if (input.value !== initial) {
+              const crlf = draft.includes("\r\n") && !/(^|[^\r])\n/.test(draft);
+              text = crlf ? input.value.replace(/\n/g, "\r\n") : input.value;
+            }
+            input.readOnly = true;
+            await this.choose("merge", text);
+            input.readOnly = false;
+            b.setDisabled(false);
+          }));
+        };
+        const show = (index) => {
+          pane.empty();
+          const part = changes[index];
+          const controls = new Setting(pane).setName(tr2("Change ", "\u5DEE\u5F02 ") + (index + 1) + " / " + changes.length);
+          controls.addButton((b) => b.setButtonText(tr2("Previous", "\u4E0A\u4E00\u5904")).setDisabled(index === 0).onClick(() => show(index - 1)));
+          controls.addButton((b) => b.setButtonText(tr2("Next", "\u4E0B\u4E00\u5904")).setDisabled(index + 1 === changes.length).onClick(() => show(index + 1)));
+          if (part.local.length + part.selected.length > previewLimit) {
+            const encoder = new TextEncoder();
+            drawWindows(pane.createDiv(), encoder.encode(part.local), encoder.encode(part.selected));
+          } else drawText(pane, part.local, part.selected);
+          new Setting(pane).setName(tr2("Include in merge", "\u5408\u5E76\u65F6\u91C7\u7528")).addDropdown((d) => d.addOption("local", tr2("Local", "\u672C\u673A")).addOption("selected", tr2("Selected version", "\u6240\u9009\u7248\u672C")).addOption("both", tr2("Both (local first)", "\u4E24\u8005\u90FD\u4FDD\u7559\uFF08\u672C\u673A\u5728\u524D\uFF09")).setValue(part.choice).onChange((value) => {
+            part.choice = value;
+          }));
+          new Setting(pane).addButton((b) => b.setCta().setButtonText(tr2("Review and edit result", "\u9884\u89C8\u5E76\u7F16\u8F91\u5408\u5E76\u7ED3\u679C")).onClick(edit));
+        };
+        if (changes.length) show(0);
+        else edit();
+      }
+      async choose(source, text) {
+        if (this.submitting) return;
+        this.submitting = true;
         this.localButton.setDisabled(true);
         this.remoteButton.setDisabled(true);
         this.picker.setDisabled(true);
         this.message.setText(tr2("Resolving\u2026", "\u6B63\u5728\u63D0\u4EA4\u2026"));
         try {
-          await this.submit(source);
+          await this.submit(source, text, this.selected.id);
           this.close();
         } catch (e) {
-          this.message.setText(e.message + " " + tr2("Close and compare again.", "\u8BF7\u5173\u95ED\u7A97\u53E3\u540E\u91CD\u65B0\u6BD4\u8F83\u3002"));
+          this.message.setText(e.message);
+          if (source !== "merge") {
+            this.localButton.setDisabled(false);
+            this.remoteButton.setDisabled(false);
+            this.picker.setDisabled(false);
+          }
+        } finally {
+          this.submitting = false;
         }
       }
       onClose() {
         this.generation++;
         this.contentEl.empty();
+        this.closed?.();
       }
     };
     module2.exports = { ConflictReview: ConflictReview2 };
@@ -13281,7 +13426,7 @@ var require_settings = __commonJS({
         const unknown = p.uploads.failed ? tr2("Unavailable", "\u6682\u65F6\u65E0\u6CD5\u7EDF\u8BA1") : tr2("Checking\u2026", "\u6838\u5BF9\u4E2D\u2026");
         this.countEl.setText(p.uploads.known ? String(p.uploads.files.size) : unknown);
         this.conflictEl.setText(p.status.conflicts ? p.conflicts.length ? String(p.conflicts.length) : tr2("None", "\u65E0\u51B2\u7A81") : tr2("Awaiting first check", "\u5F85\u9996\u6B21\u68C0\u67E5"));
-        this.resultEl.setText(p.last || "");
+        this.resultEl.setText(p.pollError || p.last || "");
         if (this.listedConflicts === p.conflicts) return;
         this.listedConflicts = p.conflicts;
         this.conflictList.empty();
@@ -13343,9 +13488,6 @@ var require_settings = __commonJS({
         if (current) {
           el.createEl("p", { text: current.address + "/" + current.folder + " \xB7 " + current.username });
           button(el, tr2("Sync now", "\u7ACB\u5373\u540C\u6B65"), () => p.run());
-          new Setting(el).setName(tr2("Sync while open", "\u6253\u5F00\u671F\u95F4\u81EA\u52A8\u540C\u6B65")).addToggle((t) => t.setValue(Boolean(current.auto)).onChange((value) => {
-            if (p.state.current?.id === current.id) p.setAuto(value);
-          }));
           button(el, tr2("Show sharing QR code", "\u663E\u793A\u5171\u4EAB\u4E8C\u7EF4\u7801"), () => this.showCode());
           button(el, tr2("Back up vault key", "\u5907\u4EFD\u5E93\u5BC6\u94A5"), () => this.showBackup());
         }
@@ -13398,6 +13540,50 @@ var require_settings = __commonJS({
   }
 });
 
+// src/version.cjs
+var require_version = __commonJS({
+  "src/version.cjs"(exports2, module2) {
+    "use strict";
+    var VersionWatch2 = class {
+      async read(dav) {
+        if (this.mode !== "file") {
+          const marker = await dav.collectionMarker();
+          if (marker) {
+            this.mode = "collection";
+            if (marker.tag !== this.observed) {
+              this.observed = marker.tag;
+              this.observedAt = Date.now();
+            }
+            return { tag: marker.tag, provisional: marker.coarse && Date.now() - this.observedAt < 2e3 };
+          }
+          this.mode = "file";
+        }
+        const response = await dav.call("GET", "version", [200, 404], { headers: { "Cache-Control": "no-cache" } });
+        if (response.status === 404) return { tag: "file:missing" };
+        if (!/^[a-f0-9]{32}$/.test(response.text)) throw Error("Invalid WebDAV version marker.");
+        return { tag: "file:" + response.text };
+      }
+      changed(sample) {
+        return sample.tag !== this.accepted?.tag || this.accepted.provisional && !sample.provisional;
+      }
+      async trackWrites(store, action) {
+        const previous = store.lastPublished;
+        try {
+          return await action();
+        } finally {
+          if (store.lastPublished && store.lastPublished !== previous && this.mode !== "collection") {
+            try {
+              await store.dav.put("version", new TextEncoder().encode(store.lastPublished).buffer);
+            } catch {
+            }
+          }
+        }
+      }
+    };
+    module2.exports = { VersionWatch: VersionWatch2 };
+  }
+});
+
 // src/plugin.cjs
 var { Plugin, Notice, getLanguage } = require("obsidian");
 var core = require_core();
@@ -13408,6 +13594,7 @@ var { seedSnapshot, checkJoin } = require_personal();
 var { PendingUploads } = require_pending();
 var { ConflictReview } = require_review();
 var { HomeboundSettings } = require_settings();
+var { VersionWatch } = require_version();
 var tr = (en, zh) => getLanguage().startsWith("zh") ? zh : en;
 var stateKey = "homebound-personal-v2";
 var baselineKey = (id) => stateKey + "-baseline-" + id;
@@ -13453,8 +13640,15 @@ module.exports = class HomeboundPlugin extends Plugin {
     this.registerDomEvent(document, "visibilitychange", check);
     this.registerDomEvent(window, "online", check);
     this.registerInterval(window.setInterval(check, 3e5));
+    this.registerInterval(window.setInterval(() => this.pollRemote(), 5e3));
   }
   restoreStatus() {
+    this.watch = new VersionWatch();
+    this.pollError = "";
+    this.syncSerial = 0;
+    this.reviewed = /* @__PURE__ */ new Map();
+    this.conflictVersions = /* @__PURE__ */ new Map();
+    this.reviewModal?.close();
     this.uploads = new PendingUploads();
     const id = this.state.current?.id;
     this.status = id && this.app.loadLocalStorage(stateKey + "-status-" + id) || {};
@@ -13481,13 +13675,14 @@ module.exports = class HomeboundPlugin extends Plugin {
       for (const path of paths) this.uploads.candidates.add(path);
     }
     this.scheduleCount();
-    if (!this.state.current.auto) return;
     clearTimeout(this.editTimer);
     if (this.autoDue === "edit") this.autoDue = null;
     this.editTimer = setTimeout(() => {
       this.editTimer = null;
-      this.requestAuto(false);
-    }, 4e3);
+      const check = this.autoDue === "check";
+      this.autoDue = null;
+      this.requestAuto(check);
+    }, 2e3);
   }
   scheduleCount() {
     clearTimeout(this.countTimer);
@@ -13506,10 +13701,45 @@ module.exports = class HomeboundPlugin extends Plugin {
     if (uploads === this.uploads && !this.closed) this.settingsTab.refreshStatus();
   }
   autoEnabled() {
-    return !this.closed && this.state.current?.auto && !this.state.pending && document.visibilityState === "visible";
+    return !this.closed && this.ready && this.state.current && !this.state.pending && document.visibilityState === "visible";
+  }
+  async pollRemote() {
+    if (!this.autoEnabled() || this.busy || this.probing) return;
+    const c = this.state.current, watch = this.watch, serial = this.syncSerial;
+    const usable = () => this.autoEnabled() && this.watch === watch && this.syncSerial === serial && !this.busy && !this.editTimer;
+    this.probing = true;
+    try {
+      const dav = this.vaultDav(c, this.secret(c, "dav"));
+      const sample = await watch.read(dav);
+      if (!usable()) return;
+      if (this.pollError) {
+        this.pollError = "";
+        this.settingsTab.refreshStatus();
+      }
+      if (!watch.changed(sample)) return;
+      const names = await dav.list("commits");
+      if (!usable()) return;
+      const ids = new Set(names);
+      if (watch.accepted && ids.size === this.cache.size && [...ids].every((id) => this.cache.has(id))) {
+        watch.accepted = sample;
+        return;
+      }
+      await this.run(null, true, { sample, names });
+    } catch (error) {
+      if (usable()) {
+        this.pollError = tr("Remote check failed: ", "\u8FDC\u7AEF\u68C0\u67E5\u5931\u8D25\uFF1A") + error.message;
+        this.settingsTab.refreshStatus();
+      }
+    } finally {
+      this.probing = false;
+    }
   }
   async requestAuto(force) {
     if (!this.autoEnabled()) return;
+    if (force && this.editTimer) {
+      this.autoDue = "check";
+      return;
+    }
     if (this.busy) {
       if (force || !this.autoDue) this.autoDue = force ? "check" : "edit";
       return;
@@ -13525,14 +13755,6 @@ module.exports = class HomeboundPlugin extends Plugin {
       if (uploads.known && !uploads.files.size) return;
     }
     await this.run(null, true);
-  }
-  setAuto(value) {
-    if (!this.state.current || this.state.pending) return;
-    this.save({ current: { ...this.state.current, auto: value } });
-    clearTimeout(this.editTimer);
-    this.editTimer = null;
-    this.autoDue = null;
-    if (value) this.requestAuto(true);
   }
   save(state) {
     this.app.saveLocalStorage(stateKey, state);
@@ -13569,8 +13791,11 @@ module.exports = class HomeboundPlugin extends Plugin {
   dav(config, password) {
     return new Dav(config.address, credentials(config.username, password));
   }
+  vaultDav(config, password) {
+    return this.dav(config, password).child(config.folder).child(core.namespace);
+  }
   async connect(config, password, material) {
-    const dav = this.dav(config, password).child(config.folder).child(core.namespace);
+    const dav = this.vaultDav(config, password);
     const header = core.parseBytes(await dav.read("vault.json"));
     const key = await core.unlock(header, material, config.id);
     return { store: new core.Store(dav, header.id, key, this.transfer), previous: header.previous };
@@ -13616,7 +13841,7 @@ module.exports = class HomeboundPlugin extends Plugin {
       if (this.conflicts?.length) throw Error("\u8BF7\u5148\u89E3\u51B3\u5DF2\u53D1\u73B0\u7684\u51B2\u7A81\uFF0C\u518D\u7528\u5B8C\u6574\u672C\u5730\u526F\u672C\u6362\u94A5\u3002");
     }
     const password = this.passwordFor(target, enteredPassword);
-    const config = { ...target, id: core.randomId(), secretId: core.randomId(), auto: false };
+    const config = { ...target, id: core.randomId(), secretId: core.randomId(), auto: true };
     this.storeSecrets(config, core.generateKey(), password);
     this.save({ ...this.state, pending: config });
     return this.resumeSetup();
@@ -13630,7 +13855,7 @@ module.exports = class HomeboundPlugin extends Plugin {
     if (enteredPassword) this.storeSecrets(config, material, password);
     await core.createVault(this.dav(config, password), config.folder, material, config.id, previous);
     const { store } = await this.connect(config, password, material);
-    const baseline = await seedSnapshot(store, this.local(), () => !this.closed);
+    const baseline = await new VersionWatch().trackWrites(store, () => seedSnapshot(store, this.local(), () => !this.closed));
     this.checkpoint(config.id, baseline);
     this.activate(config);
     this.last = tr("Upload and readback verified.", "\u5DF2\u5B8C\u6210\u4E0A\u4F20\u548C\u8BFB\u56DE\u6821\u9A8C\u3002");
@@ -13643,7 +13868,7 @@ module.exports = class HomeboundPlugin extends Plugin {
     const target = location(fields);
     const password = this.passwordFor(target, fields.password);
     const current = this.state.current;
-    const config = { ...target, id, secretId: core.randomId(), auto: Boolean(current?.id === id && current.auto) };
+    const config = { ...target, id, secretId: core.randomId(), auto: true };
     const { store, previous } = await this.connect(config, password, material);
     if (current?.id !== id) {
       if (current && current.id !== previous) throw Error("\u5F53\u524D\u672C\u5730\u5E93\u5DF2\u7ED1\u5B9A\u53E6\u4E00\u4E2A\u5E93\u3002\u8BF7\u6253\u5F00\u5BF9\u5E94\u7684\u72EC\u7ACB\u672C\u5730\u5E93\u3002");
@@ -13674,11 +13899,23 @@ module.exports = class HomeboundPlugin extends Plugin {
   }
   onunload() {
     this.closed = true;
+    this.reviewModal?.close();
     clearTimeout(this.editTimer);
     clearTimeout(this.countTimer);
     this.showTransfer(null);
   }
+  showNextConflict() {
+    if (!this.autoEnabled() || this.busy || this.openingReview || this.reviewModal) return;
+    for (const [path, version] of this.conflictVersions) {
+      if (this.reviewed.get(path) !== version) {
+        void this.openConflict(path);
+        return;
+      }
+    }
+  }
   async openConflict(path) {
+    if (this.closed || this.openingReview || this.reviewModal) return;
+    this.openingReview = true;
     try {
       const review = await this.exclusive(async () => {
         const c = this.state.current;
@@ -13702,27 +13939,40 @@ module.exports = class HomeboundPlugin extends Plugin {
           readVersion
         };
       });
-      if (!this.closed) new ConflictReview(this.app, review, async (source) => {
+      if (this.closed || this.state.current?.id !== review.vaultId) return;
+      const modal = new ConflictReview(this.app, review, async (source, text, peerId) => {
         if (this.state.current?.id !== review.vaultId || this.closed) throw Error(tr("Vault changed.", "\u5F53\u524D\u5E93\u5DF2\u53D8\u5316\u3002"));
         if (this.busy) throw Error(tr("Sync in progress. Try again.", "\u6B63\u5728\u540C\u6B65\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002"));
-        const selection = { path, headIds: review.headIds, localHash: review.localHash, source };
+        const selection = { path, headIds: review.headIds, localHash: review.localHash, source, text, peerId };
         const result = await this.run(selection);
         if (!result) throw Error(this.last);
-      }).open();
+      }, () => {
+        if (this.reviewModal === modal) this.reviewModal = null;
+        queueMicrotask(() => this.showNextConflict());
+      });
+      this.reviewModal = modal;
+      modal.open();
+      this.reviewed.set(path, review.headIds.join(","));
     } catch (error) {
-      new Notice(error.message);
+      this.reviewModal = null;
+      if (!this.closed) new Notice(error.message);
+    } finally {
+      this.openingReview = false;
     }
   }
-  async run(selection = null, quiet = false) {
+  async run(selection = null, quiet = false, probe = null) {
     if (typeof selection === "string") return this.openConflict(selection);
     if (this.closed || this.busy) return;
+    this.syncSerial++;
     try {
-      return await this.exclusive(async () => {
+      const result = await this.exclusive(async () => {
         const c = this.state.current;
         if (this.state.pending) throw Error("\u8BF7\u5148\u5B8C\u6210\u5EFA\u5E93\u6216\u6362\u94A5\u3002");
         if (!c) throw Error("\u8BF7\u5148\u521B\u5EFA\u6216\u626B\u7801\u52A0\u5165\u7B14\u8BB0\u5E93\u3002");
         const { store } = await this.connect(c, this.secret(c, "dav"), this.secret(c, "key"));
         const local = this.local();
+        const watch = this.watch;
+        const sample = probe?.sample ?? await watch.read(store.dav).catch(() => null);
         let reconciled = 0;
         if (c.joinedFrom) {
           const updates = await checkJoin(store, local, this.baseline(c.joinedFrom));
@@ -13736,35 +13986,33 @@ module.exports = class HomeboundPlugin extends Plugin {
           delete updated.joinedFrom;
           this.save({ current: updated });
         }
-        const result = await core.synchronize({
+        const result2 = await watch.trackWrites(store, () => core.synchronize({
           store,
           local,
           cache: this.cache,
           baseline: this.baseline(c.id),
           selection,
+          commitNames: probe?.names,
           active: () => !this.closed,
           checkpoint: (data) => this.checkpoint(c.id, data)
-        });
-        result.received += reconciled;
-        this.cache = result.history;
-        const newConflict = result.conflicts.some((path) => !this.conflicts.includes(path));
-        this.last = tr("Uploaded ", "\u5DF2\u4E0A\u4F20 ") + result.sent + tr(" \xB7 received ", " \xB7 \u5DF2\u63A5\u6536 ") + result.received;
-        if (result.conflicts.length) this.last += "\n" + tr("Review conflicts in Homebound settings: ", "\u8BF7\u5728 Homebound \u8BBE\u7F6E\u4E2D\u6BD4\u8F83\u51B2\u7A81\uFF1A") + result.conflicts.length;
-        this.recordSuccess(result.conflicts);
-        if (!quiet || newConflict) {
-          if (result.conflicts.length) {
-            const message = document.createDocumentFragment();
-            message.append(this.last + " ");
-            const compare = document.createElement("button");
-            compare.textContent = tr("Compare conflict", "\u6BD4\u8F83\u51B2\u7A81");
-            compare.addEventListener("click", () => this.openConflict(result.conflicts[0]));
-            message.append(compare);
-            new Notice(message, 9e3);
-          } else new Notice(this.last, 9e3);
-        }
-        return result;
+        }));
+        result2.received += reconciled;
+        this.cache = result2.history;
+        watch.accepted = sample;
+        const heads = result2.conflicts.length ? core.headsByPath(result2.history) : /* @__PURE__ */ new Map();
+        this.conflictVersions = new Map(result2.conflicts.map((path) => [path, heads.get(path).map((r) => r.id).sort().join(",")]));
+        for (const path of this.reviewed.keys()) if (!this.conflictVersions.has(path)) this.reviewed.delete(path);
+        this.last = tr("Uploaded ", "\u5DF2\u4E0A\u4F20 ") + result2.sent + tr(" \xB7 received ", " \xB7 \u5DF2\u63A5\u6536 ") + result2.received;
+        this.pollError = "";
+        if (result2.conflicts.length) this.last += "\n" + tr("Unresolved conflicts: ", "\u5F85\u5904\u7406\u51B2\u7A81\uFF1A") + result2.conflicts.length;
+        this.recordSuccess(result2.conflicts);
+        if (!quiet && !result2.conflicts.length) new Notice(this.last, 9e3);
+        return result2;
       });
+      this.showNextConflict();
+      return result;
     } catch (e) {
+      this.watch.accepted = null;
       this.last = tr("Sync stopped: ", "\u540C\u6B65\u5DF2\u505C\u6B62\uFF1A") + e.message;
       this.settingsTab.refreshStatus();
       if (!quiet) new Notice(this.last, 1e4);

@@ -1,4 +1,4 @@
-# Homebound WebDAV 0.3.1
+# Homebound WebDAV 0.3.2
 
 Homebound WebDAV syncs encrypted notes and attachments between your Obsidian devices using an HTTPS WebDAV server you control. Each vault has its own folder and encryption key.
 
@@ -17,15 +17,15 @@ Open **Settings → Community plugins → Browse** in Obsidian 1.11.4 or later. 
 1. On your first device, open **Settings → Homebound WebDAV**, enter the WebDAV address, account and password, and choose a new, empty remote folder. Select **Create encrypted vault** and wait for upload verification.
 2. Select **Back up vault key** and save the recovery key in your password manager. Keep the WebDAV credentials and folder name available for recovery.
 3. Open an empty local vault on the second device. Choose **Scan to join** in the plugin settings, scan the first device’s **Show sharing QR code**, confirm the destination and select **Verify and sync**. The QR code contains the WebDAV password and this vault’s encryption key. Show it only to devices you trust.
-4. Choose **Sync now** to transfer changes, or enable **Sync while open**. With automatic sync enabled, editing pauses of four seconds trigger a sync. Returning to the foreground, reconnecting and the five-minute check also sync while the app is visible. Repeat setup in another vault with its own remote folder and key.
-5. Settings show the last successful sync, pending local uploads (including deletions), and unresolved conflicts. Choose **Compare** to see added and removed lines and keep the local or selected version. Large notes can be compared in sections. Attachments show their size and SHA-256.
+4. After setup, sync runs automatically while the vault is open and visible. Local changes sync after a two-second pause. Every five seconds Homebound checks the WebDAV version marker and downloads new revisions when it changes. Returning to the foreground, reconnecting and the five-minute full check also trigger a sync. **Sync now** is available at any time. Repeat setup in another vault with its own remote folder and key.
+5. Settings show the last successful sync, pending local uploads (including deletions), and unresolved conflicts. A new conflict opens its comparison automatically. Keep the local or selected version, or choose **Merge text** to select each changed block, edit the combined text and save it. Closing the dialog leaves the conflict available under **Compare** in settings. Large notes can be compared in sections. Binary attachments show their size and SHA-256.
 
 ## 创建与加入
 
 1. 在当前库启用插件，填写 WebDAV 地址、账号、密码和一个新的子目录。点「创建加密库」，核对目标并确认本地副本完整。插件会创建缺少的目录，上传笔记和附件，并读回校验。中断后在同一设备点「继续上传并校验」。
 2. 点「备份库密钥」，将恢复密钥、地址、账号、密码和子目录保存到密码管理器。丢失最后一份密钥将无法解密远端数据。
 3. 在另一台设备打开准备同步的本地库，启用插件并点「扫码加入」。扫描首台设备的「显示共享二维码」，或在插件内读取二维码图片。核对本地库、远端地址和库标识后确认，插件会验证并同步。没有摄像头时，也可填写 WebDAV 配置、粘贴恢复密钥并连接。建议首次加入使用空本地库；若已有文件与远端冲突，插件会提示先备份。
-4. 在其他 Obsidian 库中重复建库，选用另一个远端子目录。在库设置中可以打开自动同步，可同步文件的最后一次编辑、创建、删除或改名后，插件等待 4 秒再同步；应用可见期间也会每五分钟、回到前台或网络恢复时检查。移动系统可能挂起后台应用。
+4. 在其他 Obsidian 库中重复建库，选用另一个远端子目录。库绑定后自动同步。文件编辑、创建、删除或改名后，停顿 2 秒即同步。应用在前台时每 5 秒轻量检查远端版本标记，有新提交就拉取。每 5 分钟、返回前台及恢复联网时还会完整检查。移动系统可能挂起后台应用。
 
 共享码包含 WebDAV 地址、账号、密码、远端目录、库标识及库密钥。它可以重复使用，请仅当面展示给自己的设备。每张码只含一把库密钥；该账号可列举、写入或删除哪些目录取决于服务器权限。恢复密钥独立于 WebDAV 密码，更新账号密码时可在已连接设备点「验证并更新 WebDAV 配置」。
 
@@ -39,7 +39,9 @@ Open **Settings → Community plugins → Browse** in Obsidian 1.11.4 or later. 
 
 每库随机生成 32 字节密钥。AES-256-GCM 认证加密正文、附件和含文件名、相对路径的修订元数据。WebDAV 上的对象使用随机标识，服务器能看到外层子目录、对象大小、数量及访问时间。插件将库密钥和 WebDAV 密码存入 Obsidian SecretStorage。库绑定和同步检查点保存在当前设备当前库的本地存储。
 
-同步当前库内的笔记和附件，排除隐藏文件、Obsidian 配置、空目录及保留的冲突副本目录。至少 4 MiB 的附件自动分块传输，重新同步时恢复进度。设备仍需能在内存中读写整份附件。设置显示最后成功同步时间、待上传文件数（含删除）和冲突状态。点冲突文件旁的「比较差异」可查看本机和所选版本的逐行增删，选择保留本机或采用所选版本，包括删除。大型笔记可分段比较，二进制附件显示大小及 SHA-256。冲突副本仍保存在 Homebound conflicts 下。锁屏或后台暂停时可回到前台继续。
+同步当前库内的笔记和附件，排除隐藏文件、Obsidian 配置、空目录及保留的冲突副本目录。至少 4 MiB 的附件自动分块传输，重新同步时恢复进度。设备仍需能在内存中读写整份附件。设置显示最后成功同步时间、待上传文件数（含删除）和冲突状态。发现冲突会自动弹出逐行比较。可保留本机、采用所选版本（包括删除），或点「合并文本…」逐处选择本机、所选或两者，再编辑并保存合并正文。多个冲突依次显示，关闭后仍可从设置中的「比较差异」重新打开。大型笔记可分段比较，二进制附件显示大小及 SHA-256。冲突副本仍保存在 Homebound conflicts 下。锁屏或后台暂停时可回到前台继续。
+
+轮询优先使用提交目录的 WebDAV 属性。如果服务器不提供可用的版本属性，新版客户端在发布提交后更新一个小标记文件；在这类服务器上，旧版客户端的写入仍可通过完整检查发现。
 
 服务端需支持 GET、PUT、PROPFIND、MKCOL 和同源 MOVE（Overwrite: F）。请保留整个远端目录的独立备份。拥有共享凭据的设备可以破坏远端数据，单台设备无法验证自己从未见过的历史是否完整。
 

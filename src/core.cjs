@@ -109,10 +109,10 @@ function checkRevision(id, rev) {
 // A revision is visible only after its immutable data and metadata have both arrived.
 // MKCOL publishes a unique completion marker with a single WebDAV operation.
 class Store {
-    constructor(dav, id, key, transfer, knownIds = []) {
+    constructor(dav, id, key, transfer, knownIds = [], reads = new ReadWindow()) {
         this.transfer = transfer;
         this.knownIds = knownIds;
-        this.reads = new ReadWindow();
+        this.reads = reads;
         this.dav = dav;
         this.id = id;
         this.key = key;
@@ -125,19 +125,40 @@ class Store {
     }
     async publish(path, parents, bytes) {
         const hash = bytes === null ? null : await sha(bytes);
-        const scope = "personal/" + this.id;
-        const staged = this.transfer?.shouldSplit(bytes) ? await this.transfer.upload({
-            objects:this.chunkObjects(), scope, wrapKey:this.key, path, parents, hash, bytes
-        }) : null;
-        const id = staged?.id || randomId();
-        if (bytes !== null && !staged) await this.writeObject("b-" + id, bytes);
-        const rev = { id, path, parents, hash, time:Date.now() };
-        if (staged) Object.assign(rev, {parts:staged.parts, key:staged.key});
-        await this.writeObject("r-" + id, jsonBytes(rev));
-        await this.dav.mkdir("commits/" + id);
-        this.lastPublished = id;
-        if (staged) await this.transfer.uploaded(scope,path);
+        const [rev] = await this.publishBatch([{path, parents, bytes, hash}], new ReadWindow(1));
         return rev;
+    }
+    // The caller groups whole files or supplies a single chunked attachment.
+    // Finish each stage before publishing markers. A retry reuses the same object names.
+    async publishBatch(files, window, published = () => {}, active = () => true) {
+        const scope = "personal/" + this.id;
+        const revisions = files.map(({path, parents, hash}) => ({id:randomId(), path, parents, hash, time:Date.now()}));
+        const stage = work => window.each(files.length, async i => {
+            if (!active()) throw Error("Sync stopped.");
+            return work(revisions[i], files[i].bytes);
+        });
+        await stage(async (rev, bytes) => {
+            if (this.transfer?.shouldSplit(bytes)) {
+                if (files.length !== 1) throw Error("Chunked attachments require a separate batch.");
+                Object.assign(rev, await this.transfer.upload({objects:this.chunkObjects(), scope, wrapKey:this.key,
+                    path:rev.path, parents:rev.parents, hash:rev.hash, bytes, window}));
+            } else if (bytes !== null) await this.writeObject("b-" + rev.id, bytes);
+        });
+        await stage(rev => this.writeObject("r-" + rev.id, jsonBytes(rev)));
+        const attempted = new Set();
+        await stage(async rev => {
+            const retry = attempted.has(rev.id);
+            attempted.add(rev.id);
+            try { await this.dav.mkdir("commits/" + rev.id); }
+            catch (error) {
+                // MKCOL may have succeeded before a throttled response reached us.
+                if (!retry || error.status !== 405 || !(await this.dav.list("commits")).includes(rev.id)) throw error;
+            }
+            this.lastPublished = rev.id;
+            if (rev.parts) await this.transfer.uploaded(scope, rev.path);
+            published(rev);
+        });
+        return revisions;
     }
     chunkObjects() {
         return {read:id=>this.dav.read("objects/b-"+id), put:(id,data)=>this.dav.put("objects/b-"+id,data)};
@@ -214,7 +235,7 @@ class Store {
         return true;
     }
     async history(cache, names, {progress, active = () => true, refresh = false} = {}) {
-        names ??= await this.dav.list("commits");
+        names ??= await this.reads.one(() => this.dav.list("commits"));
         const visible = new Set(names);
         checkKnownIds(new Set([...this.knownIds, ...cache.keys()]), visible);
         const history = new Map(), missing = [];
@@ -472,16 +493,16 @@ async function synchronize({ store, local, baseline, cache, checkpoint, resolve,
     return { history, sent, received, conflicts };
 }
 
-async function createVault(home, folder, material, id, previous = "") {
+async function createVault(home, folder, material, id, previous = "", window = new ReadWindow(1)) {
     let current = home;
     for (const part of folder.split("/")) {
-        try { await current.mkdir(part); }
+        try { await window.one(() => current.mkdir(part)); }
         catch (e) { if (e.status !== 405) throw e; }
         current = current.child(part);
     }
-    const entries = await current.list();
+    const entries = await window.one(() => current.list());
     if (entries.includes(namespace)) {
-        const existing = parseBytes(await current.child(namespace).read("vault.json"));
+        const existing = parseBytes(await window.one(() => current.child(namespace).read("vault.json")));
         await unlock(existing, material, id);
         if (existing.previous !== previous) throw Error("目标目录已绑定其他库。");
         return existing;
@@ -491,17 +512,30 @@ async function createVault(home, folder, material, id, previous = "") {
     }
     const header = await newHeader(material, id, previous);
     const staging = "homebound-init-" + randomId();
-    await current.mkdir(staging);
+    // An overloaded server may already have created this exact staging directory.
+    async function makeStageDirectory(parent, name) {
+        let attempted = false;
+        await window.one(async () => {
+            const retry = attempted;
+            attempted = true;
+            try { await parent.mkdir(name); }
+            catch (error) {
+                if (!retry || error.status !== 405) throw error;
+                await parent.list(name);
+            }
+        });
+    }
+    await makeStageDirectory(current, staging);
     const store = current.child(staging);
-    await store.mkdir("objects");
-    await store.mkdir("commits");
-    await store.put("vault.json", jsonBytes(header).buffer);
+    await makeStageDirectory(store, "objects");
+    await makeStageDirectory(store, "commits");
+    await window.one(() => store.put("vault.json", jsonBytes(header).buffer));
     // A dropped connection leaves an unpublished staging directory. Retrying cannot replace a live vault.
     try {
-        await current.call("MOVE", staging, [201], { headers: { Destination: current.child(namespace).root, Overwrite: "F" } });
+        await window.one(() => current.call("MOVE", staging, [201], { headers: { Destination: current.child(namespace).root, Overwrite: "F" } }));
     } catch (error) {
         let existing;
-        try { existing = parseBytes(await current.child(namespace).read("vault.json")); } catch { /* Preserve the original failure. */ }
+        try { existing = parseBytes(await window.one(() => current.child(namespace).read("vault.json"))); } catch { /* Preserve the original failure. */ }
         if (existing?.id !== header.id) throw error;
         await unlock(existing, material, id);
         if (existing.previous !== previous) throw error;

@@ -49,6 +49,9 @@ function progressView(parent) {
 }
 
 const progressLabels={
+    preparingVault:["Preparing the remote vault…","正在准备远端库…"],
+    uploading:["Uploading vault files","上传建库文件"],
+    readback:["Verifying uploaded files","读回校验文件"],
     connecting:["Verifying connection and vault key…","正在验证连接和库密钥…"],
     versions:["Checking remote versions","核对远端版本"],
     local:["Checking local files","核对本地文件"],
@@ -177,9 +180,21 @@ class HomeboundSettings extends PluginSettingTab {
     }
     statusVisible() { return Boolean(this.statusEl?.isConnected); }
     refreshProgress() {
+        const step=this.plugin.progress;
+        if (this.pendingActions) this.pendingActions.hidden=Boolean(step);
+        if (this.setupBlocks) {
+            const view=this.setupBlocks, block=step?.block;
+            view.el.hidden=!block;
+            if (block) {
+                const label=block.path+" · "+block.done+" / "+block.total+tr(" blocks"," 块");
+                updateText(view.label,label);
+                view.bar.setAttribute("aria-label",label);
+                view.bar.max=block.total;
+                view.bar.value=block.done;
+            }
+        }
         for (const view of [this.panelProgress,this.joinProgress]) {
             if (!view?.el.isConnected) continue;
-            const step=this.plugin.progress;
             view.el.hidden=!step;
             if (!step) continue;
             const label=tr(...progressLabels[step.phase]);
@@ -297,12 +312,16 @@ class HomeboundSettings extends PluginSettingTab {
         });
     }
     hide() {
+        this.pendingActions=null;
+        this.setupBlocks=null;
         this.statusEl=null;
         this.panelProgress=null;
         this.refreshHistoryPeriod=null;
         super.hide?.();
     }
     display() {
+        this.pendingActions=null;
+        this.setupBlocks=null;
         this.refreshHistoryPeriod=null;
         this.statusEl=null;
         this.panelProgress=null;
@@ -364,11 +383,15 @@ class HomeboundSettings extends PluginSettingTab {
     showPending(el,current,pending) {
         const p=this.plugin;
         el.createEl("h2",{text:this.app.vault.getName()});
-        el.createEl("p",{text:tr("Setup awaiting verification: ","待完成上传和校验：") + pending.address + "/" + pending.folder});
+        el.createEl("p",{text:pending.address + "/" + pending.folder});
+        this.panelProgress=progressView(el);
+        this.setupBlocks=progressView(el);
+        this.pendingActions=el.createDiv();
+        this.refreshProgress();
         let password = "";
-        field(el,tr("Updated WebDAV password (optional)","更新后的 WebDAV 密码（可留空）"),"",v => password = v,true);
-        button(el,tr("Resume upload and verify","继续上传并校验"),() => this.perform(() => p.resumeSetup(password)));
-        button(el,tr("Cancel setup…","取消本次建库…"),() => review(this.app,tr("Cancel setup?","取消本次建库？"),
+        field(this.pendingActions,tr("Updated WebDAV password (optional)","更新后的 WebDAV 密码（可留空）"),"",v => password = v,true);
+        button(this.pendingActions,tr("Resume upload and verify","继续上传并校验"),() => this.perform(() => p.resumeSetup(password)));
+        button(this.pendingActions,tr("Cancel setup…","取消本次建库…"),() => review(this.app,tr("Cancel setup?","取消本次建库？"),
             [tr("The partial copy stays in its remote folder. Save its recovery key first if you need it. The previous connection will be available again.",
                 "新目录中已上传的数据将保留。如需保留其访问能力，请先保存下方恢复密钥。取消后可继续使用原绑定。")],
             tr("Cancel setup","取消本次建库"),() => this.perform(async () => {
@@ -409,10 +432,10 @@ class HomeboundSettings extends PluginSettingTab {
             if (current) lines.push(tr("Back up the old vault key to retain access to its history. For a lost device, revoke its WebDAV credentials on the server first. Confirm this local copy includes your latest files and all offline changes you want to keep. Other devices must scan the new code.",
                 "请先备份原库密钥，以后读取旧历史时会用到。若设备遗失，请先在服务端撤销旧 WebDAV 凭据。请确认本地副本完整，并已汇集要保留的离线修改。其余设备须重新扫码。"));
             review(this.app,titles[mode],lines,tr("Confirm complete local copy and upload","确认本地副本完整，开始上传"),
-                async () => {
-                    try { await this.perform(() => p.startSetup(draft,draft.password)); }
-                    finally { if (p.state.pending || p.state.current!==current) modal.close(); }
-                });
+                () => this.perform(() => p.startSetup(draft,draft.password,() => {
+                    modal.close();
+                    this.display();
+                })));
         });
         modal.open();
     }

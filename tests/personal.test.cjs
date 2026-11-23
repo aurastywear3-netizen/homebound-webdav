@@ -28,6 +28,7 @@ function server() {
             const path = this.child(name).root;
             if (dirs.has(path)) throw Object.assign(Error("exists"),{status:405});
             dirs.add(path);
+            if (name.startsWith("commits/")) await dav.afterCommit?.(name);
         }
         async list(path) {
             this.auth();
@@ -43,7 +44,12 @@ function server() {
             if (!value) throw Object.assign(Error("absent"),{status:404});
             return value;
         }
-        async put(name, content) { this.auth(); dav.writes++; files.set(this.child(name).root,content); }
+        async put(name, content) {
+            this.auth();
+            await dav.onPut?.(name);
+            dav.writes++;
+            files.set(this.child(name).root,content);
+        }
         async call(method, name, codes, {headers}) {
             this.auth(); assert.equal(method,"MOVE"); assert.equal(headers.Overwrite,"F");
             const from = this.child(name).root, to = headers.Destination;
@@ -199,7 +205,7 @@ test("joining authenticates each immutable revision once and picks up a commit p
         };
         ipad.settingsTab.refreshProgress=()=>steps.push(ipad.progress);
         await ipad.join(invite,invite.key,invite.id);
-        assert.equal(peak,8);
+        assert.equal(peak,10);
         assert.equal(reads.length,10);
         assert.deepEqual(steps[0],{phase:"connecting",done:0,total:null});
         assert.deepEqual(steps.filter(s=>s?.phase==="versions").map(s=>s.done),Array.from({length:11},(_,i)=>i));
@@ -231,7 +237,7 @@ test("a failed metadata batch finishes its outstanding reads and leaves the join
             inflight++; await new Promise(setImmediate); inflight--;
         };
         await assert.rejects(peer.join(invite,invite.key,invite.id),/interrupted/);
-        assert.equal(requests,8); assert.equal(inflight,0);
+        assert.equal(requests,9); assert.equal(inflight,0);
         assert.equal(peer.state.current,undefined); assert.equal(peer.cache.size,0);
         assert.equal(peer.progress,null);
         delete srv.onRead;
@@ -265,6 +271,98 @@ function measureReads(srv, firstBatch = {}) {
     return stats;
 }
 
+test("first creation uploads and audits twenty at a time, reporting only confirmed files", async t => {
+    const prior={window:global.window,document:global.document};
+    global.window={setInterval:()=>0}; global.document={};
+    t.after(()=>Object.assign(global,prior));
+    const srv=server(), source=new Map(), events=[];
+    for (let i=0;i<24;i++) source.set(i+".md",bytes("snapshot "+i));
+    const mac=await device(srv,source);
+    const gets=measureReads(srv,{r:20,b:20});
+    const uploads={};
+    const puts=measureReads(uploads,{r:20,b:20});
+    srv.onPut=uploads.onRead;
+    let markers=0;
+    srv.afterCommit=()=>{markers++;};
+    mac.settingsTab.refreshProgress=()=>{
+        const step=mac.progress;
+        if (step?.phase==="uploading") assert(step.done<=markers);
+        if (step?.phase==="readback") assert.equal(mac.state.current,undefined);
+        events.push(step);
+    };
+    await mac.startSetup({address:"https://dav.example",folder:"fresh",username:"owner"},srv.password,()=>{
+        assert(mac.state.pending);
+        assert.equal(srv.requests,0);
+    });
+    for (const stats of [gets,puts]) for (const kind of ["b","r"])
+        assert.deepEqual(stats[kind],{calls:24,peak:20});
+    for (const phase of ["uploading","versions","readback"])
+        assert.deepEqual(events.filter(s=>s?.phase===phase && s.total===24).map(s=>s.done),
+            Array.from({length:25},(_,i)=>i));
+    assert.equal(events[0].phase,"preparingVault");
+    assert.equal(events.at(-2).phase,"finishing");
+    assert.equal(events.at(-1),null);
+    assert.equal(mac.baseline(mac.state.current.id).size,24);
+});
+
+test("throttling while creating and connecting the vault carries into its uploads and readback", async t => {
+    const prior={window:global.window,document:global.document};
+    global.window={setInterval:()=>0}; global.document={};
+    t.after(()=>Object.assign(global,prior));
+    const srv=server(), source=new Map();
+    for (let i=0;i<22;i++) source.set(i+".md",bytes("note "+i));
+    const mac=await device(srv,source), uploads={};
+    const puts=measureReads(uploads,{b:8,r:8}), gets=measureReads(srv,{b:8,r:8});
+    const observe=srv.onRead;
+    let headersPut=0, headersRead=0;
+    srv.onPut=async name=>{
+        if (name==="vault.json" && ++headersPut===1) throw Object.assign(Error("busy"),{status:429});
+        await uploads.onRead(name);
+    };
+    srv.onRead=async name=>{
+        if (name==="vault.json" && ++headersRead===1) throw Object.assign(Error("busy"),{status:503});
+        await observe(name);
+    };
+    await mac.startSetup({address:"https://dav.example",folder:"bootstrap",username:"owner"},srv.password);
+    assert.equal(headersPut,2); assert.equal(headersRead,2);
+    for (const stats of [puts,gets]) for (const kind of ["b","r"])
+        assert.deepEqual(stats[kind],{calls:22,peak:8});
+    assert.equal(mac.state.current.initialReadLimit,undefined);
+});
+
+test("lost commit acknowledgement and interrupted creation audit resume without duplicate uploads", async t => {
+    const prior={window:global.window,document:global.document};
+    global.window={setInterval:()=>0}; global.document={};
+    t.after(()=>Object.assign(global,prior));
+    const srv=server(), disk=new Map(), secrets=new Map(), source=new Map();
+    for (let i=0;i<25;i++) source.set(i+".md",bytes("version "+i));
+    let mac=await device(srv,source,disk,secrets);
+    let commits=0;
+    srv.afterCommit=()=>{
+        if (++commits===1) throw Object.assign(Error("lost acknowledgement"),{status:503});
+    };
+    const reads=measureReads(srv,{r:12});
+    srv.failRead=true;
+    await assert.rejects(mac.startSetup({address:"https://dav.example",folder:"resume",username:"owner"},srv.password),/readback/);
+    const id=mac.state.pending.id, writes=srv.writes;
+    assert.equal(mac.state.current,undefined);
+    assert.equal(mac.progress,null);
+    assert.equal(mac.state.pending.initialReadLimit,12);
+    assert.equal(commits,25);
+    assert.deepEqual(reads.r,{calls:25,peak:12});
+    srv.failRead=false;
+    mac=await device(srv,source,disk,secrets);
+    const resumed=measureReads(srv,{r:12,b:12});
+    await mac.resumeSetup();
+    assert.equal(resumed.r.peak,12); assert.equal(resumed.b.peak,12);
+    assert.equal(mac.state.current.initialReadLimit,undefined);
+    assert.equal(srv.writes,writes);
+    assert.equal(commits,25);
+    assert.equal(mac.state.current.id,id);
+    assert.equal(mac.baseline(id).size,25);
+    assert.equal(mac.cache.size,25);
+});
+
 async function cacheFixture(t, count) {
     const prior = {window:global.window, document:global.document};
     global.window = {setInterval:()=>0}; global.document = {};
@@ -275,31 +373,31 @@ async function cacheFixture(t, count) {
     await mac.startSetup({address:"https://dav.example",folder:"cache",username:"tester"},srv.password);
     const invite = mac.sharingFields(), restart = () => device(srv,files,disk,secrets);
     const peer = await restart();
-    const joinStats = measureReads(srv,{r:Math.min(count,8)});
+    const joinStats = measureReads(srv,{r:Math.min(count,20)});
     await peer.join(invite,invite.key,invite.id);
     const pointer = () => disk.get("homebound-revision-cache-v1-"+invite.id);
     const snapshot = () => peer.revisions.path(invite.id,pointer().generation);
     return {srv, disk, files, source, mac, invite, restart, peer, joinStats, pointer, snapshot};
 }
 
-test("first download after restart uses eight reads, daily refresh uses four and fetches only new revisions", async t => {
-    const {srv, disk, files, source, mac, restart, joinStats, snapshot} = await cacheFixture(t,18);
-    assert.deepEqual(joinStats.r,{calls:18,peak:8});
+test("first download after restart uses twenty reads, daily refresh uses four and fetches only new revisions", async t => {
+    const {srv, disk, files, source, mac, restart, joinStats, snapshot} = await cacheFixture(t,25);
+    assert.deepEqual(joinStats.r,{calls:25,peak:20});
     assert.equal(joinStats.b.calls,0);
     assert.match(snapshot(),/^\.obsidian\/plugins\/homebound-webdav\/versions-/);
     assert(!Buffer.from(disk.get(snapshot())).includes("private-"));
-    let peer = await restart(), stats = measureReads(srv,{b:8});
-    assert.equal((await peer.run()).received,18);
+    let peer = await restart(), stats = measureReads(srv,{b:20});
+    assert.equal((await peer.run()).received,25);
     assert.deepEqual(stats.r,{calls:0,peak:0});
-    assert.deepEqual(stats.b,{calls:18,peak:8});
+    assert.deepEqual(stats.b,{calls:25,peak:20});
     assert.deepEqual(files,source);
 
     for (const path of source.keys()) source.set(path,bytes("new "+path));
-    assert.equal((await mac.run()).sent,18);
+    assert.equal((await mac.run()).sent,25);
     peer = await restart(); stats = measureReads(srv,{r:4,b:4});
-    assert.equal((await peer.run()).received,18);
-    assert.deepEqual(stats.r,{calls:18,peak:4});
-    assert.deepEqual(stats.b,{calls:18,peak:4});
+    assert.equal((await peer.run()).received,25);
+    assert.deepEqual(stats.r,{calls:25,peak:4});
+    assert.deepEqual(stats.b,{calls:25,peak:4});
     assert.deepEqual(files,source);
     for (let i=0; i<3; i++) source.set("extra-"+i+".md",bytes("extra"));
     assert.equal((await mac.run()).sent,3);
@@ -356,8 +454,8 @@ test("cache rebuild is read-only remotely, preserves the old generation on netwo
     assert.equal((await restart()).cache.size,12);
 });
 
-test("a throttled first verification carries the slower limit through download and restart", async t => {
-    const {srv,invite} = await cacheFixture(t,13);
+test("first verification and interrupted download retain successive lower limits across restarts", async t => {
+    const {srv,invite} = await cacheFixture(t,32);
     const disk = new Map(), secrets = new Map(), files = new Map();
     const peer = await device(srv,files,disk,secrets);
     let rejected, active=0; const completed = new Set();
@@ -368,11 +466,24 @@ test("a throttled first verification carries the slower limit through download a
         assert(!completed.has(name)); completed.add(name);
     };
     await peer.join(invite,invite.key,invite.id);
-    assert(rejected); assert.equal(completed.size,13);
-    const cold = await device(srv,files,disk,secrets), stats = measureReads(srv);
-    assert.equal((await cold.run()).received,13);
-    assert.deepEqual(stats.b,{calls:13,peak:1});
-    assert.equal(cold.state.current.initialReadLimit,undefined);
+    assert(rejected); assert.equal(completed.size,32);
+    assert.equal(peer.state.current.initialReadLimit,12);
+    const cold = await device(srv,files,disk,secrets);
+    const stats = measureReads(srv,{b:12}), observe = srv.onRead;
+    let blocked;
+    srv.onRead = async name => {
+        await observe(name);
+        if (!name.startsWith("objects/b-")) return;
+        if (!blocked) { blocked = name; throw Object.assign(Error("busy"),{status:503}); }
+        if (name===blocked) throw Error("offline during download retry");
+    };
+    assert.equal(await cold.run(),undefined);
+    assert.equal(stats.b.peak,12);
+    assert.equal(cold.state.current.initialReadLimit,8);
+    const resumed = await device(srv,files,disk,secrets), after = measureReads(srv,{b:8});
+    assert.equal((await resumed.run()).received,32);
+    assert.deepEqual(after.b,{calls:32,peak:8});
+    assert.equal(resumed.state.current.initialReadLimit,undefined);
 });
 
 test("rebuilding after a peer publishes leaves notes alone and the next normal poll pulls the new revision", async t => {

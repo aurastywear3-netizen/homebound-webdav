@@ -5,6 +5,7 @@ const core = require("./core.cjs");
 const sharing = require("./pairing-invite.cjs");
 const {Dav, VaultFiles, credentials} = require("./adapter.cjs");
 const {ChunkTransfer, TransferCache, blockSize} = require("./transfer.cjs");
+const {ReadWindow, concurrencyLevels} = require("./parallel-reads.cjs");
 const {seedSnapshot, checkJoin} = require("./personal.cjs");
 const {PendingUploads} = require("./pending.cjs");
 const {ConflictFiles} = require("./conflict-files.cjs");
@@ -226,11 +227,19 @@ module.exports = class HomeboundPlugin extends Plugin {
     local() { return new VaultFiles(this.app,this.copies); }
     dav(config, password) { return new Dav(config.address, credentials(config.username, password)); }
     vaultDav(config, password) { return this.dav(config,password).child(config.folder).child(core.namespace); }
-    async connect(config, password, material) {
+    initialWindow(config, slot) {
+        const limit = concurrencyLevels.includes(config.initialReadLimit) ? config.initialReadLimit : concurrencyLevels[0];
+        return new ReadWindow(limit, lowered => {
+            const saved = this.state[slot];
+            if (!this.closed && saved?.secretId === config.secretId)
+                this.save({...this.state, [slot]:{...saved, initialReadLimit:lowered}});
+        });
+    }
+    async connect(config, password, material, reads = new ReadWindow()) {
         const dav = this.vaultDav(config,password);
-        const header = core.parseBytes(await dav.read("vault.json"));
+        const header = core.parseBytes(await reads.one(() => dav.read("vault.json")));
         const key = await core.unlock(header, material, config.id);
-        return {store:new core.Store(dav, header.id, key, this.transfer, this.revisions.knownIds(header.id)), previous:header.previous};
+        return {store:new core.Store(dav, header.id, key, this.transfer, this.revisions.knownIds(header.id), reads), previous:header.previous};
     }
     async historyStore(id) {
         const c=this.state.current;
@@ -293,7 +302,7 @@ module.exports = class HomeboundPlugin extends Plugin {
         }
     }
     setProgress(phase, done = 0, total = null) {
-        this.progress = phase ? {phase, done, total} : null;
+        this.progress = phase && !this.closed ? {phase, done, total} : null;
         this.settingsTab?.refreshProgress?.();
     }
     activate(config, history = new Map()) {
@@ -309,7 +318,7 @@ module.exports = class HomeboundPlugin extends Plugin {
 
     // Persist the key and target before the first WebDAV write. A lost response or
     // restart can resume the same target without replacing the current binding.
-    async startSetup(fields, enteredPassword) {
+    async startSetup(fields, enteredPassword, onPending) {
         if (this.state.pending) throw Error("请先完成正在进行的建库。");
         const current = this.state.current;
         const target = location(fields);
@@ -324,6 +333,7 @@ module.exports = class HomeboundPlugin extends Plugin {
         const config = {...target, id:core.randomId(), secretId:core.randomId(), auto:true};
         this.storeSecrets(config, core.generateKey(), password);
         this.save({...this.state, pending:config});
+        onPending?.();
         return this.resumeSetup();
     }
     async resumeSetup(enteredPassword = "") {
@@ -333,16 +343,25 @@ module.exports = class HomeboundPlugin extends Plugin {
         if (!password || !material) throw Error("缺少本机保存的建库凭据。");
         const previous = this.state.current?.id || "";
         if (enteredPassword) this.storeSecrets(config, material, password);
-        await core.createVault(this.dav(config,password), config.folder, material, config.id, previous);
-        const {store} = await this.connect(config,password,material);
-        const active = () => !this.closed;
-        const {baseline,history} = await new VersionWatch().trackWrites(store, () => seedSnapshot(store, this.local(), active));
-        await this.revisions.save(store, history, active);
-        this.checkpoint(config.id, baseline);
-        this.activate(config, history);
-        this.last = tr("Upload and readback verified.","已完成上传和读回校验。");
-        this.recordSuccess([]);
-        new Notice(this.last);
+        const progress = this.setProgress.bind(this);
+        const active = () => !this.closed && this.state.pending?.id === config.id;
+        progress("preparingVault");
+        try {
+            const window = previous ? new ReadWindow() : this.initialWindow(config, "pending");
+            await core.createVault(this.dav(config,password), config.folder, material, config.id, previous, window);
+            const {store} = await this.connect(config,password,material,window);
+            const {baseline,history} = await new VersionWatch().trackWrites(store,
+                () => seedSnapshot(store, this.local(), active, progress));
+            progress("finishing");
+            await this.revisions.save(store, history, active);
+            this.checkpoint(config.id, baseline);
+            const connected = {...config};
+            delete connected.initialReadLimit;
+            this.activate(connected, history);
+            this.last = tr("Upload and readback verified.","已完成上传和读回校验。");
+            this.recordSuccess([]);
+            new Notice(this.last);
+        } finally { progress(null); }
     }
     async join(fields, material, id) {
         if (this.state.pending) throw Error("请先完成或取消正在进行的建库。");
@@ -353,11 +372,11 @@ module.exports = class HomeboundPlugin extends Plugin {
         const config = {...target, id, secretId:core.randomId(), auto:true};
         this.setProgress("connecting");
         try {
-            const {store, previous} = await this.connect(config, password, material);
+            const window = current ? new ReadWindow() : new ReadWindow(concurrencyLevels[0]);
+            const {store, previous} = await this.connect(config, password, material, window);
             let verified;
             if (current?.id !== id) {
                 if (current && current.id !== previous) throw Error("当前本地库已绑定另一个库。请打开对应的独立本地库。");
-                if (!current) store.reads.limit = 8;
                 const options = {progress:this.setProgress.bind(this), active:() => !this.closed};
                 const previousCache = await this.revisions.load(id, material);
                 verified = await store.history(previousCache, undefined, options);
@@ -381,6 +400,12 @@ module.exports = class HomeboundPlugin extends Plugin {
     }
 
     showTransfer(event) {
+        if (event && this.closed) return;
+        if (event && this.state.pending && ["uploading","readback"].includes(this.progress?.phase)) {
+            this.progress.block = {...event};
+            this.settingsTab?.refreshProgress();
+            return;
+        }
         if (!event) {
             this.transferNotice?.hide();
             this.transferNotice = null;
@@ -490,13 +515,13 @@ module.exports = class HomeboundPlugin extends Plugin {
                 const c = this.state.current;
                 if (this.state.pending) throw Error("请先完成建库或换钥。");
                 if (!c) throw Error("请先创建或扫码加入笔记库。");
-                const {store} = await this.connect(c, this.secret(c,"dav"), this.secret(c,"key"));
-                if (c.initialReadLimit === 8 || c.initialReadLimit === 1) store.reads.limit = c.initialReadLimit;
+                const window = concurrencyLevels.includes(c.initialReadLimit) ? this.initialWindow(c, "current") : new ReadWindow();
+                const {store} = await this.connect(c, this.secret(c,"dav"), this.secret(c,"key"), window);
                 const local = this.local();
                 // Sample before listing commits. A post-sync marker could acknowledge
                 // a concurrent revision that was never part of this sync.
                 const watch = this.watch;
-                const sample = probe?.sample ?? await watch.read(store.dav).catch(() => null);
+                const sample = probe?.sample ?? await window.one(() => watch.read(store.dav)).catch(() => null);
                 const progress = this.setProgress.bind(this), active = () => !this.closed;
                 let cache = this.cache;
                 let reconciled = 0;

@@ -3,10 +3,10 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const {createRequire} = require("node:module");
 
-function loadTab(Setting) {
+function loadTab(Setting, Modal = class {}) {
     const source=require.resolve("../src/settings.cjs");
     const localRequire=createRequire(source), settings={exports:{}};
-    const obsidian={PluginSettingTab:class {}, Modal:class {}, Setting, getLanguage:()=>"en"};
+    const obsidian={PluginSettingTab:class {}, Modal, Setting, getLanguage:()=>"en"};
     new Function("module","require",fs.readFileSync(source,"utf8"))(settings,
         name=>name==="obsidian" ? obsidian : localRequire(name));
     return settings.exports.HomeboundSettings;
@@ -66,6 +66,73 @@ test("join confirmation and settings show the current phase and counts and clear
     assert.equal(tab.joinProgress.bar.value,8);
     p.progress=null;tab.refreshProgress();
     assert.equal(tab.panelProgress.el.hidden,true);
+});
+
+test("confirming creation reveals live file and block progress, including after reopening settings", async()=>{
+    const dialogs=[], actions=new Map();
+    class Element {
+        isConnected=true;
+        empty() {}
+        addClass() {}
+        createEl() { return new Element(); }
+        createDiv() { return new Element(); }
+        setAttribute(key,value) { this[key]=value; }
+        removeAttribute(key) { delete this[key]; }
+        setText(value) { this.textContent=value; }
+    }
+    class Modal {
+        contentEl=new Element();
+        setTitle() {}
+        open() { this.visible=true; dialogs.push(this); }
+        close() { this.visible=false; }
+    }
+    class Row {
+        setClass() { return this; }
+        setName(name) { this.name=name; return this; }
+        addText(create) {
+            const address=this.name==="WebDAV HTTPS address";
+            create({inputEl:new Element(),setValue(){return this;},
+                onChange(fn){if (address) fn("https://dav.example");}});
+            return this;
+        }
+        addButton(create) {
+            create({setButtonText(label){this.label=label; return this;},
+                setDisabled(){},onClick(fn){actions.set(this.label,fn);}});
+            return this;
+        }
+    }
+    let finish;
+    const busy=new Promise(resolve=>{finish=resolve;});
+    const plugin={state:{},exclusive:action=>action()};
+    const tab=new (loadTab(Row,Modal))({},plugin);
+    tab.app={vault:{getName:()=>"Example"}};
+    tab.containerEl=new Element();
+    plugin.startSetup=async(fields,password,onPending)=>{
+        plugin.state.pending={address:"https://dav.example",folder:"Example"};
+        onPending();
+        plugin.progress={phase:"uploading",done:2,total:10,
+            block:{path:"sound.wav",done:3,total:9}};
+        tab.refreshProgress();
+        await busy;
+        plugin.progress=null;
+    };
+    tab.connectionForm("create");
+    await actions.get("Continue")();
+    const running=actions.get("Confirm complete local copy and upload")();
+    function checkProgress() {
+        assert.equal(tab.panelProgress.label.textContent,"Uploading vault files 2 / 10");
+        assert.equal(tab.panelProgress.bar.value,2);
+        assert.equal(tab.setupBlocks.label.textContent,"sound.wav · 3 / 9 blocks");
+        assert.equal(tab.setupBlocks.bar.value,3);
+        assert.equal(tab.pendingActions.hidden,true);
+    }
+    assert.deepEqual(dialogs.map(dialog=>dialog.visible),[false,false]);
+    checkProgress();
+    tab.hide(); tab.display(); checkProgress();
+    finish(); await running;
+    assert.equal(tab.panelProgress.el.hidden,true);
+    assert.equal(tab.setupBlocks.el.hidden,true);
+    assert.equal(tab.pendingActions.hidden,false);
 });
 
 test("an open retention dropdown refreshes in place and ignores responses superseded by an edit or a closed tab", async () => {

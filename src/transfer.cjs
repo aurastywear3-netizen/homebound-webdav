@@ -83,7 +83,7 @@ class ChunkTransfer {
             }
         }
     }
-    async upload({objects,scope,wrapKey,path,parents,hash,bytes}) {
+    async upload({objects,scope,wrapKey,path,parents,hash,bytes,window = new ReadWindow(1)}) {
         const data = new Uint8Array(bytes.buffer ?? bytes, bytes.byteOffset ?? 0, bytes.byteLength);
         const slot = [scope,"put",path];
         const binding = JSON.stringify(["upload-2",scope,path,hash,[...parents].sort()]);
@@ -103,29 +103,42 @@ class ChunkTransfer {
         const key = await aes(raw);
         const info = {direction:"upload",path,total,size:data.length,done:pending.done};
         this.progress(info);
-        for (let i=pending.done;i<total;i++) {
+        // Older checkpoints stored only whether the next single PUT was uncertain.
+        const uncertainEnd = pending.probeThrough ?? (pending.done + (pending.inFlight ? 1 : 0));
+        if (!Number.isInteger(uncertainEnd) || uncertainEnd < pending.done || uncertainEnd > total)
+            throw Error("分块上传记录损坏。");
+        while (pending.done < total) {
             this.checkActive();
-            const chunk = data.subarray(i*blockSize,(i+1)*blockSize);
-            const name = await chunkName(parts,i), aad = label(scope,id,parts,i);
-            const uncertain = pending.inFlight;
+            const start = pending.done, end = Math.min(start + window.limit, total);
+            // Record the entire uncertain range before the first PUT. The prefix
+            // advances only after all its blocks succeed, even with out-of-order replies.
+            pending.probeThrough = Math.max(end, uncertainEnd);
             pending.inFlight = true;
             await this.cache.put(slot,pending);
-            await this.retry(info, async attempt => {
-                // A timeout may occur after the server saved the PUT. Authenticate that block before skipping it.
-                if (uncertain || attempt > 0) {
-                    let packet;
-                    try { packet = await objects.read(name); } catch (e) { if (e.status !== 404) throw e; }
-                    if (packet) {
-                        const old = new Uint8Array(await core.unseal(key,aad,packet));
-                        if (old.length !== chunk.length || !old.every((b,j)=>b===chunk[j])) throw Error("远端分块内容不一致。");
-                        return;
+            const attempted = new Set();
+            await window.each(end-start, async offset => {
+                const i = start + offset, chunk = data.subarray(i*blockSize,(i+1)*blockSize);
+                const name = await chunkName(parts,i), aad = label(scope,id,parts,i);
+                const uncertain = i < uncertainEnd || attempted.has(i);
+                attempted.add(i);
+                await this.retry(info, async attempt => {
+                    if (uncertain || attempt > 0) {
+                        let packet;
+                        try { packet = await objects.read(name); } catch (e) { if (e.status !== 404) throw e; }
+                        if (packet) {
+                            const old = new Uint8Array(await core.unseal(key,aad,packet));
+                            if (old.length !== chunk.length || !old.every((b,j)=>b===chunk[j])) throw Error("远端分块内容不一致。");
+                            return;
+                        }
                     }
-                }
-                await objects.put(name,await core.seal(key,aad,chunk));
+                    await objects.put(name,await core.seal(key,aad,chunk));
+                }, window);
+                info.done++;
+                this.progress(info);
             });
-            pending.done = ++info.done; pending.inFlight = false;
+            pending.done = end;
+            pending.inFlight = end < uncertainEnd;
             await this.cache.put(slot,pending);
-            this.progress(info);
         }
         this.checkActive();
         return {id,parts,key:base64(new Uint8Array(raw))};

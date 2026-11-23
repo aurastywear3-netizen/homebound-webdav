@@ -1,6 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const core = require("../src/core.cjs");
+const {seedSnapshot} = require("../src/personal.cjs");
 const {ChunkTransfer,blockSize,threshold,chunkName} = require("../src/transfer.cjs");
 
 class Cache extends Map {
@@ -33,7 +34,7 @@ async function fixture() {
 }
 
 test("interrupted chunk PUT survives a restarted client; a lost acknowledgement never duplicates its block", async()=>{
-    const {files,dav,client,data,progress}=await fixture();
+    const {files,dav,client,data,progress,cache}=await fixture();
     let offline=false,puts=0;const put=dav.put,read=dav.read;
     dav.put=async(n,b)=>{
         if(offline)throw networkError(503);
@@ -44,6 +45,10 @@ test("interrupted chunk PUT survives a restarted client; a lost acknowledgement 
     await assert.rejects(client().publish("附件.pdf",[],data));
     assert.equal((await dav.list()).length,0);assert.equal(files.size,3);
     assert.deepEqual(progress.filter(e=>e.retry).map(e=>e.retry),[1,2,3]);
+    const slot=["personal/vault","put","附件.pdf"];
+    const previous=await cache.get(slot);
+    delete previous.probeThrough; // 0.3.8 tracked only the next uncertain PUT.
+    await cache.put(slot,previous);
     offline=false;
     const rev=await client().publish("附件.pdf",[],data);
     assert.equal(puts,9);assert.equal((await dav.list()).length,1);
@@ -90,6 +95,97 @@ test("permanent errors are not retried; a changed attachment never resumes the o
     assert.deepEqual(new Uint8Array(await client().readBody(rev)),data);
 });
 
+test("setup resumes an interrupted eight-block batch, authenticates uncertain blocks and audits every block",async()=>{
+    const {client,dav,data,cache,files}=await fixture();
+    const source=new Map([["before.md",Uint8Array.of(1)],["audio.bin",data],["after.md",Uint8Array.of(2)]]);
+    const local={paths:()=>new Set(source.keys()),allowed:()=>true,read:async path=>source.get(path)};
+    const run=async limit=>{
+        const store=client();
+        store.reads.limit=limit;
+        return seedSnapshot(store,local,()=>true);
+    };
+    const originalPut=dav.put, originalRead=dav.read;
+    let release;
+    const ready=new Promise(resolve=>{release=resolve;});
+    const attempted=new Set(), acknowledged=new Set();
+    dav.put=async(name,packet)=>{
+        if (!name.startsWith("objects/b-") || packet.byteLength!==blockSize+28) return originalPut(name,packet);
+        attempted.add(name);
+        const order=attempted.size;
+        if (order===8) release();
+        await ready;
+        if (order===2) throw networkError(403); // This block never reached WebDAV.
+        await originalPut(name,packet);
+        acknowledged.add(name);
+        if (order===5) throw networkError(403); // Saved, but no acknowledgement.
+    };
+    await assert.rejects(run(8),e=>e.status===403);
+    assert.equal(attempted.size,8);
+    assert.equal(acknowledged.size,7);
+    assert.equal((await dav.list()).length,1);
+    const checkpoint=await cache.get(["personal/vault","put","audio.bin"]);
+    assert.equal(checkpoint.done,0);
+    assert.equal(checkpoint.probeThrough,8);
+    const blocks=new Set();
+    for (let i=0;i<9;i++) blocks.add("objects/b-"+await chunkName(checkpoint.parts,i));
+    const probes=[], audit=[];
+    dav.read=async name=>{
+        if (blocks.has(name)) ((await dav.list()).length===1 ? probes : audit).push(name);
+        return originalRead(name);
+    };
+    dav.put=async(name,packet)=>{
+        assert(!acknowledged.has(name),"an authenticated block must not be uploaded again");
+        await originalPut(name,packet);
+    };
+    const {baseline,history}=await run(4); // A later attempt can use a narrower window.
+    assert.deepEqual(new Set(probes),attempted);
+    assert.equal(probes.length,8);
+    assert.deepEqual(new Set(audit),blocks);
+    assert.equal(audit.length,9);
+    assert.equal(history.size,3);
+    assert.equal(baseline.get("audio.bin").hash,await core.sha(data));
+    assert.equal(cache.size,0);
+    assert.equal(files.size,17); // 3 markers, 3 metadata, 2 note bodies and 9 blocks.
+});
+
+test("mixed setup shares twenty network slots between whole files and large attachments in both directions",async()=>{
+    const {client,dav,files}=await fixture();
+    const data=new Uint8Array(24*blockSize+59);
+    const store=client(), source=new Map();
+    store.reads.limit=20;
+    for (let i=0;i<22;i++) source.set(i+".md",Uint8Array.of(i));
+    source.set("first.bin",data);
+    source.set("last.md",Uint8Array.of(42));
+    source.set("second.bin",data);
+    let inflight=0, peak=0;
+    const blockPeaks={};
+    for (const method of ["put","read"]) {
+        const original=dav[method];
+        let release, blocks=0;
+        const firstWave=new Promise(resolve=>{release=resolve;});
+        blockPeaks[method]=0;
+        dav[method]=async(name,packet)=>{
+            peak=Math.max(peak,++inflight);
+            try {
+                if ((packet ?? files.get(name))?.byteLength===blockSize+28) {
+                    blockPeaks[method]=Math.max(blockPeaks[method],++blocks);
+                    if (blocks===20) release();
+                    await firstWave;
+                    await new Promise(setImmediate);
+                    blocks--;
+                }
+                return await original(name,packet);
+            } finally { inflight--; }
+        };
+    }
+    const {baseline}=await seedSnapshot(store,{
+        paths:()=>new Set(source.keys()),allowed:()=>true,read:async path=>source.get(path)
+    },()=>true);
+    assert.equal(peak,20);
+    assert.deepEqual(blockPeaks,{put:20,read:20});
+    assert.equal(baseline.size,source.size);
+});
+
 test("whole-file and chunk downloads share one limit and retry a throttled block without repeating successful reads",async()=>{
     const {dav,client,data}=await fixture(), store=client();
     for (let i=0;i<10;i++) await store.publish(i+".md",[],Uint8Array.of(i));
@@ -124,9 +220,38 @@ test("whole-file and chunk downloads share one limit and retry a throttled block
         apply:async(p,previous,body)=>{assert.equal(previous,null);files.set(p,body);}};
     const result=await core.synchronize({store,local,baseline:new Map(),cache:new Map(),checkpoint(){}});
     assert.equal(result.received,12); assert.equal(result.sent,0);
-    assert.equal(peak,8); assert.equal(chunkPeak,8); assert.equal(afterLimit,1);
+    assert.equal(peak,8); assert.equal(chunkPeak,8); assert.equal(afterLimit,4);
     assert.equal(completed.size,20);
     assert.deepEqual(new Uint8Array(files.get("audio.bin")),data);
+});
+
+test("initial chunk upload lowers in stages and verifies uncertain PUTs before retrying",async()=>{
+    const {client,dav}=await fixture(), store=client();
+    const data=new Uint8Array(25*blockSize);
+    const put=dav.put, accepted=new Set(), lowered=[];
+    let lost, missing;
+    store.reads.limit=20;
+    store.reads.onLower=level=>lowered.push(level);
+    dav.put=async(name,packet)=>{
+        if (name.startsWith("objects/b-")) {
+            if (!lost) {
+                lost=name; accepted.add(name);
+                await put(name,packet);
+                throw networkError(503);
+            }
+            missing ??= name;
+            if (name===missing && store.reads.limit>8) throw networkError(429);
+            assert(!accepted.has(name));
+            accepted.add(name);
+        }
+        return put(name,packet);
+    };
+    const {baseline}=await seedSnapshot(store,{
+        paths:()=>new Set(["video.bin"]),allowed:()=>true,read:async()=>data
+    },()=>true);
+    assert.deepEqual(lowered,[12,8]);
+    assert.equal(accepted.size,25);
+    assert.equal(baseline.get("video.bin").hash,await core.sha(data));
 });
 
 test("small files, deletions and a large file without opt-in keep the old whole-object format",async()=>{

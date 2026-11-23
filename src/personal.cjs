@@ -8,26 +8,48 @@ function checkActive(active) {
 
 // The only writer during setup is the device holding the unpublished sharing key.
 // Retrying always takes the trusted local files as the source, never the partial remote copy.
-async function seedSnapshot(store, local, active) {
-    const {groups:heads, localPaths:paths} = await core.syncScope(local,await store.history(new Map()));
+async function seedSnapshot(store, local, active, progress) {
+    const options = {active, progress};
+    const known = await store.history(new Map(), undefined, options);
+    const {groups:heads, localPaths:paths} = await core.syncScope(local,known);
     core.checkAliases([...paths]);
-    for (const path of new Set([...paths, ...heads.keys()])) {
-        checkActive(active);
+    const targets = new Set([...paths, ...heads.keys()]);
+    for (const path of targets) {
         if (!core.safePath(path) || !local.allowed(path)) throw Error("此路径无法同步：" + path);
+        if (heads.get(path)?.length > 1) throw Error("目标库出现并发修改，请检查目标目录。");
+    }
+    let done = 0, batch = [];
+    const uploaded = rev => {
+        known.set(rev.id, rev);
+        progress?.("uploading", ++done, targets.size);
+    };
+    const flushUploads = async () => {
+        if (batch.length) await store.publishBatch(batch, store.reads, uploaded, active);
+        batch = [];
+    };
+    progress?.("uploading", 0, targets.size);
+    for (const path of targets) {
+        checkActive(active);
         const bytes = await local.read(path);
         const hash = bytes === null ? null : await core.sha(bytes);
         const current = heads.get(path) || [];
-        if (current.length > 1) throw Error("目标库出现并发修改，请检查目标目录。");
-        if (hash !== (current[0]?.hash ?? null)) {
-            await store.publish(path, current.map(rev => rev.id), bytes);
+        if (hash === (current[0]?.hash ?? null)) {
+            progress?.("uploading", ++done, targets.size);
+            continue;
         }
+        const chunked = store.transfer?.shouldSplit(bytes);
+        if (chunked) await flushUploads();
+        batch.push({path, parents:current.map(rev => rev.id), bytes, hash});
+        if (chunked || batch.length >= store.reads.limit) await flushUploads();
     }
+    await flushUploads();
 
     // Re-read the published metadata and ciphertext from storage, including chunked files.
-    const history = await store.history(new Map());
+    progress?.("versions");
+    const history = await store.history(known, undefined, {...options, refresh:true});
     const {groups:published,localPaths:remaining} = await core.syncScope(local,history);
     const baseline = new Map();
-    for (const [path, versions] of published) {
+    const verify = async ([path, versions]) => {
         checkActive(active);
         const [rev] = versions;
         const bytes = await local.read(path);
@@ -36,7 +58,24 @@ async function seedSnapshot(store, local, active) {
         if (hash !== null) await store.readBody(rev, {audit:true});
         baseline.set(path, {ids:[rev.id], hash});
         remaining.delete(path);
+        progress?.("readback", baseline.size, published.size);
+    };
+    let small = [];
+    const flushReads = async () => {
+        await store.reads.each(small.length, i => verify(small[i]));
+        small = [];
+    };
+    progress?.("readback", 0, published.size);
+    for (const entry of published) {
+        if (entry[1][0].parts) {
+            await flushReads();
+            await verify(entry); // Its blocks use the same window as the whole files.
+        } else {
+            small.push(entry);
+            if (small.length >= store.reads.limit) await flushReads();
+        }
     }
+    await flushReads();
     if (remaining.size) throw Error("有文件尚未上传，请继续重试。");
     checkActive(active);
     return {baseline,history};

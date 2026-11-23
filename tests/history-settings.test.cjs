@@ -3,9 +3,52 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const {createRequire} = require("node:module");
 
+function loadTab(Setting) {
+    const source=require.resolve("../src/settings.cjs");
+    const localRequire=createRequire(source), settings={exports:{}};
+    const obsidian={PluginSettingTab:class {}, Modal:class {}, Setting, getLanguage:()=>"en"};
+    new Function("module","require",fs.readFileSync(source,"utf8"))(settings,
+        name=>name==="obsidian" ? obsidian : localRequire(name));
+    return settings.exports.HomeboundSettings;
+}
+
+test("the vault summary updates in place and keeps pending work, conflicts and errors visible",()=>{
+    let compare,opened;
+    class Row {
+        setName(){return this;}
+        addButton(create){create({setButtonText(){return this;},onClick(fn){compare=fn;}});}
+    }
+    const HomeboundSettings=loadTab(Row);
+    const p={status:{},uploads:{known:false,files:new Set()},conflicts:[],openConflict:path=>{opened=path;}};
+    const tab=new HomeboundSettings({},p);
+    const label=()=>({setText(value){this.textContent=value;}});
+    tab.statusEl={isConnected:true,toggleClass(){}};
+    tab.summaryEl=label();tab.detailEl=label();tab.resultEl=label();
+    tab.conflictList={empty(){compare=undefined;}};
+    tab.refreshStatus();
+    assert.match(tab.summaryEl.textContent,/Checking/);
+    p.status.lastSuccess=Date.now();p.uploads.known=true;
+    tab.refreshStatus();
+    assert.match(tab.summaryEl.textContent,/Last synced/);
+    assert.equal(tab.detailEl.hidden,true);
+    p.uploads.files.add("note.md");tab.refreshStatus();
+    assert.match(tab.summaryEl.textContent,/1 file waiting/);
+    assert.match(tab.detailEl.textContent,/Last synced/);
+    p.conflicts=["conflict.md"];tab.refreshStatus();
+    assert.equal(tab.summaryEl.textContent,"1 conflict to review");
+    compare();assert.equal(opened,"conflict.md");
+    p.syncError="Sync stopped";tab.refreshStatus();
+    assert.match(tab.detailEl.textContent,/1 conflict to review.*1 file waiting/);
+    assert.equal(tab.resultEl.textContent,"Sync stopped");
+    p.syncError="";p.conflicts=[];p.uploads.files.clear();tab.refreshStatus();
+    assert.equal(compare,undefined);
+    assert.match(tab.summaryEl.textContent,/Last synced/);
+    assert.equal(tab.resultEl.hidden,true);
+});
+
 test("an open retention dropdown refreshes in place and ignores responses superseded by an edit or a closed tab", async () => {
     const selectEl = {ownerDocument:{visibilityState:"visible"}, isConnected:true,
-        getClientRects:()=>[{}], options:[{remove(){}}]};
+        setAttribute(){}, getClientRects:()=>[{}], options:[{remove(){}}]};
     const dropdown = {
         value:"", selectEl,
         addOption(){return this;}, setDisabled(){return this;},
@@ -19,20 +62,14 @@ test("an open retention dropdown refreshes in place and ignores responses supers
         addButton(){return this;}
         addDropdown(create){create(dropdown);return this;}
     }
-    const source = require.resolve("../src/settings.cjs");
-    const localRequire = createRequire(source);
-    const settings = {exports:{}};
-    const obsidian = {PluginSettingTab:class {}, Modal:class {}, Setting, getLanguage:()=>"en"};
-    new Function("module","require",fs.readFileSync(source,"utf8"))(settings,
-        name=>name==="obsidian" ? obsidian : localRequire(name));
-
     const reads=[], writes=[];
     let snapshot={generation:1,days:30};
     const store={readHistoryPolicy:async generation=>{reads.push(generation);return snapshot;}};
     const plugin={state:{current:{id:"vault"}},historyStore:async()=>store,
         setHistoryPeriod:async(id,days)=>writes.push([id,days])};
-    const tab=new settings.exports.HomeboundSettings({},plugin);
-    tab.showHistory({},"vault");
+    const HomeboundSettings=loadTab(Setting);
+    const tab=new HomeboundSettings({},plugin);
+    tab.showHistory({createEl:()=>({addEventListener(){}})},"vault");
     await new Promise(setImmediate);
     assert.equal(dropdown.value,"30");
 

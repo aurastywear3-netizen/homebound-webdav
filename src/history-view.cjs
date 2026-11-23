@@ -40,7 +40,7 @@ class HistoryModal extends Modal {
             if (!this.paths.includes(this.path)) this.path=this.paths[0];
             el.empty();
             if (!this.paths.length) { el.createEl("p",{text:tr("No synced files yet.","暂无已同步文件。")}); return; }
-            const files=new Setting(el).setName(tr("File","文件"));
+            const files=new Setting(el).setClass("homebound-history-picker").setName(tr("File","文件"));
             files.addDropdown(d=>{
                 for (const path of this.paths) d.addOption(path,path);
                 d.setValue(this.path).onChange(path=>{this.path=path;this.showVersions();});
@@ -62,7 +62,7 @@ class HistoryModal extends Modal {
         const revisions=[...history.values()].filter(rev=>rev.path===path && index.available(rev));
         revisions.sort((a,b)=>Number(heads.has(b.id))-Number(heads.has(a.id)) ||
             index.date(b)-index.date(a) || b.id.localeCompare(a.id));
-        const controls=new Setting(el).setName(tr("Version","版本"));
+        const controls=new Setting(el).setClass("homebound-history-picker").setName(tr("Version","版本"));
         let selected=revisions[0];
         controls.addDropdown(d=>{
             for (const r of revisions) {

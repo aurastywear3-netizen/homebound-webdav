@@ -13876,12 +13876,37 @@ var require_settings = __commonJS({
     }
     function field(el, label, value, change, secret = false) {
       new Setting(el).setClass("homebound-field").setName(label).addText((t) => {
+        t.inputEl.setAttribute("aria-label", label);
         if (secret) {
           t.inputEl.type = "password";
           t.inputEl.autocomplete = "off";
         }
         t.setValue(value).onChange(change);
       });
+    }
+    function actionButton(el, label, action, cls) {
+      const b = el.createEl("button", { text: label, cls, attr: { type: "button" } });
+      b.addEventListener("click", async () => {
+        if (b.disabled) return;
+        b.disabled = true;
+        try {
+          await action();
+        } catch (error) {
+          new Notice2(error.message, 1e4);
+        } finally {
+          b.disabled = false;
+        }
+      });
+      return b;
+    }
+    function section(el, title) {
+      const group = el.createEl("section", { cls: "homebound-section" });
+      group.createEl("h3", { text: title });
+      return group;
+    }
+    function updateText(el, text) {
+      if (el.textContent !== text) el.setText(text);
+      el.hidden = !text;
     }
     var DetailModal = class extends Modal {
       onClose() {
@@ -13995,7 +14020,7 @@ var require_settings = __commonJS({
           this.display();
         }
       }
-      reviewJoin(fields) {
+      reviewJoin(fields, form) {
         const p = this.plugin;
         const lines = [
           this.app.vault.getName() + " \u2190 " + core2.davAddress(fields.address) + "/" + core2.directory(fields.folder),
@@ -14007,8 +14032,8 @@ var require_settings = __commonJS({
         ];
         review(this.app, tr2("Join this vault?", "\u52A0\u5165\u8FD9\u4E2A\u5E93\uFF1F"), lines, tr2("Verify and sync", "\u9A8C\u8BC1\u5E76\u540C\u6B65"), async () => {
           await this.perform(() => p.join(fields, fields.key, fields.id));
+          form?.close();
           await p.run();
-          this.display();
         });
       }
       showBackup(c = this.plugin.state.current) {
@@ -14045,11 +14070,27 @@ var require_settings = __commonJS({
         if (!this.statusVisible()) return;
         const p = this.plugin;
         const time = p.status.lastSuccess;
-        this.successEl.setText(time ? new Date(time).toLocaleString() : tr2("No successful sync recorded", "\u6682\u65E0\u6210\u529F\u540C\u6B65\u8BB0\u5F55"));
-        const unknown = p.uploads.failed ? tr2("Unavailable", "\u6682\u65F6\u65E0\u6CD5\u7EDF\u8BA1") : tr2("Checking\u2026", "\u6838\u5BF9\u4E2D\u2026");
-        this.countEl.setText(p.uploads.known ? String(p.uploads.files.size) : unknown);
-        this.conflictEl.setText(p.status.conflicts ? p.conflicts.length ? String(p.conflicts.length) : tr2("None", "\u65E0\u51B2\u7A81") : tr2("Awaiting first check", "\u5F85\u9996\u6B21\u68C0\u67E5"));
-        this.resultEl.setText([p.pollError || p.last, p.historyError].filter(Boolean).join("\n"));
+        const date = new Date(time);
+        let last = "";
+        if (time) {
+          const locale = getLanguage2().replace(/_/g, "-");
+          const clock = date.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" });
+          last = tr2("Last synced ", "\u4E0A\u6B21\u540C\u6B65\u6210\u529F ") + (date.toDateString() === (/* @__PURE__ */ new Date()).toDateString() ? clock : date.toLocaleDateString(locale) + " " + clock);
+        }
+        const count = p.uploads.files.size;
+        let queue = "";
+        if (p.uploads.failed) queue = tr2("Upload count unavailable", "\u6682\u65F6\u65E0\u6CD5\u7EDF\u8BA1\u5F85\u4E0A\u4F20\u6587\u4EF6");
+        else if (!p.uploads.known) queue = tr2("Checking for local changes\u2026", "\u6B63\u5728\u6838\u5BF9\u672C\u5730\u4FEE\u6539\u2026");
+        else if (count) queue = tr2(count + (count === 1 ? " file" : " files") + " waiting to upload", count + " \u4E2A\u6587\u4EF6\u5F85\u4E0A\u4F20");
+        const conflicts = p.conflicts.length;
+        const conflict = conflicts ? tr2(conflicts + (conflicts === 1 ? " conflict" : " conflicts") + " to review", conflicts + " \u4E2A\u51B2\u7A81\u5F85\u5904\u7406") : "";
+        const error = p.syncError || p.pollError;
+        const primary = error && tr2("Sync needs attention", "\u540C\u6B65\u9047\u5230\u95EE\u9898") || conflict || p.syncing && tr2("Syncing\u2026", "\u6B63\u5728\u540C\u6B65\u2026") || queue || last || tr2("Waiting for first sync", "\u7B49\u5F85\u9996\u6B21\u540C\u6B65");
+        updateText(this.summaryEl, primary);
+        updateText(this.detailEl, [conflict, queue, last].filter((s) => s && s !== primary).join(" \xB7 "));
+        const historyError = p.historyError && tr2("Version history: ", "\u7248\u672C\u5386\u53F2\uFF1A") + p.historyError;
+        updateText(this.resultEl, [error, historyError].filter(Boolean).join("\n"));
+        this.statusEl.toggleClass("has-issue", Boolean(error || conflicts || p.historyError));
         if (this.listedConflicts === p.conflicts) return;
         this.listedConflicts = p.conflicts;
         this.conflictList.empty();
@@ -14058,16 +14099,14 @@ var require_settings = __commonJS({
         }
       }
       showStatus(el) {
-        this.statusEl = el.createDiv({ cls: "homebound-status" });
-        const list = this.statusEl.createEl("dl");
-        const value = (label) => {
-          list.createEl("dt", { text: label });
-          return list.createEl("dd");
-        };
-        this.successEl = value(tr2("Last successful sync", "\u6700\u540E\u6210\u529F\u540C\u6B65"));
-        this.countEl = value(tr2("Pending uploads", "\u5F85\u4E0A\u4F20\u6587\u4EF6"));
-        this.conflictEl = value(tr2("Conflicts", "\u51B2\u7A81\u72B6\u6001"));
-        this.resultEl = this.statusEl.createDiv({ attr: { role: "status" } });
+        this.statusEl = el.createEl("section", { cls: "homebound-status" });
+        const head = this.statusEl.createDiv({ cls: "homebound-overview" });
+        const title = head.createDiv({ cls: "homebound-vault" });
+        title.createEl("h2", { text: this.app.vault.getName() });
+        this.summaryEl = title.createDiv({ cls: "homebound-summary", attr: { role: "status" } });
+        actionButton(head, tr2("Sync now", "\u7ACB\u5373\u540C\u6B65"), () => this.plugin.run(), "homebound-sync");
+        this.detailEl = this.statusEl.createDiv({ cls: "homebound-detail" });
+        this.resultEl = this.statusEl.createDiv({ cls: "homebound-issue", attr: { role: "status" } });
         this.conflictList = this.statusEl.createDiv();
         this.listedConflicts = null;
         this.refreshStatus();
@@ -14075,13 +14114,15 @@ var require_settings = __commonJS({
       }
       showHistory(el, id) {
         const p = this.plugin;
-        button(el, tr2("View version history", "\u67E5\u770B\u5386\u53F2\u7248\u672C"), () => p.openHistory());
+        actionButton(el, tr2("View version history", "\u67E5\u770B\u5386\u53F2\u7248\u672C"), () => p.openHistory(), "homebound-nav");
         const description = tr2(
           "Shared by all devices in this vault. The period starts when a version is replaced.",
           "\u540C\u4E00\u5E93\u7684\u6240\u6709\u8BBE\u5907\u5171\u7528\u6B64\u8BBE\u7F6E\uFF0C\u65E7\u7248\u672C\u4ECE\u88AB\u66FF\u6362\u65F6\u5F00\u59CB\u8BA1\u65F6\u3002"
         );
-        const setting = new Setting(el).setName(tr2("Keep version history", "\u5386\u53F2\u7248\u672C\u4FDD\u7559\u671F\u9650")).setDesc(description);
+        const label = tr2("Keep version history", "\u5386\u53F2\u7248\u672C\u4FDD\u7559\u671F\u9650");
+        const setting = new Setting(el).setName(label).setDesc(description);
         setting.addDropdown((d) => {
+          d.selectEl.setAttribute("aria-label", label);
           d.addOption("", tr2("Loading\u2026", "\u8BFB\u53D6\u4E2D\u2026")).setDisabled(true);
           for (const n of periods) d.addOption(String(n), n === 0 ? tr2("Forever", "\u6C38\u4E45\u4FDD\u5B58") : n + tr2(" days", " \u5929"));
           let store, saved, generation, reading = false, writing = false, edits = 0;
@@ -14135,80 +14176,115 @@ var require_settings = __commonJS({
         });
       }
       hide() {
+        this.statusEl = null;
         this.refreshHistoryPeriod = null;
         super.hide?.();
       }
       display() {
         this.refreshHistoryPeriod = null;
-        const p = this.plugin, el = this.containerEl;
+        this.statusEl = null;
+        const p = this.plugin;
         const { current, pending } = p.state;
-        el.empty();
-        el.addClass("homebound-settings");
-        if (current) this.showStatus(el);
-        button(el, tr2("Clear historical conflict files", "\u6E05\u7406\u5386\u53F2\u51B2\u7A81\u6587\u4EF6"), async () => {
-          const { removed, edited } = await p.exclusive(() => p.copies.serial(() => p.copies.clearHistory(p.conflicts, p.cache, p.conflictVersions)));
-          new Notice2(tr2("Historical copies removed: ", "\u5DF2\u6E05\u7406\u5386\u53F2\u526F\u672C\uFF1A") + removed + (edited ? tr2(" \xB7 edited copies kept: ", " \xB7 \u5DF2\u4FDD\u7559\u7F16\u8F91\u8FC7\u7684\u526F\u672C\uFF1A") + edited : ""));
-        }).setDesc(tr2(
-          "Remove resolved copies on this device. Pending versions and edited copies are kept.",
-          "\u6E05\u7406\u672C\u673A\u5DF2\u89E3\u51B3\u7684\u51B2\u7A81\u526F\u672C\uFF0C\u4FDD\u7559\u5F85\u5904\u7406\u7248\u672C\u548C\u624B\u52A8\u7F16\u8F91\u8FC7\u7684\u526F\u672C\u3002"
-        ));
+        this.containerEl.empty();
+        this.containerEl.addClass("homebound-settings");
+        const el = this.containerEl.createDiv({ cls: "homebound-panel" });
         if (pending) {
-          el.createEl("p", { text: tr2("Setup awaiting verification: ", "\u5F85\u5B8C\u6210\u4E0A\u4F20\u548C\u6821\u9A8C\uFF1A") + pending.address + "/" + pending.folder });
-          let password = "";
-          field(el, tr2("Updated WebDAV password (optional)", "\u66F4\u65B0\u540E\u7684 WebDAV \u5BC6\u7801\uFF08\u53EF\u7559\u7A7A\uFF09"), "", (v) => password = v, true);
-          button(el, tr2("Resume upload and verify", "\u7EE7\u7EED\u4E0A\u4F20\u5E76\u6821\u9A8C"), () => this.perform(() => p.resumeSetup(password)));
-          button(el, tr2("Cancel setup\u2026", "\u53D6\u6D88\u672C\u6B21\u5EFA\u5E93\u2026"), () => review(
-            this.app,
-            tr2("Cancel setup?", "\u53D6\u6D88\u672C\u6B21\u5EFA\u5E93\uFF1F"),
-            [tr2(
-              "The partial copy stays in its remote folder. Save its recovery key first if you need it. The previous connection will be available again.",
-              "\u65B0\u76EE\u5F55\u4E2D\u5DF2\u4E0A\u4F20\u7684\u6570\u636E\u5C06\u4FDD\u7559\u3002\u5982\u9700\u4FDD\u7559\u5176\u8BBF\u95EE\u80FD\u529B\uFF0C\u8BF7\u5148\u4FDD\u5B58\u4E0B\u65B9\u6062\u590D\u5BC6\u94A5\u3002\u53D6\u6D88\u540E\u53EF\u7EE7\u7EED\u4F7F\u7528\u539F\u7ED1\u5B9A\u3002"
-            )],
-            tr2("Cancel setup", "\u53D6\u6D88\u672C\u6B21\u5EFA\u5E93"),
-            () => this.perform(async () => {
-              p.save(current ? { current } : {});
-              p.forgetSecrets(pending);
-            })
-          ));
-          button(el, tr2("View pending recovery key", "\u67E5\u770B\u5F85\u5B8C\u6210\u5E93\u7684\u6062\u590D\u5BC6\u94A5"), () => this.showBackup(pending));
+          this.showPending(el, current, pending);
           return;
         }
-        if (p.oldFormat) el.createEl("p", { text: tr2(
-          "Older vault detected. Finish syncing and backing up with 0.2.2 first. Use a new remote folder to migrate a complete local copy.",
-          "\u68C0\u6D4B\u5230\u65E7\u683C\u5F0F\u3002\u8BF7\u5148\u7528 0.2.2 \u540C\u6B65\u5B8C\u6574\u5E76\u5907\u4EFD\uFF0C\u518D\u4ECE\u5B8C\u6574\u672C\u5730\u526F\u672C\u8FC1\u79FB\u5230\u65B0\u7684\u8FDC\u7AEF\u7A7A\u76EE\u5F55\u3002"
-        ) });
-        el.createEl("p", { text: tr2(
-          "Syncs notes and attachments in this vault. Hidden files, empty folders and Obsidian settings are excluded.",
-          "\u540C\u6B65\u5F53\u524D\u5E93\u7684\u7B14\u8BB0\u548C\u9644\u4EF6\u3002\u9690\u85CF\u6587\u4EF6\u3001\u7A7A\u76EE\u5F55\u548C Obsidian \u914D\u7F6E\u76EE\u5F55\u4F1A\u8DF3\u8FC7\u3002"
-        ) });
-        if (current) {
-          el.createEl("p", { text: current.address + "/" + current.folder + " \xB7 " + current.username });
-          button(el, tr2("Sync now", "\u7ACB\u5373\u540C\u6B65"), () => p.run());
-          this.showHistory(el, current.id);
-          button(el, tr2("Show sharing QR code", "\u663E\u793A\u5171\u4EAB\u4E8C\u7EF4\u7801"), () => this.showCode());
-          button(el, tr2("Back up vault key", "\u5907\u4EFD\u5E93\u5BC6\u94A5"), () => this.showBackup());
+        const scan = () => new Scanner(this.app, (f) => this.reviewJoin(f)).open();
+        if (!current) {
+          el.createEl("h2", { text: this.app.vault.getName() });
+          el.createEl("p", { cls: "homebound-intro", text: tr2(
+            "Connect this vault to sync notes and attachments.",
+            "\u8FDE\u63A5\u6B64\u5E93\u4EE5\u540C\u6B65\u7B14\u8BB0\u548C\u9644\u4EF6\u3002"
+          ) });
+          if (p.oldFormat) el.createEl("p", { text: tr2(
+            "Older vault detected. Finish syncing and backing up with 0.2.2 first. Use a new remote folder to migrate a complete local copy.",
+            "\u68C0\u6D4B\u5230\u65E7\u683C\u5F0F\u3002\u8BF7\u5148\u7528 0.2.2 \u540C\u6B65\u5B8C\u6574\u5E76\u5907\u4EFD\uFF0C\u518D\u4ECE\u5B8C\u6574\u672C\u5730\u526F\u672C\u8FC1\u79FB\u5230\u65B0\u7684\u8FDC\u7AEF\u7A7A\u76EE\u5F55\u3002"
+          ) });
+          const actions = el.createDiv({ cls: "homebound-start" });
+          actionButton(actions, tr2("Scan to join", "\u626B\u7801\u52A0\u5165"), scan, "mod-cta");
+          actionButton(actions, tr2("Create new vault", "\u521B\u5EFA\u65B0\u5E93"), () => this.connectionForm("create"));
+          actionButton(el, tr2("Join with a recovery key", "\u4F7F\u7528\u6062\u590D\u5BC6\u94A5\u52A0\u5165"), () => this.connectionForm("recover"), "homebound-alternative");
+          return;
         }
-        button(el, tr2("Scan to join", "\u626B\u7801\u52A0\u5165"), () => new Scanner(this.app, (f) => this.reviewJoin(f)).open());
-        const form = el.createEl("details");
-        form.open = !current;
-        form.createEl("summary", { text: tr2("WebDAV configuration and recovery", "WebDAV \u914D\u7F6E\u4E0E\u6062\u590D") });
+        this.showStatus(el);
+        this.showHistory(section(el, tr2("Version history", "\u7248\u672C\u5386\u53F2")), current.id);
+        const devices = section(el, tr2("Devices and recovery", "\u8BBE\u5907\u4E0E\u6062\u590D"));
+        actionButton(devices, tr2("Use this vault on another device", "\u5728\u53E6\u4E00\u53F0\u8BBE\u5907\u4E0A\u4F7F\u7528\u6B64\u5E93"), () => this.showCode(), "homebound-nav");
+        actionButton(devices, tr2("Back up vault key", "\u5907\u4EFD\u5E93\u5BC6\u94A5"), () => this.showBackup(), "homebound-nav");
+        const advanced = el.createEl("details", { cls: "homebound-advanced" });
+        advanced.createEl("summary", { text: tr2("Advanced settings", "\u9AD8\u7EA7\u8BBE\u7F6E") });
+        advanced.createDiv({ cls: "homebound-detail", text: current.address + "/" + current.folder + " \xB7 " + current.username });
+        actionButton(advanced, tr2("Edit WebDAV connection", "\u4FEE\u6539 WebDAV \u8FDE\u63A5"), () => this.connectionForm("update"), "homebound-nav");
+        actionButton(advanced, tr2("Scan to rejoin", "\u91CD\u65B0\u626B\u7801\u52A0\u5165"), scan, "homebound-nav");
+        actionButton(advanced, tr2("Join with a recovery key", "\u4F7F\u7528\u6062\u590D\u5BC6\u94A5\u52A0\u5165"), () => this.connectionForm("recover"), "homebound-nav");
+        actionButton(advanced, tr2("Rotate key and move to a new folder\u2026", "\u6362\u94A5\u5E76\u8FC1\u5165\u65B0\u76EE\u5F55\u2026"), () => this.connectionForm("rotate"), "homebound-nav");
+        button(advanced, tr2("Clear historical copies", "\u6E05\u7406\u5386\u53F2\u526F\u672C"), () => this.clearCopies()).setName(tr2("Local conflict copies", "\u672C\u673A\u51B2\u7A81\u526F\u672C")).setDesc(tr2(
+          "Remove resolved copies. Pending versions and edited copies are kept.",
+          "\u6E05\u7406\u5DF2\u89E3\u51B3\u7684\u526F\u672C\uFF0C\u4FDD\u7559\u5F85\u5904\u7406\u7248\u672C\u548C\u624B\u52A8\u7F16\u8F91\u8FC7\u7684\u526F\u672C\u3002"
+        ));
+      }
+      async clearCopies() {
+        const p = this.plugin;
+        const { removed, edited } = await p.exclusive(() => p.copies.serial(() => p.copies.clearHistory(p.conflicts, p.cache, p.conflictVersions)));
+        new Notice2(tr2("Historical copies removed: ", "\u5DF2\u6E05\u7406\u5386\u53F2\u526F\u672C\uFF1A") + removed + (edited ? tr2(" \xB7 edited copies kept: ", " \xB7 \u5DF2\u4FDD\u7559\u7F16\u8F91\u8FC7\u7684\u526F\u672C\uFF1A") + edited : ""));
+      }
+      showPending(el, current, pending) {
+        const p = this.plugin;
+        el.createEl("h2", { text: this.app.vault.getName() });
+        el.createEl("p", { text: tr2("Setup awaiting verification: ", "\u5F85\u5B8C\u6210\u4E0A\u4F20\u548C\u6821\u9A8C\uFF1A") + pending.address + "/" + pending.folder });
+        let password = "";
+        field(el, tr2("Updated WebDAV password (optional)", "\u66F4\u65B0\u540E\u7684 WebDAV \u5BC6\u7801\uFF08\u53EF\u7559\u7A7A\uFF09"), "", (v) => password = v, true);
+        button(el, tr2("Resume upload and verify", "\u7EE7\u7EED\u4E0A\u4F20\u5E76\u6821\u9A8C"), () => this.perform(() => p.resumeSetup(password)));
+        button(el, tr2("Cancel setup\u2026", "\u53D6\u6D88\u672C\u6B21\u5EFA\u5E93\u2026"), () => review(
+          this.app,
+          tr2("Cancel setup?", "\u53D6\u6D88\u672C\u6B21\u5EFA\u5E93\uFF1F"),
+          [tr2(
+            "The partial copy stays in its remote folder. Save its recovery key first if you need it. The previous connection will be available again.",
+            "\u65B0\u76EE\u5F55\u4E2D\u5DF2\u4E0A\u4F20\u7684\u6570\u636E\u5C06\u4FDD\u7559\u3002\u5982\u9700\u4FDD\u7559\u5176\u8BBF\u95EE\u80FD\u529B\uFF0C\u8BF7\u5148\u4FDD\u5B58\u4E0B\u65B9\u6062\u590D\u5BC6\u94A5\u3002\u53D6\u6D88\u540E\u53EF\u7EE7\u7EED\u4F7F\u7528\u539F\u7ED1\u5B9A\u3002"
+          )],
+          tr2("Cancel setup", "\u53D6\u6D88\u672C\u6B21\u5EFA\u5E93"),
+          () => this.perform(async () => {
+            p.save(current ? { current } : {});
+            p.forgetSecrets(pending);
+          })
+        ));
+        button(el, tr2("View pending recovery key", "\u67E5\u770B\u5F85\u5B8C\u6210\u5E93\u7684\u6062\u590D\u5BC6\u94A5"), () => this.showBackup(pending));
+      }
+      connectionForm(mode) {
+        const p = this.plugin, current = p.state.current;
+        const modal = new DetailModal(this.app);
+        const titles = {
+          create: tr2("Create new vault", "\u521B\u5EFA\u65B0\u5E93"),
+          update: tr2("Edit WebDAV connection", "\u4FEE\u6539 WebDAV \u8FDE\u63A5"),
+          rotate: tr2("Rotate key and move to a new folder", "\u6362\u94A5\u5E76\u8FC1\u5165\u65B0\u76EE\u5F55"),
+          recover: tr2("Join with a recovery key", "\u4F7F\u7528\u6062\u590D\u5BC6\u94A5\u52A0\u5165")
+        };
+        modal.setTitle(titles[mode]);
+        const form = modal.contentEl;
+        form.addClass("homebound-form");
         const draft = {
           address: current?.address || "",
-          folder: current?.folder || this.app.vault.getName(),
+          folder: mode === "rotate" ? "" : current?.folder || this.app.vault.getName(),
           username: current?.username || "",
           password: ""
         };
         field(form, tr2("WebDAV HTTPS address", "WebDAV HTTPS \u5730\u5740"), draft.address, (v) => draft.address = v);
-        field(form, tr2("Remote folder", "\u8FDC\u7AEF\u5B50\u76EE\u5F55"), draft.folder, (v) => draft.folder = v);
+        field(form, mode === "rotate" || mode === "create" ? tr2("New, empty remote folder", "\u65B0\u7684\u8FDC\u7AEF\u7A7A\u76EE\u5F55") : tr2("Remote folder", "\u8FDC\u7AEF\u5B50\u76EE\u5F55"), draft.folder, (v) => draft.folder = v);
         field(form, tr2("WebDAV username", "WebDAV \u7528\u6237\u540D"), draft.username, (v) => draft.username = v);
         field(form, current ? tr2("WebDAV password (blank keeps current credentials for this account)", "WebDAV \u5BC6\u7801\uFF08\u540C\u5730\u5740\u3001\u540C\u8D26\u53F7\u53EF\u7559\u7A7A\u6CBF\u7528\uFF09") : tr2("WebDAV password", "WebDAV \u5BC6\u7801"), "", (v) => draft.password = v, true);
-        if (current) button(
-          form,
-          tr2("Verify and update WebDAV credentials", "\u9A8C\u8BC1\u5E76\u66F4\u65B0 WebDAV \u914D\u7F6E"),
-          () => this.perform(() => p.join(draft, p.secret(current, "key"), current.id))
-        );
-        const create = current ? tr2("Rotate vault key\u2026", "\u6362\u94A5\u5E76\u8FC1\u5165\u65B0\u76EE\u5F55\u2026") : tr2("Create encrypted vault\u2026", "\u521B\u5EFA\u52A0\u5BC6\u5E93\u2026");
-        button(form, create, () => {
+        if (mode === "update") {
+          button(form, tr2("Verify and save", "\u9A8C\u8BC1\u5E76\u4FDD\u5B58"), async () => {
+            await this.perform(() => p.join(draft, p.secret(current, "key"), current.id));
+            modal.close();
+          });
+        } else if (mode === "recover") {
+          let recovery = "";
+          field(form, tr2("Recovery key", "\u6062\u590D\u5BC6\u94A5"), "", (v) => recovery = v, true);
+          button(form, tr2("Review and join", "\u6838\u5BF9\u5E76\u52A0\u5165"), () => this.reviewJoin({ ...draft, ...qr.recover(recovery) }, modal));
+        } else button(form, tr2("Continue", "\u7EE7\u7EED"), () => {
           const lines = [
             this.app.vault.getName() + " \u2192 " + core2.davAddress(draft.address) + "/" + core2.directory(draft.folder),
             tr2(
@@ -14222,15 +14298,19 @@ var require_settings = __commonJS({
           ));
           review(
             this.app,
-            create,
+            titles[mode],
             lines,
             tr2("Confirm complete local copy and upload", "\u786E\u8BA4\u672C\u5730\u526F\u672C\u5B8C\u6574\uFF0C\u5F00\u59CB\u4E0A\u4F20"),
-            () => this.perform(() => p.startSetup(draft, draft.password))
+            async () => {
+              try {
+                await this.perform(() => p.startSetup(draft, draft.password));
+              } finally {
+                if (p.state.pending || p.state.current !== current) modal.close();
+              }
+            }
           );
         });
-        let recovery = "";
-        field(form, tr2("Recovery key", "\u6062\u590D\u5BC6\u94A5"), "", (v) => recovery = v, true);
-        button(form, tr2("Join using recovery key\u2026", "\u4F7F\u7528\u6062\u590D\u5BC6\u94A5\u52A0\u5165\u2026"), () => this.reviewJoin({ ...draft, ...qr.recover(recovery) }));
+        modal.open();
       }
     };
     module2.exports = { HomeboundSettings: HomeboundSettings2 };
@@ -14327,7 +14407,7 @@ var require_history_view = __commonJS({
             el.createEl("p", { text: tr2("No synced files yet.", "\u6682\u65E0\u5DF2\u540C\u6B65\u6587\u4EF6\u3002") });
             return;
           }
-          const files = new Setting(el).setName(tr2("File", "\u6587\u4EF6"));
+          const files = new Setting(el).setClass("homebound-history-picker").setName(tr2("File", "\u6587\u4EF6"));
           files.addDropdown((d) => {
             for (const path of this.paths) d.addOption(path, path);
             d.setValue(this.path).onChange((path) => {
@@ -14352,7 +14432,7 @@ var require_history_view = __commonJS({
         const heads = new Set(headIds(index.heads.get(path)));
         const revisions = [...history.values()].filter((rev) => rev.path === path && index.available(rev));
         revisions.sort((a, b) => Number(heads.has(b.id)) - Number(heads.has(a.id)) || index.date(b) - index.date(a) || b.id.localeCompare(a.id));
-        const controls = new Setting(el).setName(tr2("Version", "\u7248\u672C"));
+        const controls = new Setting(el).setClass("homebound-history-picker").setName(tr2("Version", "\u7248\u672C"));
         let selected = revisions[0];
         controls.addDropdown((d) => {
           for (const r of revisions) {
@@ -14518,6 +14598,7 @@ module.exports = class HomeboundPlugin extends Plugin {
     this.historyError = "";
     this.watch = new VersionWatch();
     this.pollError = "";
+    this.syncError = "";
     this.syncSerial = 0;
     this.reviewed = /* @__PURE__ */ new Map();
     this.conflictVersions = /* @__PURE__ */ new Map();
@@ -14531,6 +14612,7 @@ module.exports = class HomeboundPlugin extends Plugin {
     this.editTimer = null;
   }
   recordSuccess(conflicts) {
+    this.syncError = "";
     this.conflicts = conflicts;
     this.status = { lastSuccess: Date.now(), conflicts };
     this.app.saveLocalStorage(stateKey + "-status-" + this.state.current.id, this.status);
@@ -14880,9 +14962,11 @@ module.exports = class HomeboundPlugin extends Plugin {
   async run(selection = null, quiet = false, probe = null) {
     if (typeof selection === "string") return this.openConflict(selection);
     if (this.closed || this.busy) return;
-    this.syncSerial++;
+    const serial = ++this.syncSerial;
+    this.syncing = true;
     try {
       const result = await this.exclusive(async () => {
+        this.settingsTab.refreshStatus();
         const c = this.state.current;
         if (this.state.pending) throw Error("\u8BF7\u5148\u5B8C\u6210\u5EFA\u5E93\u6216\u6362\u94A5\u3002");
         if (!c) throw Error("\u8BF7\u5148\u521B\u5EFA\u6216\u626B\u7801\u52A0\u5165\u7B14\u8BB0\u5E93\u3002");
@@ -14949,8 +15033,11 @@ module.exports = class HomeboundPlugin extends Plugin {
     } catch (e) {
       this.watch.accepted = null;
       this.last = tr("Sync stopped: ", "\u540C\u6B65\u5DF2\u505C\u6B62\uFF1A") + e.message;
-      this.settingsTab.refreshStatus();
+      this.syncError = this.last;
       if (!quiet) new Notice(this.last, 1e4);
+    } finally {
+      if (serial === this.syncSerial) this.syncing = false;
+      this.settingsTab.refreshStatus();
     }
   }
 };

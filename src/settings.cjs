@@ -14,9 +14,32 @@ function button(el, label, action) {
 }
 function field(el, label, value, change, secret = false) {
     new Setting(el).setClass("homebound-field").setName(label).addText(t => {
+        t.inputEl.setAttribute("aria-label",label);
         if (secret) { t.inputEl.type = "password"; t.inputEl.autocomplete = "off"; }
         t.setValue(value).onChange(change);
     });
+}
+
+function actionButton(el,label,action,cls) {
+    const b=el.createEl("button",{text:label,cls,attr:{type:"button"}});
+    b.addEventListener("click",async()=>{
+        if (b.disabled) return;
+        b.disabled=true;
+        try { await action(); } catch (error) { new Notice(error.message,10000); }
+        finally { b.disabled=false; }
+    });
+    return b;
+}
+
+function section(el,title) {
+    const group=el.createEl("section",{cls:"homebound-section"});
+    group.createEl("h3",{text:title});
+    return group;
+}
+
+function updateText(el,text) {
+    if (el.textContent!==text) el.setText(text);
+    el.hidden=!text;
 }
 
 class DetailModal extends Modal {
@@ -94,15 +117,15 @@ class HomeboundSettings extends PluginSettingTab {
         try { await this.plugin.exclusive(action); }
         finally { this.display(); }
     }
-    reviewJoin(fields) {
+    reviewJoin(fields,form) {
         const p = this.plugin;
         const lines = [this.app.vault.getName() + " ← " + core.davAddress(fields.address) + "/" + core.directory(fields.folder),
             tr("Vault ID: ","库标识：") + fields.id, tr("After verification, download this vault into the open local vault.",
                 "确认后会验证库标识与密钥，并把远端内容同步到当前本地库。")];
         review(this.app,tr("Join this vault?","加入这个库？"),lines,tr("Verify and sync","验证并同步"),async () => {
             await this.perform(() => p.join(fields,fields.key,fields.id));
+            form?.close();
             await p.run();
-            this.display();
         });
     }
     showBackup(c = this.plugin.state.current) {
@@ -132,12 +155,29 @@ class HomeboundSettings extends PluginSettingTab {
         if (!this.statusVisible()) return;
         const p = this.plugin;
         const time = p.status.lastSuccess;
-        this.successEl.setText(time ? new Date(time).toLocaleString() : tr("No successful sync recorded","暂无成功同步记录"));
-        const unknown = p.uploads.failed ? tr("Unavailable","暂时无法统计") : tr("Checking…","核对中…");
-        this.countEl.setText(p.uploads.known ? String(p.uploads.files.size) : unknown);
-        this.conflictEl.setText(p.status.conflicts ? (p.conflicts.length ? String(p.conflicts.length) : tr("None","无冲突"))
-            : tr("Awaiting first check","待首次检查"));
-        this.resultEl.setText([p.pollError || p.last,p.historyError].filter(Boolean).join("\n"));
+        const date=new Date(time);
+        let last="";
+        if (time) {
+            const locale=getLanguage().replace(/_/g,"-");
+            const clock=date.toLocaleTimeString(locale,{hour:"2-digit",minute:"2-digit"});
+            last=tr("Last synced ","上次同步成功 ")+(date.toDateString()===new Date().toDateString()
+                ? clock : date.toLocaleDateString(locale)+" "+clock);
+        }
+        const count=p.uploads.files.size;
+        let queue="";
+        if (p.uploads.failed) queue=tr("Upload count unavailable","暂时无法统计待上传文件");
+        else if (!p.uploads.known) queue=tr("Checking for local changes…","正在核对本地修改…");
+        else if (count) queue=tr(count+(count===1?" file":" files")+" waiting to upload",count+" 个文件待上传");
+        const conflicts=p.conflicts.length;
+        const conflict=conflicts ? tr(conflicts+(conflicts===1?" conflict":" conflicts")+" to review",conflicts+" 个冲突待处理") : "";
+        const error=p.syncError || p.pollError;
+        const primary=(error && tr("Sync needs attention","同步遇到问题")) || conflict ||
+            (p.syncing && tr("Syncing…","正在同步…")) || queue || last || tr("Waiting for first sync","等待首次同步");
+        updateText(this.summaryEl,primary);
+        updateText(this.detailEl,[conflict,queue,last].filter(s=>s && s!==primary).join(" · "));
+        const historyError=p.historyError && tr("Version history: ","版本历史：")+p.historyError;
+        updateText(this.resultEl,[error,historyError].filter(Boolean).join("\n"));
+        this.statusEl.toggleClass("has-issue",Boolean(error || conflicts || p.historyError));
         if (this.listedConflicts === p.conflicts) return;
         this.listedConflicts = p.conflicts;
         this.conflictList.empty();
@@ -147,13 +187,14 @@ class HomeboundSettings extends PluginSettingTab {
         }
     }
     showStatus(el) {
-        this.statusEl = el.createDiv({cls:"homebound-status"});
-        const list = this.statusEl.createEl("dl");
-        const value = label => { list.createEl("dt",{text:label}); return list.createEl("dd"); };
-        this.successEl = value(tr("Last successful sync","最后成功同步"));
-        this.countEl = value(tr("Pending uploads","待上传文件"));
-        this.conflictEl = value(tr("Conflicts","冲突状态"));
-        this.resultEl = this.statusEl.createDiv({attr:{role:"status"}});
+        this.statusEl = el.createEl("section",{cls:"homebound-status"});
+        const head=this.statusEl.createDiv({cls:"homebound-overview"});
+        const title=head.createDiv({cls:"homebound-vault"});
+        title.createEl("h2",{text:this.app.vault.getName()});
+        this.summaryEl=title.createDiv({cls:"homebound-summary",attr:{role:"status"}});
+        actionButton(head,tr("Sync now","立即同步"),()=>this.plugin.run(),"homebound-sync");
+        this.detailEl=this.statusEl.createDiv({cls:"homebound-detail"});
+        this.resultEl=this.statusEl.createDiv({cls:"homebound-issue",attr:{role:"status"}});
         this.conflictList = this.statusEl.createDiv();
         this.listedConflicts = null;
         this.refreshStatus();
@@ -161,11 +202,13 @@ class HomeboundSettings extends PluginSettingTab {
     }
     showHistory(el,id) {
         const p=this.plugin;
-        button(el,tr("View version history","查看历史版本"),()=>p.openHistory());
+        actionButton(el,tr("View version history","查看历史版本"),()=>p.openHistory(),"homebound-nav");
         const description=tr("Shared by all devices in this vault. The period starts when a version is replaced.",
             "同一库的所有设备共用此设置，旧版本从被替换时开始计时。");
-        const setting=new Setting(el).setName(tr("Keep version history","历史版本保留期限")).setDesc(description);
+        const label=tr("Keep version history","历史版本保留期限");
+        const setting=new Setting(el).setName(label).setDesc(description);
         setting.addDropdown(d=>{
+            d.selectEl.setAttribute("aria-label",label);
             d.addOption("",tr("Loading…","读取中…")).setDisabled(true);
             for (const n of periods) d.addOption(String(n),n===0 ? tr("Forever","永久保存") : n+tr(" days"," 天"));
             let store, saved, generation, reading=false, writing=false, edits=0;
@@ -211,74 +254,114 @@ class HomeboundSettings extends PluginSettingTab {
         });
     }
     hide() {
+        this.statusEl=null;
         this.refreshHistoryPeriod=null;
         super.hide?.();
     }
     display() {
         this.refreshHistoryPeriod=null;
-        const p = this.plugin, el = this.containerEl;
+        this.statusEl=null;
+        const p = this.plugin;
         const {current, pending} = p.state;
-        el.empty(); el.addClass("homebound-settings");
-        if (current) this.showStatus(el);
-        button(el,tr("Clear historical conflict files","清理历史冲突文件"),async () => {
-            const {removed,edited} = await p.exclusive(() =>
-                p.copies.serial(() => p.copies.clearHistory(p.conflicts,p.cache,p.conflictVersions)));
-            new Notice(tr("Historical copies removed: ","已清理历史副本：") + removed +
-                (edited ? tr(" · edited copies kept: "," · 已保留编辑过的副本：") + edited : ""));
-        }).setDesc(tr("Remove resolved copies on this device. Pending versions and edited copies are kept.",
-            "清理本机已解决的冲突副本，保留待处理版本和手动编辑过的副本。"));
+        this.containerEl.empty();
+        this.containerEl.addClass("homebound-settings");
+        const el=this.containerEl.createDiv({cls:"homebound-panel"});
         if (pending) {
-            el.createEl("p",{text:tr("Setup awaiting verification: ","待完成上传和校验：") + pending.address + "/" + pending.folder});
-            let password = "";
-            field(el,tr("Updated WebDAV password (optional)","更新后的 WebDAV 密码（可留空）"),"",v => password = v,true);
-            button(el,tr("Resume upload and verify","继续上传并校验"),() => this.perform(() => p.resumeSetup(password)));
-            button(el,tr("Cancel setup…","取消本次建库…"),() => review(this.app,tr("Cancel setup?","取消本次建库？"),
-                [tr("The partial copy stays in its remote folder. Save its recovery key first if you need it. The previous connection will be available again.",
-                    "新目录中已上传的数据将保留。如需保留其访问能力，请先保存下方恢复密钥。取消后可继续使用原绑定。")],
-                tr("Cancel setup","取消本次建库"),() => this.perform(async () => {
-                    p.save(current ? {current} : {}); p.forgetSecrets(pending);
-                })));
-            button(el,tr("View pending recovery key","查看待完成库的恢复密钥"),() => this.showBackup(pending));
+            this.showPending(el,current,pending);
             return;
         }
-        if (p.oldFormat) el.createEl("p",{text:tr("Older vault detected. Finish syncing and backing up with 0.2.2 first. Use a new remote folder to migrate a complete local copy.",
-            "检测到旧格式。请先用 0.2.2 同步完整并备份，再从完整本地副本迁移到新的远端空目录。")});
-        el.createEl("p",{text:tr("Syncs notes and attachments in this vault. Hidden files, empty folders and Obsidian settings are excluded.",
-            "同步当前库的笔记和附件。隐藏文件、空目录和 Obsidian 配置目录会跳过。")});
-        if (current) {
-            el.createEl("p",{text:current.address + "/" + current.folder + " · " + current.username});
-            button(el,tr("Sync now","立即同步"),() => p.run());
-            this.showHistory(el,current.id);
-            button(el,tr("Show sharing QR code","显示共享二维码"),() => this.showCode());
-            button(el,tr("Back up vault key","备份库密钥"),() => this.showBackup());
+        const scan=()=>new Scanner(this.app,f=>this.reviewJoin(f)).open();
+        if (!current) {
+            el.createEl("h2",{text:this.app.vault.getName()});
+            el.createEl("p",{cls:"homebound-intro",text:tr("Connect this vault to sync notes and attachments.",
+                "连接此库以同步笔记和附件。")});
+            if (p.oldFormat) el.createEl("p",{text:tr("Older vault detected. Finish syncing and backing up with 0.2.2 first. Use a new remote folder to migrate a complete local copy.",
+                "检测到旧格式。请先用 0.2.2 同步完整并备份，再从完整本地副本迁移到新的远端空目录。")});
+            const actions=el.createDiv({cls:"homebound-start"});
+            actionButton(actions,tr("Scan to join","扫码加入"),scan,"mod-cta");
+            actionButton(actions,tr("Create new vault","创建新库"),()=>this.connectionForm("create"));
+            actionButton(el,tr("Join with a recovery key","使用恢复密钥加入"),()=>this.connectionForm("recover"),"homebound-alternative");
+            return;
         }
-        button(el,tr("Scan to join","扫码加入"),() => new Scanner(this.app,f => this.reviewJoin(f)).open());
+        this.showStatus(el);
+        this.showHistory(section(el,tr("Version history","版本历史")),current.id);
+        const devices=section(el,tr("Devices and recovery","设备与恢复"));
+        actionButton(devices,tr("Use this vault on another device","在另一台设备上使用此库"),()=>this.showCode(),"homebound-nav");
+        actionButton(devices,tr("Back up vault key","备份库密钥"),()=>this.showBackup(),"homebound-nav");
 
-        const form = el.createEl("details");
-        form.open = !current;
-        form.createEl("summary",{text:tr("WebDAV configuration and recovery","WebDAV 配置与恢复")});
-        const draft = {address:current?.address || "", folder:current?.folder || this.app.vault.getName(),
+        const advanced=el.createEl("details",{cls:"homebound-advanced"});
+        advanced.createEl("summary",{text:tr("Advanced settings","高级设置")});
+        advanced.createDiv({cls:"homebound-detail",text:current.address+"/"+current.folder+" · "+current.username});
+        actionButton(advanced,tr("Edit WebDAV connection","修改 WebDAV 连接"),()=>this.connectionForm("update"),"homebound-nav");
+        actionButton(advanced,tr("Scan to rejoin","重新扫码加入"),scan,"homebound-nav");
+        actionButton(advanced,tr("Join with a recovery key","使用恢复密钥加入"),()=>this.connectionForm("recover"),"homebound-nav");
+        actionButton(advanced,tr("Rotate key and move to a new folder…","换钥并迁入新目录…"),()=>this.connectionForm("rotate"),"homebound-nav");
+        button(advanced,tr("Clear historical copies","清理历史副本"),()=>this.clearCopies())
+            .setName(tr("Local conflict copies","本机冲突副本"))
+            .setDesc(tr("Remove resolved copies. Pending versions and edited copies are kept.",
+                "清理已解决的副本，保留待处理版本和手动编辑过的副本。"));
+    }
+    async clearCopies() {
+        const p=this.plugin;
+        const {removed,edited} = await p.exclusive(() =>
+            p.copies.serial(() => p.copies.clearHistory(p.conflicts,p.cache,p.conflictVersions)));
+        new Notice(tr("Historical copies removed: ","已清理历史副本：") + removed +
+            (edited ? tr(" · edited copies kept: "," · 已保留编辑过的副本：") + edited : ""));
+    }
+    showPending(el,current,pending) {
+        const p=this.plugin;
+        el.createEl("h2",{text:this.app.vault.getName()});
+        el.createEl("p",{text:tr("Setup awaiting verification: ","待完成上传和校验：") + pending.address + "/" + pending.folder});
+        let password = "";
+        field(el,tr("Updated WebDAV password (optional)","更新后的 WebDAV 密码（可留空）"),"",v => password = v,true);
+        button(el,tr("Resume upload and verify","继续上传并校验"),() => this.perform(() => p.resumeSetup(password)));
+        button(el,tr("Cancel setup…","取消本次建库…"),() => review(this.app,tr("Cancel setup?","取消本次建库？"),
+            [tr("The partial copy stays in its remote folder. Save its recovery key first if you need it. The previous connection will be available again.",
+                "新目录中已上传的数据将保留。如需保留其访问能力，请先保存下方恢复密钥。取消后可继续使用原绑定。")],
+            tr("Cancel setup","取消本次建库"),() => this.perform(async () => {
+                p.save(current ? {current} : {}); p.forgetSecrets(pending);
+            })));
+        button(el,tr("View pending recovery key","查看待完成库的恢复密钥"),() => this.showBackup(pending));
+    }
+    connectionForm(mode) {
+        const p=this.plugin, current=p.state.current;
+        const modal=new DetailModal(this.app);
+        const titles={
+            create:tr("Create new vault","创建新库"), update:tr("Edit WebDAV connection","修改 WebDAV 连接"),
+            rotate:tr("Rotate key and move to a new folder","换钥并迁入新目录"), recover:tr("Join with a recovery key","使用恢复密钥加入")
+        };
+        modal.setTitle(titles[mode]);
+        const form=modal.contentEl;
+        form.addClass("homebound-form");
+        const draft = {address:current?.address || "", folder:mode==="rotate" ? "" : current?.folder || this.app.vault.getName(),
             username:current?.username || "", password:""};
         field(form,tr("WebDAV HTTPS address","WebDAV HTTPS 地址"),draft.address,v => draft.address = v);
-        field(form,tr("Remote folder","远端子目录"),draft.folder,v => draft.folder = v);
+        field(form,mode==="rotate" || mode==="create" ? tr("New, empty remote folder","新的远端空目录") : tr("Remote folder","远端子目录"),draft.folder,v => draft.folder = v);
         field(form,tr("WebDAV username","WebDAV 用户名"),draft.username,v => draft.username = v);
         field(form,current ? tr("WebDAV password (blank keeps current credentials for this account)","WebDAV 密码（同地址、同账号可留空沿用）")
             : tr("WebDAV password","WebDAV 密码"),"",v => draft.password = v,true);
-        if (current) button(form,tr("Verify and update WebDAV credentials","验证并更新 WebDAV 配置"),
-            () => this.perform(() => p.join(draft,p.secret(current,"key"),current.id)));
-        const create = current ? tr("Rotate vault key…","换钥并迁入新目录…") : tr("Create encrypted vault…","创建加密库…");
-        button(form,create,() => {
+        if (mode==="update") {
+            button(form,tr("Verify and save","验证并保存"),async()=>{
+                await this.perform(()=>p.join(draft,p.secret(current,"key"),current.id));
+                modal.close();
+            });
+        } else if (mode==="recover") {
+            let recovery="";
+            field(form,tr("Recovery key","恢复密钥"),"",v=>recovery=v,true);
+            button(form,tr("Review and join","核对并加入"),()=>this.reviewJoin({...draft,...qr.recover(recovery)},modal));
+        } else button(form,tr("Continue","继续"),() => {
             const lines = [this.app.vault.getName() + " → " + core.davAddress(draft.address) + "/" + core.directory(draft.folder),
                 tr("Upload the complete local notes and attachments, then read them back for verification. The new vault starts a fresh revision history.",
                     "将当前本地笔记和附件上传并读回校验。新库从当前内容开始记录版本。")];
             if (current) lines.push(tr("Back up the old vault key to retain access to its history. For a lost device, revoke its WebDAV credentials on the server first. Confirm this local copy includes your latest files and all offline changes you want to keep. Other devices must scan the new code.",
                 "请先备份原库密钥，以后读取旧历史时会用到。若设备遗失，请先在服务端撤销旧 WebDAV 凭据。请确认本地副本完整，并已汇集要保留的离线修改。其余设备须重新扫码。"));
-            review(this.app,create,lines,tr("Confirm complete local copy and upload","确认本地副本完整，开始上传"),
-                () => this.perform(() => p.startSetup(draft,draft.password)));
+            review(this.app,titles[mode],lines,tr("Confirm complete local copy and upload","确认本地副本完整，开始上传"),
+                async () => {
+                    try { await this.perform(() => p.startSetup(draft,draft.password)); }
+                    finally { if (p.state.pending || p.state.current!==current) modal.close(); }
+                });
         });
-        let recovery = "";
-        field(form,tr("Recovery key","恢复密钥"),"",v => recovery = v,true);
-        button(form,tr("Join using recovery key…","使用恢复密钥加入…"),() => this.reviewJoin({...draft,...qr.recover(recovery)}));
+        modal.open();
     }
 
 }

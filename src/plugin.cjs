@@ -81,6 +81,7 @@ module.exports = class HomeboundPlugin extends Plugin {
         this.historyError = "";
         this.watch = new VersionWatch();
         this.pollError = "";
+        this.syncError = "";
         this.syncSerial = 0;
         this.reviewed = new Map();
         this.conflictVersions = new Map();
@@ -94,6 +95,7 @@ module.exports = class HomeboundPlugin extends Plugin {
         this.editTimer = null;
     }
     recordSuccess(conflicts) {
+        this.syncError = "";
         this.conflicts = conflicts;
         this.status = {lastSuccess:Date.now(), conflicts};
         this.app.saveLocalStorage(stateKey + "-status-" + this.state.current.id, this.status);
@@ -434,9 +436,11 @@ module.exports = class HomeboundPlugin extends Plugin {
     async run(selection = null, quiet = false, probe = null) {
         if (typeof selection === "string") return this.openConflict(selection);
         if (this.closed || this.busy) return;
-        this.syncSerial++;
+        const serial=++this.syncSerial;
+        this.syncing = true;
         try {
             const result = await this.exclusive(async () => {
+                this.settingsTab.refreshStatus();
                 const c = this.state.current;
                 if (this.state.pending) throw Error("请先完成建库或换钥。");
                 if (!c) throw Error("请先创建或扫码加入笔记库。");
@@ -499,8 +503,11 @@ module.exports = class HomeboundPlugin extends Plugin {
         } catch (e) {
             this.watch.accepted = null;
             this.last = tr("Sync stopped: ","同步已停止：") + e.message;
-            this.settingsTab.refreshStatus();
+            this.syncError = this.last;
             if (!quiet) new Notice(this.last, 10000);
+        } finally {
+            if (serial===this.syncSerial) this.syncing = false;
+            this.settingsTab.refreshStatus();
         }
     }
 };

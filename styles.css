@@ -1,31 +1,129 @@
-.homebound-settings .homebound-field {
+.homebound-settings { container: homebound / inline-size; }
+.homebound-panel {
+    max-inline-size: 46rem;
+    margin-inline: auto;
+    color: var(--text-normal);
+    overflow-wrap: anywhere;
+}
+.homebound-panel h2 {
+    margin: 0;
+    padding: 0;
+    font-size: var(--h2-size, 1.5em);
+    line-height: 1.25;
+}
+.homebound-overview, .homebound-start {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: .75rem 1rem;
+}
+.homebound-vault { flex: 1 1 13rem; min-inline-size: 0; }
+.homebound-summary { margin-block-start: .4rem; }
+.homebound-summary, .homebound-detail, .homebound-intro { color: var(--text-muted); }
+.homebound-status.has-issue .homebound-summary { color: var(--text-normal); font-weight: var(--font-semibold); }
+.homebound-detail, .homebound-issue { margin-block-start: .5rem; font-size: var(--font-ui-small); }
+.homebound-issue { color: var(--text-error); white-space: pre-line; }
+.homebound-panel [hidden] { display: none; }
+.homebound-section, .homebound-advanced {
+    margin-block-start: 1.5rem;
+    padding-block-start: 1rem;
+    border-block-start: 1px solid var(--background-modifier-border);
+}
+.homebound-section h3, .homebound-advanced summary {
+    margin: 0;
+    font-size: var(--font-ui-medium);
+    font-weight: var(--font-semibold);
+}
+.homebound-panel .homebound-section h3 { padding: 0; }
+.homebound-advanced summary {
+    width: fit-content;
+    padding-block: .5rem;
+    cursor: pointer;
+}
+.homebound-panel button.homebound-nav, .homebound-panel button.homebound-alternative {
+    color: var(--text-normal);
+    background: transparent;
+    box-shadow: none;
+    height: auto;
+    text-align: start;
+    white-space: normal;
+    font: inherit;
+}
+.homebound-panel button.homebound-nav {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    width: 100%;
+    min-block-size: 2.75rem;
+    padding: .5rem .25rem;
+}
+.homebound-nav::after {
+    content: "";
+    width: .45rem;
+    height: .45rem;
+    flex: none;
+    margin-inline-end: .3rem;
+    color: var(--text-muted);
+    border: solid currentColor;
+    border-width: 1.5px 1.5px 0 0;
+    transform: rotate(45deg);
+}
+.homebound-panel:dir(rtl) .homebound-nav::after { transform: rotate(-135deg); }
+.homebound-panel button.homebound-alternative {
+    margin-block-start: 1rem;
+    padding: .5rem 0;
+    color: var(--text-muted);
+}
+.homebound-panel button.homebound-nav:hover, .homebound-panel button.homebound-alternative:hover {
+    background: var(--background-modifier-hover);
+    color: var(--text-normal);
+}
+.homebound-panel :is(button,summary,select):focus-visible {
+    outline: 2px solid var(--interactive-accent);
+    outline-offset: 2px;
+}
+.homebound-panel .setting-item {
+    border: 0;
+    background: transparent;
+    padding: .5rem .25rem;
+    min-width: 0;
+}
+.homebound-panel .setting-item-info { min-width: 0; }
+:is(.homebound-panel,.homebound-form) .homebound-field {
     display: flex;
     flex-direction: column;
     align-items: stretch;
     gap: var(--size-4-2);
 }
-.homebound-settings .homebound-field .setting-item-control {
+:is(.homebound-panel,.homebound-form) .homebound-field .setting-item-control {
     flex: 1 1 auto;
     min-width: 0;
     width: 100%;
 }
-.homebound-settings .homebound-field input {
+:is(.homebound-panel,.homebound-form) .homebound-field input {
     width: 100%;
     max-width: none;
     min-width: 0;
     box-sizing: border-box;
 }
-.homebound-settings .setting-item-control {
+:is(.homebound-panel,.homebound-form) .setting-item-control {
     margin-inline-start: 0;
     flex-wrap: wrap;
 }
-@media (max-width: 600px) {
-    .mod-settings .vertical-tab-content-container > .homebound-settings.vertical-tab-content {
-        padding-inline: var(--size-4-1);
+@container homebound (max-width: 30rem) {
+    .homebound-panel .setting-item {
+        flex-direction: column;
+        align-items: stretch;
+        gap: .5rem;
     }
-    .homebound-settings .homebound-field {
-        padding-inline: 0;
+    .homebound-panel .setting-item-control {
+        margin-inline: 0;
+        align-self: flex-start;
+        justify-content: flex-start;
     }
+    .homebound-overview { align-items: flex-start; }
+    .homebound-panel :is(button,select), .homebound-advanced summary { min-block-size: 44px; }
 }
 .homebound-invite-qr {
     display: block;
@@ -43,15 +141,22 @@
     min-height: 5em;
     font-family: var(--font-monospace);
 }
-.homebound-status dl {
-    display: grid;
-    grid-template-columns: auto 1fr;
-    gap: var(--size-4-1) var(--size-4-4);
-}
-.homebound-status dt, .homebound-version {
+.homebound-version {
     color: var(--text-muted);
 }
-.homebound-status dd { margin: 0; }
+.homebound-history-picker {
+    flex-wrap: wrap;
+    gap: .5rem 1rem;
+}
+.homebound-history-picker .setting-item-control {
+    min-inline-size: 0;
+    max-inline-size: 100%;
+    margin-inline-start: 0;
+    flex-wrap: wrap;
+}
+.homebound-history-picker .setting-item-control > * {
+    max-inline-size: 100%;
+}
 .homebound-status .setting-item-name, .homebound-review-path, .homebound-version { overflow-wrap: anywhere; }
 .homebound-review .setting-item-control { flex-wrap: wrap; }
 .homebound-review .setting-item[hidden] { display: none; }

@@ -1,4 +1,4 @@
-# Homebound WebDAV 0.3.3
+# Homebound WebDAV 0.3.4
 
 Homebound WebDAV syncs encrypted notes and attachments between your Obsidian devices using an HTTPS WebDAV server you control. Each vault has its own folder and encryption key.
 
@@ -20,6 +20,8 @@ Open **Settings → Community plugins → Browse** in Obsidian 1.11.4 or later. 
 4. After setup, sync runs automatically while the vault is open and visible. Local changes sync after a two-second pause. Every five seconds Homebound checks the WebDAV version marker and downloads new revisions when it changes. Returning to the foreground, reconnecting and the five-minute full check also trigger a sync. **Sync now** is available at any time. Repeat setup in another vault with its own remote folder and key.
 5. Settings show the last successful sync, pending local uploads (including deletions), and unresolved conflicts. Markdown and plain-text notes use their shared revision to merge independent edits automatically. If both devices change the same passage differently, choose **Keep remote**, **Keep local** or **Edit** for that passage. Other edits from both devices are included when the result is saved. Independently created files, deletion versus editing, and binary attachments still require a file-level decision. You can reopen a dismissed comparison from settings.
 
+When a conflict needs a decision, Homebound saves the versions in the plugin’s private `conflicts/` folder. Dismissing the comparison puts one local copy next to the original, for example `Note-20261123143005-conflict-<revision ID>.md`. The copy is excluded from sync. Once the conflict is resolved on either device, the next successful sync removes the unchanged sibling. **Clear historical conflict files** in settings removes resolved local archives. Edited copies are kept.
+
 ## 创建与加入
 
 1. 在当前库启用插件，填写 WebDAV 地址、账号、密码和一个新的子目录。点「创建加密库」，核对目标并确认本地副本完整。插件会创建缺少的目录，上传笔记和附件，并读回校验。中断后在同一设备点「继续上传并校验」。
@@ -40,6 +42,8 @@ Open **Settings → Community plugins → Browse** in Obsidian 1.11.4 or later. 
 每库随机生成 32 字节密钥。AES-256-GCM 认证加密正文、附件和含文件名、相对路径的修订元数据。WebDAV 上的对象使用随机标识，服务器能看到外层子目录、对象大小、数量及访问时间。插件将库密钥和 WebDAV 密码存入 Obsidian SecretStorage。库绑定和同步检查点保存在当前设备当前库的本地存储。
 
 同步当前库内的笔记和附件，排除隐藏文件、Obsidian 配置、空目录及保留的冲突副本目录。至少 4 MiB 的附件自动分块传输，重新同步时恢复进度。设备仍需能在内存中读写整份附件。设置显示最后成功同步时间、待上传文件数（含删除）和冲突状态。Markdown 和纯文本笔记会根据共同版本自动合并并保存不同位置的修改。两端改到同一处且内容不同时，才会弹出比较框。每处可选「保留远端」「保留本地」或「编辑」，保存时会一起保留两端在其他位置的修改。独立新建的同名文件、删除与编辑冲突、二进制附件需要按整份文件选择。关闭比较框后可从设置中的「比较差异」重新打开。锁屏或后台暂停时可回到前台继续。
+
+自动合并成功时不会创建冲突副本。需要人工选择时，版本先保存在当前库的 `.obsidian/plugins/homebound-webdav/conflicts/`；使用自定义配置目录的库会跟随该目录。关闭比较框、暂不处理时，原文件旁会出现一份本机副本，例如 `日记-20261123143005-conflict-<版本ID>.md`。时间采用本地的年月日时分秒，副本保留原扩展名，也不参与同步。两端任一设备解决冲突后，下次成功同步会收起未改动的同目录副本。设置中的「清理历史冲突文件」可以清除本机已解决的历史副本。待处理版本和用户改过的副本会保留。升级后，同步会将旧 `Homebound conflicts/` 中与修订记录匹配的原样副本迁入插件目录。
 
 轮询优先使用提交目录的 WebDAV 属性。如果服务器不提供可用的版本属性，新版客户端在发布提交后更新一个小标记文件；在这类服务器上，旧版客户端的写入仍可通过完整检查发现。
 

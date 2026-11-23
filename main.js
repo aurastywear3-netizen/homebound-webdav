@@ -12778,13 +12778,14 @@ var require_adapter = __commonJS({
       return "Basic " + btoa(Array.from(bytes, (b) => String.fromCharCode(b)).join(""));
     }
     var VaultFiles2 = class {
-      constructor(app) {
+      constructor(app, copies) {
         this.app = app;
         this.vault = app.vault;
+        this.copies = copies;
       }
       allowed(path) {
         const first = path.split("/")[0].toLowerCase();
-        return !core2.isRecovery(path) && first !== this.vault.configDir.toLowerCase() && !path.split("/").some((part) => part.startsWith("."));
+        return !this.copies.paths.has(path) && !core2.isRecovery(path) && first !== this.vault.configDir.toLowerCase() && !path.split("/").some((part) => part.startsWith("."));
       }
       paths() {
         return new Set(this.vault.getFiles().map((f) => f.path).filter((path) => this.allowed(path)));
@@ -12842,14 +12843,8 @@ var require_adapter = __commonJS({
           await this.vault.modifyBinary(file, bytes);
         }
       }
-      async archive(rev, body) {
-        const path = core2.conflictFolder + "/" + rev.id + "/" + rev.path;
-        const current = await this.read(path);
-        if (current !== null) {
-          if (await core2.sha(current) !== rev.hash) throw Error("Move your edited conflict copy before syncing: " + path);
-          return;
-        }
-        await this.apply(path, null, await body());
+      archive(rev, body) {
+        return this.copies.archive(rev, body);
       }
     };
     module2.exports = { Dav: Dav2, VaultFiles: VaultFiles2, credentials: credentials2 };
@@ -13183,6 +13178,241 @@ var require_pending = __commonJS({
       }
     };
     module2.exports = { PendingUploads: PendingUploads2 };
+  }
+});
+
+// src/conflict-files.cjs
+var require_conflict_files = __commonJS({
+  "src/conflict-files.cjs"(exports2, module2) {
+    "use strict";
+    var { conflictFolder, safePath, isRecovery, sha } = require_core();
+    var revisionDir = /^([0-9a-f]{32})-([0-9a-f]{64})$/;
+    var encoder = new TextEncoder();
+    function stamp(date) {
+      return [
+        date.getFullYear(),
+        date.getMonth() + 1,
+        date.getDate(),
+        date.getHours(),
+        date.getMinutes(),
+        date.getSeconds()
+      ].map((n) => String(n).padStart(2, "0")).join("");
+    }
+    function fitBytes(text, room) {
+      let result = "";
+      for (const ch of text) {
+        room -= encoder.encode(ch).length;
+        if (room < 0) break;
+        result += ch;
+      }
+      return result;
+    }
+    function siblingPath({ path, id, time, number }) {
+      const slash = path.lastIndexOf("/"), name = path.slice(slash + 1), dot = name.lastIndexOf(".");
+      const suffix = "-" + time + "-conflict-" + id + (number ? "-" + number : "");
+      const room = 255 - suffix.length;
+      const ext = dot < 0 ? "" : fitBytes(name.slice(dot), room - 4);
+      const stem = fitBytes(dot < 0 ? name : name.slice(0, dot), room - encoder.encode(ext).length);
+      return path.slice(0, slash + 1) + stem + suffix + ext;
+    }
+    var ConflictFiles2 = class {
+      constructor(app, pluginDir) {
+        this.app = app;
+        this.disk = app.vault.adapter;
+        this.root = pluginDir + "/conflicts";
+        this.markers = this.root + "/deferred";
+        this.copies = /* @__PURE__ */ new Map();
+        this.paths = /* @__PURE__ */ new Set();
+        this.work = Promise.resolve();
+      }
+      serial(action) {
+        const result = this.work.then(action);
+        this.work = result.catch(() => {
+        });
+        return result;
+      }
+      key(rev) {
+        return rev.id + "-" + rev.hash;
+      }
+      archivePath(rev) {
+        return this.root + "/" + this.key(rev) + "/" + rev.path;
+      }
+      marker(rev) {
+        return this.markers + "/" + this.key(rev) + ".json";
+      }
+      track(record) {
+        this.copies.set(record.id, record);
+        this.paths.add(siblingPath(record));
+      }
+      async load() {
+        if (!await this.disk.exists(this.markers)) return;
+        for (const file of (await this.disk.list(this.markers)).files) {
+          const name = file.slice(this.markers.length + 1);
+          const match = name.endsWith(".json") && revisionDir.exec(name.slice(0, -5));
+          if (!match) continue;
+          const record = JSON.parse(await this.disk.read(file));
+          if (!safePath(record.path) || isRecovery(record.path) || typeof record.time !== "string" || !/^\d{14}$/.test(record.time) || !Number.isSafeInteger(record.number) || record.number < 0)
+            throw Error("Invalid conflict copy record: " + file);
+          this.track({ ...record, id: match[1], hash: match[2] });
+        }
+      }
+      async ensureDir(path) {
+        if (await this.disk.exists(path)) return;
+        const parent = path.lastIndexOf("/");
+        if (parent >= 0) await this.ensureDir(path.slice(0, parent));
+        try {
+          await this.disk.mkdir(path);
+        } catch (error) {
+          if ((await this.disk.stat(path))?.type !== "folder") throw error;
+        }
+      }
+      async read(rev) {
+        const path = this.archivePath(rev);
+        if (!await this.disk.exists(path)) return null;
+        const bytes = await this.disk.readBinary(path);
+        return await sha(bytes) === rev.hash ? bytes : null;
+      }
+      async archive(rev, body) {
+        if (await this.read(rev) !== null) return;
+        const path = this.archivePath(rev), bytes = await body();
+        if (await sha(bytes) !== rev.hash) throw Error("Invalid conflict copy: " + rev.path);
+        if (await this.disk.exists(path)) throw Error("Move the modified conflict archive before syncing: " + path);
+        await this.ensureDir(path.slice(0, path.lastIndexOf("/")));
+        const partial = this.root + "/" + this.key(rev) + "/.partial";
+        await this.disk.writeBinary(partial, bytes);
+        await this.disk.rename(partial, path);
+      }
+      defer(rev, local, history, headIds = [rev.id]) {
+        return this.serial(async () => {
+          let record = [...this.copies.values()].find((r) => r.path === rev.path && headIds.includes(r.id));
+          if (!record) {
+            record = { id: rev.id, hash: rev.hash, path: rev.path, time: stamp(/* @__PURE__ */ new Date()), number: 0 };
+            const known = new Set(Array.from(history.values(), (r) => r.path.normalize("NFC").toLowerCase()));
+            while (await this.disk.exists(siblingPath(record)) || known.has(siblingPath(record).normalize("NFC").toLowerCase()))
+              record.number++;
+            await this.ensureDir(this.markers);
+            const marker = this.marker(record);
+            await this.disk.write(marker + ".tmp", JSON.stringify(record));
+            await this.disk.rename(marker + ".tmp", marker);
+            this.track(record);
+          }
+          await this.materialize(record, local);
+        });
+      }
+      async materialize(record, local) {
+        const path = siblingPath(record);
+        if (await this.disk.exists(path)) return;
+        const bytes = await this.read(record);
+        if (bytes === null) throw Error("Missing conflict copy: " + record.path);
+        await local.apply(path, null, bytes);
+      }
+      async removeSibling(record) {
+        const path = siblingPath(record);
+        if (await this.disk.exists(path)) {
+          const file = this.app.vault.getAbstractFileByPath(path);
+          if (!file || file.children || await sha(await this.app.vault.readBinary(file)) !== record.hash || file.path !== path)
+            return false;
+          await this.app.fileManager.trashFile(file);
+        }
+        await this.disk.remove(this.marker(record));
+        this.paths.delete(path);
+        this.copies.delete(record.id);
+        return true;
+      }
+      async trashEmpty(dir) {
+        const { files, folders } = await this.disk.list(dir);
+        if (files.length || folders.length) return false;
+        await this.disk.trashLocal(dir);
+        return true;
+      }
+      async prune(dir, root) {
+        while (dir === root || dir.startsWith(root + "/")) {
+          if (!await this.trashEmpty(dir)) break;
+          dir = dir.slice(0, dir.lastIndexOf("/"));
+        }
+      }
+      async migrateLegacy(history) {
+        const folder = this.app.vault.getAbstractFileByPath(conflictFolder);
+        if (!folder?.children) return 0;
+        let edited = 0;
+        const visit = async (dir) => {
+          for (const file of [...dir.children]) {
+            if (file.children) {
+              await visit(file);
+              continue;
+            }
+            const [id, ...parts] = file.path.slice(conflictFolder.length + 1).split("/");
+            const rev = history.get(id);
+            if (!rev?.hash || rev.path !== parts.join("/")) continue;
+            const bytes = await this.app.vault.readBinary(file);
+            if (await sha(bytes) !== rev.hash) {
+              edited++;
+              continue;
+            }
+            await this.archive(rev, () => bytes);
+            if (await sha(await this.app.vault.readBinary(file)) !== rev.hash || file.path !== conflictFolder + "/" + id + "/" + rev.path)
+              continue;
+            const parent = file.parent.path;
+            await this.app.fileManager.trashFile(file);
+            await this.prune(parent, conflictFolder);
+          }
+        };
+        await visit(folder);
+        return edited;
+      }
+      async reconcile(local, history, versions) {
+        await this.migrateLegacy(history);
+        for (const record of this.copies.values()) {
+          if (versions.get(record.path)?.split(",").includes(record.id)) await this.materialize(record, local);
+          else await this.removeSibling(record);
+        }
+      }
+      async clearHistory(conflicts, history, versions = /* @__PURE__ */ new Map()) {
+        let edited = await this.migrateLegacy(history);
+        const active = (path, id) => versions.has(path) ? versions.get(path).split(",").includes(id) : conflicts.includes(path);
+        let removed = 0;
+        for (const r of this.copies.values()) {
+          if (active(r.path, r.id)) continue;
+          const existed = await this.disk.exists(siblingPath(r));
+          if (!await this.removeSibling(r)) edited++;
+          else if (existed) removed++;
+        }
+        if (!await this.disk.exists(this.root)) return { removed, edited };
+        for (const dir of (await this.disk.list(this.root)).folders) {
+          const match = revisionDir.exec(dir.slice(this.root.length + 1));
+          if (!match) continue;
+          const visit = async (parent) => {
+            const { files, folders } = await this.disk.list(parent);
+            for (const file of files) {
+              const source = file.slice(dir.length + 1);
+              if (source === ".partial") {
+                await this.disk.remove(file);
+                continue;
+              }
+              if (!safePath(source) || active(source, match[1])) continue;
+              if (await sha(await this.disk.readBinary(file)) !== match[2]) {
+                edited++;
+                continue;
+              }
+              await this.disk.remove(file);
+              removed++;
+            }
+            for (const sub of folders) await visit(sub);
+            await this.trashEmpty(parent);
+          };
+          await visit(dir);
+        }
+        if (await this.disk.exists(this.markers)) {
+          for (const file of (await this.disk.list(this.markers)).files) {
+            const name = file.slice(this.markers.length + 1);
+            if (name.endsWith(".json.tmp") && revisionDir.test(name.slice(0, -9))) await this.disk.remove(file);
+          }
+          await this.prune(this.markers, this.root);
+        } else await this.prune(this.root, this.root);
+        return { removed, edited };
+      }
+    };
+    module2.exports = { ConflictFiles: ConflictFiles2, siblingPath };
   }
 });
 
@@ -13602,6 +13832,13 @@ var require_settings = __commonJS({
         el.empty();
         el.addClass("homebound-settings");
         if (current) this.showStatus(el);
+        button(el, tr2("Clear historical conflict files", "\u6E05\u7406\u5386\u53F2\u51B2\u7A81\u6587\u4EF6"), async () => {
+          const { removed, edited } = await p.exclusive(() => p.copies.serial(() => p.copies.clearHistory(p.conflicts, p.cache, p.conflictVersions)));
+          new Notice2(tr2("Historical copies removed: ", "\u5DF2\u6E05\u7406\u5386\u53F2\u526F\u672C\uFF1A") + removed + (edited ? tr2(" \xB7 edited copies kept: ", " \xB7 \u5DF2\u4FDD\u7559\u7F16\u8F91\u8FC7\u7684\u526F\u672C\uFF1A") + edited : ""));
+        }).setDesc(tr2(
+          "Remove resolved copies on this device. Pending versions and edited copies are kept.",
+          "\u6E05\u7406\u672C\u673A\u5DF2\u89E3\u51B3\u7684\u51B2\u7A81\u526F\u672C\uFF0C\u4FDD\u7559\u5F85\u5904\u7406\u7248\u672C\u548C\u624B\u52A8\u7F16\u8F91\u8FC7\u7684\u526F\u672C\u3002"
+        ));
         if (pending) {
           el.createEl("p", { text: tr2("Setup awaiting verification: ", "\u5F85\u5B8C\u6210\u4E0A\u4F20\u548C\u6821\u9A8C\uFF1A") + pending.address + "/" + pending.folder });
           let password = "";
@@ -13738,12 +13975,14 @@ var { Dav, VaultFiles, credentials } = require_adapter();
 var { ChunkTransfer, TransferCache, blockSize } = require_transfer();
 var { seedSnapshot, checkJoin } = require_personal();
 var { PendingUploads } = require_pending();
+var { ConflictFiles } = require_conflict_files();
 var { ConflictReview } = require_review();
 var { notePlan, isNote } = require_merge();
 var { HomeboundSettings } = require_settings();
 var { VersionWatch } = require_version();
 var tr = (en, zh) => getLanguage().startsWith("zh") ? zh : en;
 var stateKey = "homebound-personal-v2";
+var openReviewKey = stateKey + "-open-review";
 var baselineKey = (id) => stateKey + "-baseline-" + id;
 function location(fields) {
   const address = core.davAddress(fields.address);
@@ -13757,6 +13996,8 @@ module.exports = class HomeboundPlugin extends Plugin {
     this.closed = false;
     this.cache = /* @__PURE__ */ new Map();
     this.state = this.app.loadLocalStorage(stateKey) || {};
+    this.copies = new ConflictFiles(this.app, this.manifest.dir || this.app.vault.configDir + "/plugins/homebound-webdav");
+    await this.copies.load();
     this.restoreStatus();
     this.oldFormat = !this.state.current && Boolean((await this.loadData())?.id || this.app.loadLocalStorage("homebound-webdav-pqc-config")?.anchor);
     this.transfer = new ChunkTransfer(new TransferCache(this.app.appId), {
@@ -13937,7 +14178,7 @@ module.exports = class HomeboundPlugin extends Plugin {
     this.app.saveLocalStorage(baselineKey(id), Array.from(data));
   }
   local() {
-    return new VaultFiles(this.app);
+    return new VaultFiles(this.app, this.copies);
   }
   dav(config, password) {
     return new Dav(config.address, credentials(config.username, password));
@@ -14064,6 +14305,15 @@ module.exports = class HomeboundPlugin extends Plugin {
       }
     }
   }
+  async finishReview(ticket, peer, confirmed = false) {
+    if (!confirmed && ticket.vaultId === this.state.current?.id && peer && this.conflicts?.includes(peer.path) && this.conflictVersions.get(peer.path) !== ticket.version) return;
+    if (ticket.vaultId === this.state.current?.id && peer && this.conflictVersions.get(peer.path) === ticket.version) {
+      await this.copies.defer(peer, this.local(), this.cache, ticket.version.split(","));
+    }
+    const saved = this.app.loadLocalStorage(openReviewKey);
+    if (saved?.id === ticket.id && saved.version === ticket.version && saved.vaultId === ticket.vaultId)
+      this.app.saveLocalStorage(openReviewKey, null);
+  }
   async openConflict(path) {
     if (this.closed || this.openingReview || this.reviewModal) return;
     this.openingReview = true;
@@ -14077,15 +14327,18 @@ module.exports = class HomeboundPlugin extends Plugin {
         if (new Set(heads.map((r) => r.hash)).size < 2) throw Error(tr("This conflict changed. Sync again.", "\u51B2\u7A81\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u540C\u6B65\u3002"));
         const local = this.local(), bytes = await local.read(path);
         const readVersion = async (rev) => {
-          const copy = await local.read(core.conflictFolder + "/" + rev.id + "/" + rev.path);
-          if (copy !== null && await core.sha(copy) === rev.hash) return copy;
+          const copy = await this.copies.read(rev);
+          if (copy !== null) return copy;
           return this.exclusive(() => store.readBody(rev));
         };
         const localHash = bytes === null ? null : await core.sha(bytes);
-        const planFor = (peer, left, right) => isNote(path) ? notePlan(history, heads, localHash, peer.hash, left, right, readVersion) : null;
+        const planFor = (peer2, left, right) => isNote(path) ? notePlan(history, heads, localHash, peer2.hash, left, right, readVersion) : null;
         return { path, vaultId: c.id, heads, headIds: heads.map((r) => r.id).sort(), bytes, localHash, readVersion, planFor };
       });
       if (this.closed || this.state.current?.id !== review.vaultId) return;
+      const live = review.heads.filter((rev) => rev.hash !== null).sort((a, b) => a.id.localeCompare(b.id));
+      const peer = live.find((rev) => rev.hash !== review.localHash) || live[0];
+      const ticket = { vaultId: review.vaultId, id: peer.id, version: review.headIds.join(",") };
       const modal = new ConflictReview(this.app, review, async (source, text, peerId) => {
         if (this.state.current?.id !== review.vaultId || this.closed) throw Error(tr("Vault changed.", "\u5F53\u524D\u5E93\u5DF2\u53D8\u5316\u3002"));
         if (this.busy) throw Error(tr("Sync in progress. Try again.", "\u6B63\u5728\u540C\u6B65\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002"));
@@ -14094,9 +14347,10 @@ module.exports = class HomeboundPlugin extends Plugin {
         if (!result) throw Error(this.last);
       }, () => {
         if (this.reviewModal === modal) this.reviewModal = null;
-        queueMicrotask(() => this.showNextConflict());
+        void this.finishReview(ticket, peer).catch((error) => new Notice(error.message)).finally(() => this.showNextConflict());
       });
       this.reviewModal = modal;
+      this.app.saveLocalStorage(openReviewKey, ticket);
       modal.open();
       this.reviewed.set(path, review.headIds.join(","));
     } catch (error) {
@@ -14147,6 +14401,14 @@ module.exports = class HomeboundPlugin extends Plugin {
         watch.accepted = sample;
         const heads = result2.conflicts.length ? core.headsByPath(result2.history) : /* @__PURE__ */ new Map();
         this.conflictVersions = new Map(result2.conflicts.map((path) => [path, heads.get(path).map((r) => r.id).sort().join(",")]));
+        try {
+          const ticket = this.app.loadLocalStorage(openReviewKey);
+          if (ticket && !this.reviewModal && !this.openingReview)
+            await this.finishReview(ticket, result2.history.get(ticket.id), true);
+          await this.copies.serial(() => this.copies.reconcile(local, result2.history, this.conflictVersions));
+        } catch (error) {
+          new Notice(tr("Conflict copy maintenance: ", "\u51B2\u7A81\u526F\u672C\u6574\u7406\uFF1A") + error.message);
+        }
         for (const path of this.reviewed.keys()) if (!this.conflictVersions.has(path)) this.reviewed.delete(path);
         this.last = tr("Uploaded ", "\u5DF2\u4E0A\u4F20 ") + result2.sent + tr(" \xB7 received ", " \xB7 \u5DF2\u63A5\u6536 ") + result2.received;
         this.pollError = "";

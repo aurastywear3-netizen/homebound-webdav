@@ -7,6 +7,7 @@ const {Dav, VaultFiles, credentials} = require("./adapter.cjs");
 const {ChunkTransfer, TransferCache, blockSize} = require("./transfer.cjs");
 const {seedSnapshot, checkJoin} = require("./personal.cjs");
 const {PendingUploads} = require("./pending.cjs");
+const {ConflictFiles} = require("./conflict-files.cjs");
 const {ConflictReview} = require("./review.cjs");
 const {notePlan,isNote} = require("./merge.cjs");
 const {HomeboundSettings} = require("./settings.cjs");
@@ -14,6 +15,7 @@ const {VersionWatch} = require("./version.cjs");
 
 const tr = (en, zh) => getLanguage().startsWith("zh") ? zh : en;
 const stateKey = "homebound-personal-v2";
+const openReviewKey = stateKey + "-open-review";
 const baselineKey = id => stateKey + "-baseline-" + id;
 
 function location(fields) {
@@ -29,6 +31,8 @@ module.exports = class HomeboundPlugin extends Plugin {
         this.closed = false;
         this.cache = new Map();
         this.state = this.app.loadLocalStorage(stateKey) || {};
+        this.copies = new ConflictFiles(this.app,this.manifest.dir || this.app.vault.configDir + "/plugins/homebound-webdav");
+        await this.copies.load();
         this.restoreStatus();
         this.oldFormat = !this.state.current && Boolean((await this.loadData())?.id ||
             this.app.loadLocalStorage("homebound-webdav-pqc-config")?.anchor);
@@ -199,7 +203,7 @@ module.exports = class HomeboundPlugin extends Plugin {
     }
     baseline(id) { return new Map(this.app.loadLocalStorage(baselineKey(id)) || []); }
     checkpoint(id, data) { this.app.saveLocalStorage(baselineKey(id), Array.from(data)); }
-    local() { return new VaultFiles(this.app); }
+    local() { return new VaultFiles(this.app,this.copies); }
     dav(config, password) { return new Dav(config.address, credentials(config.username, password)); }
     vaultDav(config, password) { return this.dav(config,password).child(config.folder).child(core.namespace); }
     async connect(config, password, material) {
@@ -325,6 +329,20 @@ module.exports = class HomeboundPlugin extends Plugin {
         }
     }
 
+    async finishReview(ticket, peer, confirmed = false) {
+        // A comparison opened from saved status may precede the first sync after restart.
+        // Leave its ticket for that sync to check before deciding whether to create a copy.
+        if (!confirmed && ticket.vaultId === this.state.current?.id && peer &&
+            this.conflicts?.includes(peer.path) && this.conflictVersions.get(peer.path) !== ticket.version) return;
+        if (ticket.vaultId === this.state.current?.id && peer &&
+            this.conflictVersions.get(peer.path) === ticket.version) {
+            await this.copies.defer(peer,this.local(),this.cache,ticket.version.split(","));
+        }
+        const saved = this.app.loadLocalStorage(openReviewKey);
+        if (saved?.id === ticket.id && saved.version === ticket.version && saved.vaultId === ticket.vaultId)
+            this.app.saveLocalStorage(openReviewKey,null);
+    }
+
     async openConflict(path) {
         if (this.closed || this.openingReview || this.reviewModal) return;
         this.openingReview = true;
@@ -338,8 +356,8 @@ module.exports = class HomeboundPlugin extends Plugin {
                 if (new Set(heads.map(r => r.hash)).size < 2) throw Error(tr("This conflict changed. Sync again.","冲突已变化，请重新同步。"));
                 const local = this.local(), bytes = await local.read(path);
                 const readVersion = async rev => {
-                    const copy = await local.read(core.conflictFolder + "/" + rev.id + "/" + rev.path);
-                    if (copy !== null && await core.sha(copy) === rev.hash) return copy;
+                    const copy = await this.copies.read(rev);
+                    if (copy !== null) return copy;
                     return this.exclusive(() => store.readBody(rev));
                 };
                 const localHash=bytes===null ? null : await core.sha(bytes);
@@ -348,6 +366,9 @@ module.exports = class HomeboundPlugin extends Plugin {
                 return {path, vaultId:c.id, heads, headIds:heads.map(r => r.id).sort(), bytes,localHash,readVersion,planFor};
             });
             if (this.closed || this.state.current?.id !== review.vaultId) return;
+            const live = review.heads.filter(rev => rev.hash !== null).sort((a,b) => a.id.localeCompare(b.id));
+            const peer = live.find(rev => rev.hash !== review.localHash) || live[0];
+            const ticket = {vaultId:review.vaultId,id:peer.id,version:review.headIds.join(",")};
             const modal = new ConflictReview(this.app, review, async (source,text,peerId) => {
                 if (this.state.current?.id !== review.vaultId || this.closed) throw Error(tr("Vault changed.","当前库已变化。"));
                 if (this.busy) throw Error(tr("Sync in progress. Try again.","正在同步，请稍后重试。"));
@@ -356,9 +377,11 @@ module.exports = class HomeboundPlugin extends Plugin {
                 if (!result) throw Error(this.last);
             }, () => {
                 if (this.reviewModal === modal) this.reviewModal = null;
-                queueMicrotask(() => this.showNextConflict());
+                void this.finishReview(ticket,peer).catch(error => new Notice(error.message))
+                    .finally(() => this.showNextConflict());
             });
             this.reviewModal = modal;
+            this.app.saveLocalStorage(openReviewKey,ticket);
             modal.open();
             this.reviewed.set(path,review.headIds.join(","));
         } catch (error) {
@@ -403,6 +426,15 @@ module.exports = class HomeboundPlugin extends Plugin {
                 watch.accepted = sample;
                 const heads = result.conflicts.length ? core.headsByPath(result.history) : new Map();
                 this.conflictVersions = new Map(result.conflicts.map(path => [path,heads.get(path).map(r => r.id).sort().join(",")]));
+                try {
+                    // A mobile suspension or process exit can interrupt dismissal before the copy is written.
+                    const ticket = this.app.loadLocalStorage(openReviewKey);
+                    if (ticket && !this.reviewModal && !this.openingReview)
+                        await this.finishReview(ticket,result.history.get(ticket.id),true);
+                    await this.copies.serial(() => this.copies.reconcile(local,result.history,this.conflictVersions));
+                } catch (error) {
+                    new Notice(tr("Conflict copy maintenance: ","冲突副本整理：") + error.message);
+                }
                 for (const path of this.reviewed.keys()) if (!this.conflictVersions.has(path)) this.reviewed.delete(path);
                 this.last = tr("Uploaded ","已上传 ") + result.sent + tr(" · received "," · 已接收 ") + result.received;
                 this.pollError = "";

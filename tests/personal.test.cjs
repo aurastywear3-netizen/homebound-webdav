@@ -61,7 +61,8 @@ function server() {
 
 async function device(remote, contents = new Map(), disk = new Map(), secrets = new Map(), legacy = {}) {
     const p = new Plugin();
-    p.app = {appId:"test",vault:{getName:()=>"Vault"},workspace:{onLayoutReady(){}},
+    p.manifest = {dir:".obsidian/plugins/homebound-webdav"};
+    p.app = {appId:"test",vault:{getName:()=>"Vault",adapter:{exists:async()=>false},getAbstractFileByPath:()=>null},workspace:{onLayoutReady(){}},
         loadLocalStorage:k=>structuredClone(disk.get(k)),saveLocalStorage:(k,v)=>disk.set(k,structuredClone(v)),
         secretStorage:{getSecret:k=>secrets.get(k),setSecret:(k,v)=>secrets.set(k,v)}};
     p.loadData = async () => legacy;

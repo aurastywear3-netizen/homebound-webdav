@@ -96,10 +96,10 @@ function credentials(username, password) {
 }
 
 class VaultFiles {
-    constructor(app) { this.app = app; this.vault = app.vault; }
+    constructor(app, copies) { this.app = app; this.vault = app.vault; this.copies = copies; }
     allowed(path) {
         const first = path.split("/")[0].toLowerCase();
-        return !core.isRecovery(path) && first !== this.vault.configDir.toLowerCase() &&
+        return !this.copies.paths.has(path) && !core.isRecovery(path) && first !== this.vault.configDir.toLowerCase() &&
             !path.split("/").some(part => part.startsWith("."));
     }
     paths() { return new Set(this.vault.getFiles().map(f => f.path).filter(path => this.allowed(path))); }
@@ -149,15 +149,7 @@ class VaultFiles {
             await this.vault.modifyBinary(file, bytes);
         }
     }
-    async archive(rev, body) {
-        const path = core.conflictFolder + "/" + rev.id + "/" + rev.path;
-        const current = await this.read(path);
-        if (current !== null) {
-            if (await core.sha(current) !== rev.hash) throw Error("Move your edited conflict copy before syncing: " + path);
-            return;
-        }
-        await this.apply(path, null, await body());
-    }
+    archive(rev, body) { return this.copies.archive(rev,body); }
 }
 
 module.exports = { Dav, VaultFiles, credentials };

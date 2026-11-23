@@ -70,6 +70,11 @@ test("conflict dialogs open in order, can be dismissed, and reopen for a new ver
     const p=new compiled.exports(), history=new Map();
     Object.assign(p,{app:new EventEmitter(),ready:true,state:{current:{id:"fixture"}},
         cache:new Map(),conflictVersions:new Map(),reviewed:new Map()});
+    const deferred=[];
+    const disk=new Map();
+    p.app.loadLocalStorage=k=>disk.get(k);
+    p.app.saveLocalStorage=(k,v)=>disk.set(k,v);
+    p.copies={defer:async rev=>deferred.push(rev.path)};
     p.exclusive=action=>action(); p.secret=()=>"fixture"; p.local=()=>({read:async()=>null});
     p.connect=async()=>({store:{history:async()=>history}});
     function add(path,hash) {
@@ -82,6 +87,7 @@ test("conflict dialogs open in order, can be dismissed, and reopen for a new ver
     p.showNextConflict(); assert.equal(p.reviewModal,a);
     const second=once(p.app,"open"); a.close();
     const [b]=await second; assert.equal(b.review.path,"b.md");
+    assert.deepEqual(deferred,["a.md"]);
     b.close(); await new Promise(setImmediate);
     p.showNextConflict(); assert.equal(p.reviewModal,null);
     add("a.md","three"); const third=once(p.app,"open"); p.showNextConflict();
@@ -110,6 +116,25 @@ test("a successful sync closes only a resolved review in this vault, leaving a s
     p.recordSuccess(["b.md"]);
     p.recordSuccess([]);
     assert.equal(closes,1);
+});
+
+test("interrupted comparisons only create a sibling after the same conflict is confirmed", async () => {
+    const p = new compiled.exports(), saved = new Map(), deferred = [];
+    const peer = {id:"remote",path:"note.md"}, ticket = {id:peer.id,vaultId:"one",version:"local,remote"};
+    p.app = {loadLocalStorage:k=>saved.get(k),saveLocalStorage:(k,v)=>saved.set(k,v)};
+    p.copies = {defer:async rev=>deferred.push(rev.id)};
+    p.local = ()=>({}); p.state = {current:{id:"one"}};
+    p.conflictVersions = new Map(); p.conflicts = [peer.path];
+    const key = "homebound-personal-v2-open-review";
+    saved.set(key,ticket);
+    await p.finishReview(ticket,peer);
+    assert.equal(saved.get(key),ticket); assert.deepEqual(deferred,[]);
+    p.conflictVersions.set(peer.path,ticket.version);
+    await p.finishReview(ticket,peer,true);
+    assert.equal(saved.get(key),null); assert.deepEqual(deferred,[peer.id]);
+    saved.set(key,ticket); p.conflictVersions.clear(); p.conflicts=[];
+    await p.finishReview(ticket,peer,true);
+    assert.equal(saved.get(key),null); assert.deepEqual(deferred,[peer.id]);
 });
 
 test("probes coalesce coarse timestamps and unsupported collections use a small shared marker", async t => {
@@ -163,7 +188,8 @@ test("vault event debounce coalesces writes, queues edits during sync, and ignor
     const p=new compiled.exports();
     let start, rounds=0;
     const current={id:"fixture",auto:false};
-    p.app={appId:"test", vault:{on:(event,fn)=>{events[event]=fn;}},
+    p.manifest={dir:".obsidian/plugins/homebound-webdav"};
+    p.app={appId:"test", vault:{adapter:{exists:async()=>false},on:(event,fn)=>{events[event]=fn;}},
         workspace:{onLayoutReady:fn=>{start=fn;}},loadLocalStorage:k=>k==="homebound-personal-v2"?{current}:null};
     p.loadData=async()=>null;
     p.addSettingTab=p.addCommand=p.registerInterval=p.registerEvent=()=>{};

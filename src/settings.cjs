@@ -163,6 +163,13 @@ class HomeboundSettings extends PluginSettingTab {
         const {current, pending} = p.state;
         el.empty(); el.addClass("homebound-settings");
         if (current) this.showStatus(el);
+        button(el,tr("Clear historical conflict files","清理历史冲突文件"),async () => {
+            const {removed,edited} = await p.exclusive(() =>
+                p.copies.serial(() => p.copies.clearHistory(p.conflicts,p.cache,p.conflictVersions)));
+            new Notice(tr("Historical copies removed: ","已清理历史副本：") + removed +
+                (edited ? tr(" · edited copies kept: "," · 已保留编辑过的副本：") + edited : ""));
+        }).setDesc(tr("Remove resolved copies on this device. Pending versions and edited copies are kept.",
+            "清理本机已解决的冲突副本，保留待处理版本和手动编辑过的副本。"));
         if (pending) {
             el.createEl("p",{text:tr("Setup awaiting verification: ","待完成上传和校验：") + pending.address + "/" + pending.folder});
             let password = "";

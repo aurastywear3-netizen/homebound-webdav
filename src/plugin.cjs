@@ -267,12 +267,16 @@ module.exports = class HomeboundPlugin extends Plugin {
             if (due) queueMicrotask(() => this.requestAuto(due === "check"));
         }
     }
-    activate(config) {
+    setProgress(phase, done = 0, total = null) {
+        this.progress = phase ? {phase, done, total} : null;
+        this.settingsTab?.refreshProgress?.();
+    }
+    activate(config, history = new Map()) {
         if (this.closed) throw Error("插件已关闭，请重新打开后继续。");
         const former = this.state.current;
         this.save({current:config});
         if (former && former.secretId !== config.secretId) this.forgetSecrets(former);
-        this.cache.clear();
+        this.cache = history;
         this.restoreStatus();
         this.last = "";
         this.oldFormat = false;
@@ -320,16 +324,23 @@ module.exports = class HomeboundPlugin extends Plugin {
         const password = this.passwordFor(target, fields.password);
         const current = this.state.current;
         const config = {...target, id, secretId:core.randomId(), auto:true};
-        const {store, previous} = await this.connect(config, password, material);
-        if (current?.id !== id) {
-            if (current && current.id !== previous) throw Error("当前本地库已绑定另一个库。请打开对应的独立本地库。");
-            await checkJoin(store, this.local(), current ? this.baseline(current.id) : undefined);
-            if (current) config.joinedFrom = current.id;
-        } else if (current.joinedFrom) {
-            config.joinedFrom = current.joinedFrom;
-        }
-        this.storeSecrets(config, material, password);
-        this.activate(config);
+        this.setProgress("connecting");
+        try {
+            const {store, previous} = await this.connect(config, password, material);
+            let verified;
+            if (current?.id !== id) {
+                if (current && current.id !== previous) throw Error("当前本地库已绑定另一个库。请打开对应的独立本地库。");
+                const options = {progress:this.setProgress.bind(this), active:() => !this.closed};
+                verified = await store.history(new Map(), undefined, options);
+                await checkJoin(verified, this.local(), current ? this.baseline(current.id) : undefined, options);
+                if (current) config.joinedFrom = current.id;
+            } else if (current.joinedFrom) {
+                config.joinedFrom = current.joinedFrom;
+            }
+            if (this.closed) throw Error("插件已关闭，请重新打开后继续。");
+            this.storeSecrets(config, material, password);
+            this.activate(config, verified);
+        } finally { this.setProgress(null); }
     }
     sharingFields() {
         const c = this.state.current;
@@ -352,6 +363,7 @@ module.exports = class HomeboundPlugin extends Plugin {
     }
     onunload() {
         this.closed = true;
+        this.setProgress(null);
         this.historyModal?.close();
         this.reviewModal?.close();
         clearTimeout(this.editTimer);
@@ -440,6 +452,7 @@ module.exports = class HomeboundPlugin extends Plugin {
         this.syncing = true;
         try {
             const result = await this.exclusive(async () => {
+                this.setProgress("connecting");
                 this.settingsTab.refreshStatus();
                 const c = this.state.current;
                 if (this.state.pending) throw Error("请先完成建库或换钥。");
@@ -450,11 +463,15 @@ module.exports = class HomeboundPlugin extends Plugin {
                 // a concurrent revision that was never part of this sync.
                 const watch = this.watch;
                 const sample = probe?.sample ?? await watch.read(store.dav).catch(() => null);
+                const progress = this.setProgress.bind(this), active = () => !this.closed;
+                let cache = this.cache;
                 let reconciled = 0;
                 if (c.joinedFrom) {
-                    const updates = await checkJoin(store, local, this.baseline(c.joinedFrom));
+                    cache = await store.history(cache, undefined, {progress, active});
+                    const updates = await checkJoin(cache, local, this.baseline(c.joinedFrom), {progress, active});
                     for (const {path, hash, target} of updates) {
                         if (this.closed) throw Error("同步已停止。");
+                        progress("reconciling", reconciled, updates.length);
                         const body = target && target.hash !== null ? await store.readBody(target) : null;
                         await local.apply(path, hash, body);
                         reconciled++;
@@ -464,8 +481,9 @@ module.exports = class HomeboundPlugin extends Plugin {
                     delete updated.joinedFrom;
                     this.save({current:updated});
                 }
-                const result = await watch.trackWrites(store, () => core.synchronize({store, local, cache:this.cache, baseline:this.baseline(c.id),
-                    selection, commitNames:probe?.names, active:() => !this.closed, checkpoint:data => this.checkpoint(c.id,data)}));
+                const result = await watch.trackWrites(store, () => core.synchronize({store, local, cache, baseline:this.baseline(c.id),
+                    selection, commitNames:c.joinedFrom ? undefined : probe?.names, progress, active, checkpoint:data => this.checkpoint(c.id,data)}));
+                progress("finishing");
                 result.received += reconciled;
                 this.cache = result.history;
                 watch.accepted = sample;
@@ -506,7 +524,10 @@ module.exports = class HomeboundPlugin extends Plugin {
             this.syncError = this.last;
             if (!quiet) new Notice(this.last, 10000);
         } finally {
-            if (serial===this.syncSerial) this.syncing = false;
+            if (serial===this.syncSerial) {
+                this.syncing = false;
+                this.setProgress(null);
+            }
             this.settingsTab.refreshStatus();
         }
     }

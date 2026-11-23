@@ -46,6 +46,28 @@ test("the vault summary updates in place and keeps pending work, conflicts and e
     assert.equal(tab.resultEl.hidden,true);
 });
 
+test("join confirmation and settings show the current phase and counts and clear on completion or failure",()=>{
+    const tab=new (loadTab(class {}))({}, {});
+    const view=()=>({el:{isConnected:true},label:{setText(t){this.textContent=t;}},
+        bar:{setAttribute(k,v){this[k]=v;},removeAttribute(k){delete this[k];}}});
+    tab.joinProgress=view();tab.panelProgress=view();
+    const p=tab.plugin;
+    p.progress={phase:"connecting",done:0,total:null};tab.refreshProgress();
+    assert.equal(tab.joinProgress.el.hidden,false);
+    assert.equal(tab.joinProgress.bar.value,undefined);
+    p.progress={phase:"versions",done:8,total:10};tab.refreshProgress();
+    for (const v of [tab.joinProgress,tab.panelProgress]) {
+        assert.equal(v.label.textContent,"Checking remote versions 8 / 10");
+        assert.equal(v.bar.max,10);assert.equal(v.bar.value,8);
+    }
+    tab.joinProgress.el.isConnected=false;
+    p.progress={phase:"files",done:3,total:7};tab.refreshProgress();
+    assert.equal(tab.panelProgress.label.textContent,"Syncing files 3 / 7");
+    assert.equal(tab.joinProgress.bar.value,8);
+    p.progress=null;tab.refreshProgress();
+    assert.equal(tab.panelProgress.el.hidden,true);
+});
+
 test("an open retention dropdown refreshes in place and ignores responses superseded by an edit or a closed tab", async () => {
     const selectEl = {ownerDocument:{visibilityState:"visible"}, isConnected:true,
         setAttribute(){}, getClientRects:()=>[{}], options:[{remove(){}}]};

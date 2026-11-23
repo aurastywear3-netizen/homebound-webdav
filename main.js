@@ -599,6 +599,9 @@ var require_core = __commonJS({
       }
       return key;
     }
+    function checkRevision(id, rev) {
+      if (rev.id !== id || !safePath(rev.path) || isRecovery(rev.path) || !Array.isArray(rev.parents) || !rev.parents.every((p) => idPattern.test(p)) || !(rev.hash === null || hashPattern.test(rev.hash))) throw Error("Invalid revision metadata.");
+    }
     var Store = class {
       constructor(dav, id, key, transfer) {
         this.transfer = transfer;
@@ -713,19 +716,48 @@ var require_core = __commonJS({
         });
         return true;
       }
-      async history(cache, names) {
+      async history(cache, names, { progress, active = () => true } = {}) {
         names ??= await this.dav.list("commits");
         const visible = new Set(names);
         for (const id of cache.keys()) {
           if (!visible.has(id)) throw Error("Previously seen history is missing from this server.");
         }
-        const history = /* @__PURE__ */ new Map();
+        const history = /* @__PURE__ */ new Map(), missing = [];
         for (const id of visible) {
           if (!idPattern.test(id)) throw Error("Unexpected entry in the vault history.");
-          const rev = cache.get(id) ?? parseBytes(await this.readObject("r-" + id));
-          if (rev.id !== id || !safePath(rev.path) || isRecovery(rev.path) || !Array.isArray(rev.parents) || !rev.parents.every((p) => idPattern.test(p)) || !(rev.hash === null || hashPattern.test(rev.hash))) throw Error("Invalid revision metadata.");
+          const rev = cache.get(id);
+          if (rev) checkRevision(id, rev);
+          else missing.push(id);
           history.set(id, rev);
         }
+        let checked = history.size - missing.length;
+        progress?.("versions", checked, history.size);
+        const read = async (id) => {
+          if (!active()) throw Error("Sync stopped.");
+          const rev = parseBytes(await this.readObject("r-" + id));
+          checkRevision(id, rev);
+          if (!active()) throw Error("Sync stopped.");
+          history.set(id, rev);
+          progress?.("versions", ++checked, history.size);
+        };
+        let concurrency = 4;
+        for (let start = 0; start < missing.length; ) {
+          const ids = missing.slice(start, start + concurrency);
+          const results = await Promise.allSettled(ids.map(read));
+          start += ids.length;
+          const retry = [];
+          for (const [i, result] of results.entries()) {
+            if (result.status === "fulfilled") continue;
+            if (concurrency === 1 || ![429, 503].includes(result.reason?.status)) throw result.reason;
+            retry.push(ids[i]);
+          }
+          if (retry.length) {
+            concurrency = 1;
+            await new Promise((resolve) => setTimeout(resolve, 500));
+            for (const id of retry) await read(id);
+          }
+        }
+        if (!active()) throw Error("Sync stopped.");
         return history;
       }
     };
@@ -770,8 +802,8 @@ var require_core = __commonJS({
       }
       return { groups, localPaths };
     }
-    async function synchronize({ store, local, baseline, cache, checkpoint, resolve, selection, commitNames, active = () => true }) {
-      const history = await store.history(cache, commitNames);
+    async function synchronize({ store, local, baseline, cache, checkpoint, resolve, selection, commitNames, progress, active = () => true }) {
+      const history = await store.history(cache, commitNames, { progress, active });
       const { groups, localPaths } = await syncScope(local, history);
       if (selection && !groups.has(selection.path)) throw Error("\u51B2\u7A81\u7248\u672C\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u540C\u6B65\u5E76\u6BD4\u8F83\u3002");
       let removedCopy = false;
@@ -791,9 +823,10 @@ var require_core = __commonJS({
       }
       checkAliases([...paths].filter((path) => localPaths.has(path) || groups.get(path)?.some((r) => r.hash !== null)));
       const conflicts = [];
-      let sent = 0, received = 0;
+      let sent = 0, received = 0, processed = 0;
       for (const path of paths) {
         if (!active()) throw Error("Sync stopped.");
+        progress?.("files", processed++, paths.size);
         let heads = groups.get(path) ?? [];
         let base = baseline.get(path);
         let bytes = await local.read(path);
@@ -896,6 +929,7 @@ var require_core = __commonJS({
           checkpoint(baseline);
         }
       }
+      progress?.("files", paths.size, paths.size);
       return { history, sent, received, conflicts };
     }
     async function createVault(home, folder, material, id, previous = "") {
@@ -13201,10 +13235,13 @@ var require_personal = __commonJS({
       checkActive(active);
       return baseline;
     }
-    async function checkJoin2(store, local, previousBaseline = /* @__PURE__ */ new Map()) {
-      const { groups: heads, localPaths: paths } = await core2.syncScope(local, await store.history(/* @__PURE__ */ new Map()));
+    async function checkJoin2(history, local, previousBaseline = /* @__PURE__ */ new Map(), { progress, active = () => true } = {}) {
+      const { groups: heads, localPaths: paths } = await core2.syncScope(local, history);
       const updates = [];
+      let checked = 0;
       for (const path of paths) {
+        checkActive(active);
+        progress?.("local", checked++, paths.size);
         const bytes = await local.read(path);
         const hash = bytes === null ? null : await core2.sha(bytes);
         const versions = heads.get(path) || [];
@@ -13219,6 +13256,8 @@ var require_personal = __commonJS({
         if (base.hash !== null && !paths.has(path) && heads.get(path)?.some((rev) => rev.hash !== null))
           throw Error("\u672C\u5730\u6709\u5C1A\u5F85\u6838\u5BF9\u7684\u5220\u9664\uFF1A" + path + "\u3002\u8BF7\u5148\u5907\u4EFD\u5E76\u4F7F\u7528\u7A7A\u672C\u5730\u5E93\u52A0\u5165\u3002");
       }
+      checkActive(active);
+      if (paths.size) progress?.("local", paths.size, paths.size);
       return updates;
     }
     module2.exports = { seedSnapshot: seedSnapshot2, checkJoin: checkJoin2 };
@@ -13908,6 +13947,19 @@ var require_settings = __commonJS({
       if (el.textContent !== text) el.setText(text);
       el.hidden = !text;
     }
+    function progressView(parent) {
+      const el = parent.createDiv({ cls: "homebound-progress" });
+      el.hidden = true;
+      return { el, label: el.createDiv(), bar: el.createEl("progress") };
+    }
+    var progressLabels = {
+      connecting: ["Verifying connection and vault key\u2026", "\u6B63\u5728\u9A8C\u8BC1\u8FDE\u63A5\u548C\u5E93\u5BC6\u94A5\u2026"],
+      versions: ["Checking remote versions", "\u6838\u5BF9\u8FDC\u7AEF\u7248\u672C"],
+      local: ["Checking local files", "\u6838\u5BF9\u672C\u5730\u6587\u4EF6"],
+      reconciling: ["Updating files after key rotation", "\u66F4\u65B0\u6362\u94A5\u540E\u7684\u6587\u4EF6"],
+      files: ["Syncing files", "\u540C\u6B65\u6587\u4EF6"],
+      finishing: ["Finishing sync\u2026", "\u6B63\u5728\u5B8C\u6210\u540C\u6B65\u2026"]
+    };
     var DetailModal = class extends Modal {
       onClose() {
         this.contentEl.empty();
@@ -14022,19 +14074,29 @@ var require_settings = __commonJS({
       }
       reviewJoin(fields, form) {
         const p = this.plugin;
-        const lines = [
-          this.app.vault.getName() + " \u2190 " + core2.davAddress(fields.address) + "/" + core2.directory(fields.folder),
-          tr2("Vault ID: ", "\u5E93\u6807\u8BC6\uFF1A") + fields.id,
-          tr2(
-            "After verification, download this vault into the open local vault.",
-            "\u786E\u8BA4\u540E\u4F1A\u9A8C\u8BC1\u5E93\u6807\u8BC6\u4E0E\u5BC6\u94A5\uFF0C\u5E76\u628A\u8FDC\u7AEF\u5185\u5BB9\u540C\u6B65\u5230\u5F53\u524D\u672C\u5730\u5E93\u3002"
-          )
-        ];
-        review(this.app, tr2("Join this vault?", "\u52A0\u5165\u8FD9\u4E2A\u5E93\uFF1F"), lines, tr2("Verify and sync", "\u9A8C\u8BC1\u5E76\u540C\u6B65"), async () => {
-          await this.perform(() => p.join(fields, fields.key, fields.id));
+        const modal = new DetailModal(this.app), el = modal.contentEl;
+        modal.setTitle(tr2("Join this vault?", "\u52A0\u5165\u8FD9\u4E2A\u5E93\uFF1F"));
+        el.createEl("p", { text: this.app.vault.getName() + " \u2190 " + core2.davAddress(fields.address) + "/" + core2.directory(fields.folder) });
+        el.createEl("p", { text: tr2("Vault ID: ", "\u5E93\u6807\u8BC6\uFF1A") + fields.id });
+        el.createEl("p", { text: tr2(
+          "After verification, download this vault into the open local vault.",
+          "\u786E\u8BA4\u540E\u4F1A\u9A8C\u8BC1\u5E93\u6807\u8BC6\u4E0E\u5BC6\u94A5\uFF0C\u5E76\u628A\u8FDC\u7AEF\u5185\u5BB9\u540C\u6B65\u5230\u5F53\u524D\u672C\u5730\u5E93\u3002"
+        ) });
+        const view = progressView(el);
+        button(el, tr2("Verify and sync", "\u9A8C\u8BC1\u5E76\u540C\u6B65"), async () => {
+          await this.perform(async () => {
+            this.joinProgress = view;
+            try {
+              await p.join(fields, fields.key, fields.id);
+            } finally {
+              this.joinProgress = null;
+            }
+          });
+          modal.close();
           form?.close();
           await p.run();
         });
+        modal.open();
       }
       showBackup(c = this.plugin.state.current) {
         const p = this.plugin;
@@ -14065,6 +14127,22 @@ var require_settings = __commonJS({
       }
       statusVisible() {
         return Boolean(this.statusEl?.isConnected);
+      }
+      refreshProgress() {
+        for (const view of [this.panelProgress, this.joinProgress]) {
+          if (!view?.el.isConnected) continue;
+          const step = this.plugin.progress;
+          view.el.hidden = !step;
+          if (!step) continue;
+          const label = tr2(...progressLabels[step.phase]);
+          updateText(view.label, step.total > 0 ? label + " " + step.done + " / " + step.total : label);
+          view.bar.setAttribute("aria-label", label);
+          if (step.total === null) view.bar.removeAttribute("value");
+          else {
+            view.bar.max = step.total || 1;
+            view.bar.value = step.total ? step.done : 1;
+          }
+        }
       }
       refreshStatus() {
         if (!this.statusVisible()) return;
@@ -14105,6 +14183,8 @@ var require_settings = __commonJS({
         title.createEl("h2", { text: this.app.vault.getName() });
         this.summaryEl = title.createDiv({ cls: "homebound-summary", attr: { role: "status" } });
         actionButton(head, tr2("Sync now", "\u7ACB\u5373\u540C\u6B65"), () => this.plugin.run(), "homebound-sync");
+        this.panelProgress = progressView(this.statusEl);
+        this.refreshProgress();
         this.detailEl = this.statusEl.createDiv({ cls: "homebound-detail" });
         this.resultEl = this.statusEl.createDiv({ cls: "homebound-issue", attr: { role: "status" } });
         this.conflictList = this.statusEl.createDiv();
@@ -14177,12 +14257,14 @@ var require_settings = __commonJS({
       }
       hide() {
         this.statusEl = null;
+        this.panelProgress = null;
         this.refreshHistoryPeriod = null;
         super.hide?.();
       }
       display() {
         this.refreshHistoryPeriod = null;
         this.statusEl = null;
+        this.panelProgress = null;
         const p = this.plugin;
         const { current, pending } = p.state;
         this.containerEl.empty();
@@ -14195,6 +14277,8 @@ var require_settings = __commonJS({
         const scan = () => new Scanner(this.app, (f) => this.reviewJoin(f)).open();
         if (!current) {
           el.createEl("h2", { text: this.app.vault.getName() });
+          this.panelProgress = progressView(el);
+          this.refreshProgress();
           el.createEl("p", { cls: "homebound-intro", text: tr2(
             "Connect this vault to sync notes and attachments.",
             "\u8FDE\u63A5\u6B64\u5E93\u4EE5\u540C\u6B65\u7B14\u8BB0\u548C\u9644\u4EF6\u3002"
@@ -14806,12 +14890,16 @@ module.exports = class HomeboundPlugin extends Plugin {
       if (due) queueMicrotask(() => this.requestAuto(due === "check"));
     }
   }
-  activate(config) {
+  setProgress(phase, done = 0, total = null) {
+    this.progress = phase ? { phase, done, total } : null;
+    this.settingsTab?.refreshProgress?.();
+  }
+  activate(config, history = /* @__PURE__ */ new Map()) {
     if (this.closed) throw Error("\u63D2\u4EF6\u5DF2\u5173\u95ED\uFF0C\u8BF7\u91CD\u65B0\u6253\u5F00\u540E\u7EE7\u7EED\u3002");
     const former = this.state.current;
     this.save({ current: config });
     if (former && former.secretId !== config.secretId) this.forgetSecrets(former);
-    this.cache.clear();
+    this.cache = history;
     this.restoreStatus();
     this.last = "";
     this.oldFormat = false;
@@ -14858,16 +14946,25 @@ module.exports = class HomeboundPlugin extends Plugin {
     const password = this.passwordFor(target, fields.password);
     const current = this.state.current;
     const config = { ...target, id, secretId: core.randomId(), auto: true };
-    const { store, previous } = await this.connect(config, password, material);
-    if (current?.id !== id) {
-      if (current && current.id !== previous) throw Error("\u5F53\u524D\u672C\u5730\u5E93\u5DF2\u7ED1\u5B9A\u53E6\u4E00\u4E2A\u5E93\u3002\u8BF7\u6253\u5F00\u5BF9\u5E94\u7684\u72EC\u7ACB\u672C\u5730\u5E93\u3002");
-      await checkJoin(store, this.local(), current ? this.baseline(current.id) : void 0);
-      if (current) config.joinedFrom = current.id;
-    } else if (current.joinedFrom) {
-      config.joinedFrom = current.joinedFrom;
+    this.setProgress("connecting");
+    try {
+      const { store, previous } = await this.connect(config, password, material);
+      let verified;
+      if (current?.id !== id) {
+        if (current && current.id !== previous) throw Error("\u5F53\u524D\u672C\u5730\u5E93\u5DF2\u7ED1\u5B9A\u53E6\u4E00\u4E2A\u5E93\u3002\u8BF7\u6253\u5F00\u5BF9\u5E94\u7684\u72EC\u7ACB\u672C\u5730\u5E93\u3002");
+        const options = { progress: this.setProgress.bind(this), active: () => !this.closed };
+        verified = await store.history(/* @__PURE__ */ new Map(), void 0, options);
+        await checkJoin(verified, this.local(), current ? this.baseline(current.id) : void 0, options);
+        if (current) config.joinedFrom = current.id;
+      } else if (current.joinedFrom) {
+        config.joinedFrom = current.joinedFrom;
+      }
+      if (this.closed) throw Error("\u63D2\u4EF6\u5DF2\u5173\u95ED\uFF0C\u8BF7\u91CD\u65B0\u6253\u5F00\u540E\u7EE7\u7EED\u3002");
+      this.storeSecrets(config, material, password);
+      this.activate(config, verified);
+    } finally {
+      this.setProgress(null);
     }
-    this.storeSecrets(config, material, password);
-    this.activate(config);
   }
   sharingFields() {
     const c = this.state.current;
@@ -14888,6 +14985,7 @@ module.exports = class HomeboundPlugin extends Plugin {
   }
   onunload() {
     this.closed = true;
+    this.setProgress(null);
     this.historyModal?.close();
     this.reviewModal?.close();
     clearTimeout(this.editTimer);
@@ -14966,6 +15064,7 @@ module.exports = class HomeboundPlugin extends Plugin {
     this.syncing = true;
     try {
       const result = await this.exclusive(async () => {
+        this.setProgress("connecting");
         this.settingsTab.refreshStatus();
         const c = this.state.current;
         if (this.state.pending) throw Error("\u8BF7\u5148\u5B8C\u6210\u5EFA\u5E93\u6216\u6362\u94A5\u3002");
@@ -14974,11 +15073,15 @@ module.exports = class HomeboundPlugin extends Plugin {
         const local = this.local();
         const watch = this.watch;
         const sample = probe?.sample ?? await watch.read(store.dav).catch(() => null);
+        const progress = this.setProgress.bind(this), active = () => !this.closed;
+        let cache = this.cache;
         let reconciled = 0;
         if (c.joinedFrom) {
-          const updates = await checkJoin(store, local, this.baseline(c.joinedFrom));
+          cache = await store.history(cache, void 0, { progress, active });
+          const updates = await checkJoin(cache, local, this.baseline(c.joinedFrom), { progress, active });
           for (const { path, hash, target } of updates) {
             if (this.closed) throw Error("\u540C\u6B65\u5DF2\u505C\u6B62\u3002");
+            progress("reconciling", reconciled, updates.length);
             const body = target && target.hash !== null ? await store.readBody(target) : null;
             await local.apply(path, hash, body);
             reconciled++;
@@ -14990,13 +15093,15 @@ module.exports = class HomeboundPlugin extends Plugin {
         const result2 = await watch.trackWrites(store, () => core.synchronize({
           store,
           local,
-          cache: this.cache,
+          cache,
           baseline: this.baseline(c.id),
           selection,
-          commitNames: probe?.names,
-          active: () => !this.closed,
+          commitNames: c.joinedFrom ? void 0 : probe?.names,
+          progress,
+          active,
           checkpoint: (data) => this.checkpoint(c.id, data)
         }));
+        progress("finishing");
         result2.received += reconciled;
         this.cache = result2.history;
         watch.accepted = sample;
@@ -15036,7 +15141,10 @@ module.exports = class HomeboundPlugin extends Plugin {
       this.syncError = this.last;
       if (!quiet) new Notice(this.last, 1e4);
     } finally {
-      if (serial === this.syncSerial) this.syncing = false;
+      if (serial === this.syncSerial) {
+        this.syncing = false;
+        this.setProgress(null);
+      }
       this.settingsTab.refreshStatus();
     }
   }

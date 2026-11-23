@@ -37,6 +37,7 @@ function server() {
         }
         async read(name) {
             this.auth();
+            if (dav.onRead) await dav.onRead(name);
             if (dav.failRead && name.startsWith("objects/b-")) throw Error("readback interrupted");
             const value = files.get(this.child(name).root);
             if (!value) throw Object.assign(Error("absent"),{status:404});
@@ -168,5 +169,64 @@ test("a failed sync and a restart preserve the last completed sync and conflict 
         const restored=await device(srv,files,disk,secrets);
         assert.equal(restored.status.lastSuccess,success);
         assert.deepEqual(restored.conflicts,["note.md"]);
+    } finally { Object.assign(global,prior); }
+});
+
+test("joining authenticates each immutable revision once and picks up a commit published before the first sync", async () => {
+    const prior = {window:global.window, document:global.document};
+    global.window = {setInterval:()=>0}; global.document = {};
+    try {
+        const srv = server(), source = new Map(), files = new Map();
+        for (let i=0; i<10; i++) source.set(i+".md",bytes("note "+i));
+        const mac = await device(srv,source), ipad = await device(srv,files);
+        await mac.startSetup({address:"https://dav.example",folder:"progress",username:"tester"},srv.password);
+        const invite=mac.sharingFields(), reads=[], steps=[];
+        let active=0, peak=0;
+        srv.onRead=async name=>{
+            if (!name.startsWith("objects/r-")) return;
+            reads.push(name); peak=Math.max(peak,++active);
+            await new Promise(setImmediate);
+            active--;
+        };
+        ipad.settingsTab.refreshProgress=()=>steps.push(ipad.progress);
+        await ipad.join(invite,invite.key,invite.id);
+        assert.equal(peak,4);
+        assert.equal(reads.length,10);
+        assert.deepEqual(steps[0],{phase:"connecting",done:0,total:null});
+        assert.deepEqual(steps.filter(s=>s?.phase==="versions").map(s=>s.done),Array.from({length:11},(_,i)=>i));
+        const {store}=await mac.connect(mac.state.current,srv.password,invite.key);
+        await store.publish("later.md",[],bytes("arrived while joining"));
+        assert.equal((await ipad.run()).received,11);
+        assert.equal(reads.length,11);
+        assert.equal(new Set(reads).size,11);
+        assert.deepEqual(steps.filter(s=>s?.phase==="files").map(s=>s.done),Array.from({length:12},(_,i)=>i));
+        assert.equal(steps.at(-1),null);
+        assert.deepEqual(files.get("later.md"),bytes("arrived while joining"));
+        for (const [path,data] of source) assert.deepEqual(files.get(path),data);
+    } finally { Object.assign(global,prior); }
+});
+
+test("a failed metadata batch finishes its outstanding reads and leaves the joining device unbound for retry", async () => {
+    const prior={window:global.window,document:global.document};
+    global.window={setInterval:()=>0}; global.document={};
+    try {
+        const srv=server(), source=new Map();
+        for (let i=0;i<9;i++) source.set(i+".md",bytes("note"));
+        const mac=await device(srv,source), peer=await device(srv);
+        await mac.startSetup({address:"https://dav.example",folder:"retry",username:"tester"},srv.password);
+        const invite=mac.sharingFields();
+        let requests=0, inflight=0;
+        srv.onRead=async name=>{
+            if (!name.startsWith("objects/r-")) return;
+            if (++requests===1) throw Error("connection interrupted");
+            inflight++; await new Promise(setImmediate); inflight--;
+        };
+        await assert.rejects(peer.join(invite,invite.key,invite.id),/interrupted/);
+        assert.equal(requests,4); assert.equal(inflight,0);
+        assert.equal(peer.state.current,undefined); assert.equal(peer.cache.size,0);
+        assert.equal(peer.progress,null);
+        delete srv.onRead;
+        await peer.join(invite,invite.key,invite.id);
+        assert.equal((await peer.run()).received,9);
     } finally { Object.assign(global,prior); }
 });

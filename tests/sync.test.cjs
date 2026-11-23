@@ -69,6 +69,35 @@ test("two devices upload, restore, modify and propagate a deletion", async () =>
     assert.equal((await a.sync()).sent, 0);
 });
 
+test("a fresh listing rejects a removed verified revision before applying any local file", async () => {
+    const f=await fixture(), peer=f.device();
+    const rev=await f.store.publish("note.md",[],text("original"));
+    const verified=await f.store.history(new Map());
+    f.markers.delete("commits/"+rev.id);
+    await assert.rejects(core.synchronize({store:f.store,cache:verified,baseline:peer.baseline,local:peer.local,
+        checkpoint(){assert.fail("Unexpected checkpoint");}}),/Previously seen history is missing/);
+    assert.equal(peer.contents.size,0);
+});
+
+test("a WebDAV that limits concurrent reads can finish the same listing without rereading successful revisions", async () => {
+    const f=await fixture();
+    for (let i=0;i<9;i++) await f.store.publish(i+".md",[],text("note"));
+    const read=f.dav.read, completed=new Set();
+    let busy=false, limited=0;
+    f.dav.read=async path=>{
+        if (busy) {limited++;throw Object.assign(Error("busy"),{status:429});}
+        busy=true;
+        try {
+            await new Promise(setImmediate);
+            assert(!completed.has(path));
+            completed.add(path);
+            return await read(path);
+        } finally {busy=false;}
+    };
+    const history=await f.store.history(new Map());
+    assert.equal(history.size,9);assert.equal(completed.size,9);assert.equal(limited,3);
+});
+
 test("simultaneous first uploads preserve both branches, export variants and resolve", async () => {
     const f = await fixture(), a = f.device(), b = f.device();
     const note = "weekly.md";

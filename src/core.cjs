@@ -93,6 +93,12 @@ async function unlock(header, material, pinned) {
     return key;
 }
 
+function checkRevision(id, rev) {
+    if (rev.id !== id || !safePath(rev.path) || isRecovery(rev.path) ||
+        !Array.isArray(rev.parents) || !rev.parents.every(p => idPattern.test(p)) ||
+        !(rev.hash === null || hashPattern.test(rev.hash))) throw Error("Invalid revision metadata.");
+}
+
 // A revision is visible only after its immutable data and metadata have both arrived.
 // MKCOL publishes a unique completion marker with a single WebDAV operation.
 class Store {
@@ -198,21 +204,51 @@ class Store {
         if (generation) await dir.put("v-"+generation,new ArrayBuffer(0)).catch(()=>{});
         return true;
     }
-    async history(cache, names) {
+    async history(cache, names, {progress, active = () => true} = {}) {
         names ??= await this.dav.list("commits");
         const visible = new Set(names);
         for (const id of cache.keys()) {
             if (!visible.has(id)) throw Error("Previously seen history is missing from this server.");
         }
-        const history = new Map();
+        const history = new Map(), missing = [];
         for (const id of visible) {
             if (!idPattern.test(id)) throw Error("Unexpected entry in the vault history.");
-            const rev = cache.get(id) ?? parseBytes(await this.readObject("r-" + id));
-            if (rev.id !== id || !safePath(rev.path) || isRecovery(rev.path) ||
-                !Array.isArray(rev.parents) || !rev.parents.every(p => idPattern.test(p)) ||
-                !(rev.hash === null || hashPattern.test(rev.hash))) throw Error("Invalid revision metadata.");
+            const rev = cache.get(id);
+            if (rev) checkRevision(id, rev);
+            else missing.push(id);
+            // Preserve the listing order even when reads finish out of order.
             history.set(id, rev);
         }
+        let checked = history.size - missing.length;
+        progress?.("versions", checked, history.size);
+        const read = async id => {
+            if (!active()) throw Error("Sync stopped.");
+            const rev = parseBytes(await this.readObject("r-" + id));
+            checkRevision(id, rev);
+            if (!active()) throw Error("Sync stopped.");
+            history.set(id, rev);
+            progress?.("versions", ++checked, history.size);
+        };
+        let concurrency = 4;
+        for (let start = 0; start < missing.length;) {
+            const ids = missing.slice(start, start + concurrency);
+            const results = await Promise.allSettled(ids.map(read));
+            start += ids.length;
+            const retry = [];
+            for (const [i, result] of results.entries()) {
+                if (result.status === "fulfilled") continue;
+                if (concurrency === 1 || ![429,503].includes(result.reason?.status)) throw result.reason;
+                retry.push(ids[i]);
+            }
+            // A constrained WebDAV may refuse concurrent GETs. Keep the successful
+            // reads and finish this listing serially after a short backoff.
+            if (retry.length) {
+                concurrency = 1;
+                await new Promise(resolve => setTimeout(resolve, 500));
+                for (const id of retry) await read(id);
+            }
+        }
+        if (!active()) throw Error("Sync stopped.");
         return history;
     }
 }
@@ -261,8 +297,8 @@ async function syncScope(local, history) {
     return {groups,localPaths};
 }
 
-async function synchronize({ store, local, baseline, cache, checkpoint, resolve, selection, commitNames, active = () => true }) {
-    const history = await store.history(cache, commitNames);
+async function synchronize({ store, local, baseline, cache, checkpoint, resolve, selection, commitNames, progress, active = () => true }) {
+    const history = await store.history(cache, commitNames, {progress, active});
     const {groups,localPaths} = await syncScope(local,history);
     if (selection && !groups.has(selection.path)) throw Error("冲突版本已变化，请重新同步并比较。");
     // A checkpoint from an earlier version may still contain a leaked conflict copy.
@@ -286,9 +322,10 @@ async function synchronize({ store, local, baseline, cache, checkpoint, resolve,
     // Tombstones for old names must not block future unrelated paths.
     checkAliases([...paths].filter(path => localPaths.has(path) || groups.get(path)?.some(r => r.hash !== null)));
     const conflicts = [];
-    let sent = 0, received = 0;
+    let sent = 0, received = 0, processed = 0;
     for (const path of paths) {
         if (!active()) throw Error("Sync stopped.");
+        progress?.("files", processed++, paths.size);
         let heads = groups.get(path) ?? [];
         let base = baseline.get(path);
         let bytes = await local.read(path);
@@ -401,6 +438,7 @@ async function synchronize({ store, local, baseline, cache, checkpoint, resolve,
             checkpoint(baseline);
         }
     }
+    progress?.("files", paths.size, paths.size);
     return { history, sent, received, conflicts };
 }
 

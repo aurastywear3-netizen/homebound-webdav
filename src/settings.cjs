@@ -42,6 +42,21 @@ function updateText(el,text) {
     el.hidden=!text;
 }
 
+function progressView(parent) {
+    const el=parent.createDiv({cls:"homebound-progress"});
+    el.hidden=true;
+    return {el, label:el.createDiv(), bar:el.createEl("progress")};
+}
+
+const progressLabels={
+    connecting:["Verifying connection and vault key…","正在验证连接和库密钥…"],
+    versions:["Checking remote versions","核对远端版本"],
+    local:["Checking local files","核对本地文件"],
+    reconciling:["Updating files after key rotation","更新换钥后的文件"],
+    files:["Syncing files","同步文件"],
+    finishing:["Finishing sync…","正在完成同步…"]
+};
+
 class DetailModal extends Modal {
     onClose() { this.contentEl.empty(); }
 }
@@ -119,14 +134,24 @@ class HomeboundSettings extends PluginSettingTab {
     }
     reviewJoin(fields,form) {
         const p = this.plugin;
-        const lines = [this.app.vault.getName() + " ← " + core.davAddress(fields.address) + "/" + core.directory(fields.folder),
-            tr("Vault ID: ","库标识：") + fields.id, tr("After verification, download this vault into the open local vault.",
-                "确认后会验证库标识与密钥，并把远端内容同步到当前本地库。")];
-        review(this.app,tr("Join this vault?","加入这个库？"),lines,tr("Verify and sync","验证并同步"),async () => {
-            await this.perform(() => p.join(fields,fields.key,fields.id));
+        const modal = new DetailModal(this.app), el = modal.contentEl;
+        modal.setTitle(tr("Join this vault?","加入这个库？"));
+        el.createEl("p",{text:this.app.vault.getName() + " ← " + core.davAddress(fields.address) + "/" + core.directory(fields.folder)});
+        el.createEl("p",{text:tr("Vault ID: ","库标识：") + fields.id});
+        el.createEl("p",{text:tr("After verification, download this vault into the open local vault.",
+            "确认后会验证库标识与密钥，并把远端内容同步到当前本地库。")});
+        const view = progressView(el);
+        button(el,tr("Verify and sync","验证并同步"),async () => {
+            await this.perform(async () => {
+                this.joinProgress = view;
+                try { await p.join(fields,fields.key,fields.id); }
+                finally { this.joinProgress = null; }
+            });
+            modal.close();
             form?.close();
             await p.run();
         });
+        modal.open();
     }
     showBackup(c = this.plugin.state.current) {
         const p = this.plugin;
@@ -151,6 +176,22 @@ class HomeboundSettings extends PluginSettingTab {
         modal.open();
     }
     statusVisible() { return Boolean(this.statusEl?.isConnected); }
+    refreshProgress() {
+        for (const view of [this.panelProgress,this.joinProgress]) {
+            if (!view?.el.isConnected) continue;
+            const step=this.plugin.progress;
+            view.el.hidden=!step;
+            if (!step) continue;
+            const label=tr(...progressLabels[step.phase]);
+            updateText(view.label,step.total>0 ? label+" "+step.done+" / "+step.total : label);
+            view.bar.setAttribute("aria-label",label);
+            if (step.total===null) view.bar.removeAttribute("value");
+            else {
+                view.bar.max=step.total || 1;
+                view.bar.value=step.total ? step.done : 1;
+            }
+        }
+    }
     refreshStatus() {
         if (!this.statusVisible()) return;
         const p = this.plugin;
@@ -193,6 +234,8 @@ class HomeboundSettings extends PluginSettingTab {
         title.createEl("h2",{text:this.app.vault.getName()});
         this.summaryEl=title.createDiv({cls:"homebound-summary",attr:{role:"status"}});
         actionButton(head,tr("Sync now","立即同步"),()=>this.plugin.run(),"homebound-sync");
+        this.panelProgress=progressView(this.statusEl);
+        this.refreshProgress();
         this.detailEl=this.statusEl.createDiv({cls:"homebound-detail"});
         this.resultEl=this.statusEl.createDiv({cls:"homebound-issue",attr:{role:"status"}});
         this.conflictList = this.statusEl.createDiv();
@@ -255,12 +298,14 @@ class HomeboundSettings extends PluginSettingTab {
     }
     hide() {
         this.statusEl=null;
+        this.panelProgress=null;
         this.refreshHistoryPeriod=null;
         super.hide?.();
     }
     display() {
         this.refreshHistoryPeriod=null;
         this.statusEl=null;
+        this.panelProgress=null;
         const p = this.plugin;
         const {current, pending} = p.state;
         this.containerEl.empty();
@@ -273,6 +318,8 @@ class HomeboundSettings extends PluginSettingTab {
         const scan=()=>new Scanner(this.app,f=>this.reviewJoin(f)).open();
         if (!current) {
             el.createEl("h2",{text:this.app.vault.getName()});
+            this.panelProgress=progressView(el);
+            this.refreshProgress();
             el.createEl("p",{cls:"homebound-intro",text:tr("Connect this vault to sync notes and attachments.",
                 "连接此库以同步笔记和附件。")});
             if (p.oldFormat) el.createEl("p",{text:tr("Older vault detected. Finish syncing and backing up with 0.2.2 first. Use a new remote folder to migrate a complete local copy.",

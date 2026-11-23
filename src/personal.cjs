@@ -42,10 +42,13 @@ async function seedSnapshot(store, local, active) {
 }
 
 // An old offline copy must never silently publish stale notes into a freshly rotated vault.
-async function checkJoin(store, local, previousBaseline = new Map()) {
-    const {groups:heads, localPaths:paths} = await core.syncScope(local,await store.history(new Map()));
+async function checkJoin(history, local, previousBaseline = new Map(), {progress, active = () => true} = {}) {
+    const {groups:heads, localPaths:paths} = await core.syncScope(local,history);
     const updates = [];
+    let checked = 0;
     for (const path of paths) {
+        checkActive(active);
+        progress?.("local", checked++, paths.size);
         const bytes = await local.read(path);
         const hash = bytes === null ? null : await core.sha(bytes);
         const versions = heads.get(path) || [];
@@ -61,6 +64,8 @@ async function checkJoin(store, local, previousBaseline = new Map()) {
         if (base.hash !== null && !paths.has(path) && heads.get(path)?.some(rev => rev.hash !== null))
             throw Error("本地有尚待核对的删除：" + path + "。请先备份并使用空本地库加入。");
     }
+    checkActive(active);
+    if (paths.size) progress?.("local", paths.size, paths.size);
     return updates;
 }
 

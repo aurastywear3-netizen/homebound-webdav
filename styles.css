@@ -19,6 +19,20 @@
 }
 .homebound-vault { flex: 1 1 13rem; min-inline-size: 0; }
 .homebound-summary { margin-block-start: .4rem; }
+.homebound-progress {
+    margin-block: .65rem;
+    font-size: var(--font-ui-small);
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+}
+.homebound-progress[hidden] { display: none; }
+.homebound-progress progress {
+    display: block;
+    inline-size: 100%;
+    block-size: .4rem;
+    margin-block-start: .35rem;
+    accent-color: var(--interactive-accent);
+}
 .homebound-summary, .homebound-detail, .homebound-intro { color: var(--text-muted); }
 .homebound-status.has-issue .homebound-summary { color: var(--text-normal); font-weight: var(--font-semibold); }
 .homebound-detail, .homebound-issue { margin-block-start: .5rem; font-size: var(--font-ui-small); }

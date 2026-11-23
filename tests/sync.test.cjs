@@ -42,6 +42,23 @@ test("Unicode folder input, literal percent signs and HTTPS rules", () => {
     assert.throws(() => core.endpoint("https://u:p@dav.example.org/test"));
 });
 
+test("an edit during first-download prefetch is preserved and other files still converge on retry", async () => {
+    const {device,dav,store}=await fixture(), peer=device();
+    const first=await store.publish("a.md",[],text("remote"));
+    await store.publish("b.md",[],text("second"));
+    const read=dav.read;
+    dav.read=async name=>{
+        if (name==="objects/b-"+first.id) peer.contents.set("a.md",text("offline edit"));
+        return read(name);
+    };
+    await assert.rejects(peer.sync());
+    assert.deepEqual(peer.contents.get("a.md"),text("offline edit"));
+    assert(!peer.baseline.has("a.md"));
+    dav.read=read;
+    assert.deepEqual((await peer.sync()).conflicts,["a.md"]);
+    assert.deepEqual(peer.contents.get("b.md"),text("second"));
+});
+
 test("key verifier rejects another vault, wrong random key, and tampering", async () => {
     const material = core.generateKey();
     const header = await core.newHeader(material, core.randomId());

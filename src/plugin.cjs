@@ -11,6 +11,7 @@ const {ConflictFiles} = require("./conflict-files.cjs");
 const {ConflictReview} = require("./review.cjs");
 const {notePlan,isNote} = require("./merge.cjs");
 const {HomeboundSettings} = require("./settings.cjs");
+const {RevisionCache} = require("./revision-cache.cjs");
 const {VersionWatch} = require("./version.cjs");
 const historyTools = require("./history.cjs");
 const {HistoryModal} = require("./history-view.cjs");
@@ -33,7 +34,11 @@ module.exports = class HomeboundPlugin extends Plugin {
         this.closed = false;
         this.cache = new Map();
         this.state = this.app.loadLocalStorage(stateKey) || {};
-        this.copies = new ConflictFiles(this.app,this.manifest.dir || this.app.vault.configDir + "/plugins/homebound-webdav");
+        const directory = this.manifest.dir || this.app.vault.configDir + "/plugins/homebound-webdav";
+        this.revisions = new RevisionCache(this.app, directory);
+        const current = this.state.current;
+        if (current) this.cache = await this.revisions.load(current.id, this.secret(current, "key"));
+        this.copies = new ConflictFiles(this.app, directory);
         await this.copies.load();
         this.restoreStatus();
         this.oldFormat = !this.state.current && Boolean((await this.loadData())?.id ||
@@ -225,12 +230,32 @@ module.exports = class HomeboundPlugin extends Plugin {
         const dav = this.vaultDav(config,password);
         const header = core.parseBytes(await dav.read("vault.json"));
         const key = await core.unlock(header, material, config.id);
-        return {store:new core.Store(dav, header.id, key, this.transfer), previous:header.previous};
+        return {store:new core.Store(dav, header.id, key, this.transfer, this.revisions.knownIds(header.id)), previous:header.previous};
     }
     async historyStore(id) {
         const c=this.state.current;
         if (this.closed || this.state.pending || !c || c.id!==id) throw Error(tr("Vault changed.","当前库已变化。"));
         return (await this.connect(c,this.secret(c,"dav"),this.secret(c,"key"))).store;
+    }
+    async rebuildRevisionCache(id) {
+        return this.exclusive(async () => {
+            const active = () => !this.closed && this.state.current?.id === id;
+            this.setProgress("connecting");
+            try {
+                const store = await this.historyStore(id);
+                const known = new Map(this.cache);
+                for (const file of this.baseline(id).values()) for (const revision of file.ids) known.set(revision,null);
+                const history = await store.history(known, undefined, {refresh:true, active,
+                    progress:this.setProgress.bind(this)});
+                core.headsByPath(history);
+                await this.revisions.save(store, history, active, true);
+                // Rebuilding can see newer revisions before their files have been applied.
+                // Let the next poll sync them even if the commit list now matches the cache.
+                this.watch.accepted = null;
+                this.cache = history;
+                return history.size;
+            } finally { this.setProgress(null); }
+        });
     }
     async setHistoryPeriod(id,days) {
         await this.exclusive(async()=>historyTools.setPeriod(await this.historyStore(id),days));
@@ -310,9 +335,11 @@ module.exports = class HomeboundPlugin extends Plugin {
         if (enteredPassword) this.storeSecrets(config, material, password);
         await core.createVault(this.dav(config,password), config.folder, material, config.id, previous);
         const {store} = await this.connect(config,password,material);
-        const baseline = await new VersionWatch().trackWrites(store, () => seedSnapshot(store, this.local(), () => !this.closed));
+        const active = () => !this.closed;
+        const {baseline,history} = await new VersionWatch().trackWrites(store, () => seedSnapshot(store, this.local(), active));
+        await this.revisions.save(store, history, active);
         this.checkpoint(config.id, baseline);
-        this.activate(config);
+        this.activate(config, history);
         this.last = tr("Upload and readback verified.","已完成上传和读回校验。");
         this.recordSuccess([]);
         new Notice(this.last);
@@ -330,12 +357,18 @@ module.exports = class HomeboundPlugin extends Plugin {
             let verified;
             if (current?.id !== id) {
                 if (current && current.id !== previous) throw Error("当前本地库已绑定另一个库。请打开对应的独立本地库。");
+                if (!current) store.reads.limit = 8;
                 const options = {progress:this.setProgress.bind(this), active:() => !this.closed};
-                verified = await store.history(new Map(), undefined, options);
+                const previousCache = await this.revisions.load(id, material);
+                verified = await store.history(previousCache, undefined, options);
                 await checkJoin(verified, this.local(), current ? this.baseline(current.id) : undefined, options);
+                await this.revisions.save(store, verified, options.active);
                 if (current) config.joinedFrom = current.id;
-            } else if (current.joinedFrom) {
-                config.joinedFrom = current.joinedFrom;
+                else config.initialReadLimit = store.reads.limit;
+            } else {
+                verified = this.cache;
+                if (current.joinedFrom) config.joinedFrom = current.joinedFrom;
+                if (current.initialReadLimit) config.initialReadLimit = current.initialReadLimit;
             }
             if (this.closed) throw Error("插件已关闭，请重新打开后继续。");
             this.storeSecrets(config, material, password);
@@ -458,6 +491,7 @@ module.exports = class HomeboundPlugin extends Plugin {
                 if (this.state.pending) throw Error("请先完成建库或换钥。");
                 if (!c) throw Error("请先创建或扫码加入笔记库。");
                 const {store} = await this.connect(c, this.secret(c,"dav"), this.secret(c,"key"));
+                if (c.initialReadLimit === 8 || c.initialReadLimit === 1) store.reads.limit = c.initialReadLimit;
                 const local = this.local();
                 // Sample before listing commits. A post-sync marker could acknowledge
                 // a concurrent revision that was never part of this sync.
@@ -485,7 +519,13 @@ module.exports = class HomeboundPlugin extends Plugin {
                     selection, commitNames:c.joinedFrom ? undefined : probe?.names, progress, active, checkpoint:data => this.checkpoint(c.id,data)}));
                 progress("finishing");
                 result.received += reconciled;
+                await this.revisions.save(store, result.history, active);
                 this.cache = result.history;
+                if (c.initialReadLimit) {
+                    const updated = {...this.state.current};
+                    delete updated.initialReadLimit;
+                    this.save({current:updated});
+                }
                 watch.accepted = sample;
                 if (Date.now()>=this.nextHistoryCheck) {
                     try {

@@ -235,6 +235,39 @@ var __commonJS = (cb, mod) => function __require() {
   }
 };
 
+// src/parallel-reads.cjs
+var require_parallel_reads = __commonJS({
+  "src/parallel-reads.cjs"(exports2, module2) {
+    "use strict";
+    var limited = (error) => error?.status === 429 || error?.status === 503;
+    var ReadWindow = class {
+      constructor(limit = 4) {
+        this.limit = limit;
+      }
+      async each(count, read) {
+        for (let start = 0; start < count; ) {
+          const length = Math.min(this.limit, count - start);
+          const jobs = Array.from({ length }, (_, i) => start + i);
+          const results = await Promise.allSettled(jobs.map(read));
+          const retry = [];
+          for (const [i, result] of results.entries()) {
+            if (result.status === "fulfilled") continue;
+            if (this.limit === 1 || !limited(result.reason)) throw result.reason;
+            retry.push(jobs[i]);
+          }
+          if (retry.length) {
+            this.limit = 1;
+            await new Promise((resolve) => setTimeout(resolve, 500));
+            for (const i of retry) await read(i);
+          }
+          start += length;
+        }
+      }
+    };
+    module2.exports = { ReadWindow, limited };
+  }
+});
+
 // src/diff.cjs
 var require_diff = __commonJS({
   "src/diff.cjs"(exports2, module2) {
@@ -516,6 +549,7 @@ var require_merge = __commonJS({
 var require_core = __commonJS({
   "src/core.cjs"(exports2, module2) {
     "use strict";
+    var { ReadWindow } = require_parallel_reads();
     var { isNote: isNote2, asText, notePlan: notePlan2 } = require_merge();
     var encoder = new TextEncoder();
     var decoder = new TextDecoder("utf-8", { fatal: true });
@@ -599,12 +633,19 @@ var require_core = __commonJS({
       }
       return key;
     }
+    function checkKnownIds(ids, visible) {
+      let absent = 0;
+      for (const id of ids) if (!visible.has(id)) absent++;
+      if (absent) throw Error("Previously seen history is missing from this server. \u8FDC\u7AEF\u7F3A\u5C11 " + absent + " \u6761\u5DF2\u6838\u5BF9\u7684\u63D0\u4EA4\u3002");
+    }
     function checkRevision(id, rev) {
       if (rev.id !== id || !safePath(rev.path) || isRecovery(rev.path) || !Array.isArray(rev.parents) || !rev.parents.every((p) => idPattern.test(p)) || !(rev.hash === null || hashPattern.test(rev.hash))) throw Error("Invalid revision metadata.");
     }
     var Store = class {
-      constructor(dav, id, key, transfer) {
+      constructor(dav, id, key, transfer, knownIds = []) {
         this.transfer = transfer;
+        this.knownIds = knownIds;
+        this.reads = new ReadWindow();
         this.dav = dav;
         this.id = id;
         this.key = key;
@@ -643,7 +684,7 @@ var require_core = __commonJS({
       async readBody(rev, options) {
         if (rev.parts) {
           if (!this.transfer) throw Error("\u6B64\u9644\u4EF6\u9700\u8981\u652F\u6301\u5206\u5757\u7684\u5BA2\u6237\u7AEF\u3002");
-          return this.transfer.download(this.chunkObjects(), "personal/" + this.id, rev, options);
+          return this.transfer.download(this.chunkObjects(), "personal/" + this.id, rev, { ...options, reads: this.reads });
         }
         const bytes = await this.readObject("b-" + rev.id);
         if (await sha(bytes) !== rev.hash) throw Error("File integrity check failed: " + rev.path);
@@ -716,16 +757,14 @@ var require_core = __commonJS({
         });
         return true;
       }
-      async history(cache, names, { progress, active = () => true } = {}) {
+      async history(cache, names, { progress, active = () => true, refresh = false } = {}) {
         names ??= await this.dav.list("commits");
         const visible = new Set(names);
-        for (const id of cache.keys()) {
-          if (!visible.has(id)) throw Error("Previously seen history is missing from this server.");
-        }
+        checkKnownIds(/* @__PURE__ */ new Set([...this.knownIds, ...cache.keys()]), visible);
         const history = /* @__PURE__ */ new Map(), missing = [];
         for (const id of visible) {
           if (!idPattern.test(id)) throw Error("Unexpected entry in the vault history.");
-          const rev = cache.get(id);
+          const rev = refresh ? void 0 : cache.get(id);
           if (rev) checkRevision(id, rev);
           else missing.push(id);
           history.set(id, rev);
@@ -740,23 +779,7 @@ var require_core = __commonJS({
           history.set(id, rev);
           progress?.("versions", ++checked, history.size);
         };
-        let concurrency = 4;
-        for (let start = 0; start < missing.length; ) {
-          const ids = missing.slice(start, start + concurrency);
-          const results = await Promise.allSettled(ids.map(read));
-          start += ids.length;
-          const retry = [];
-          for (const [i, result] of results.entries()) {
-            if (result.status === "fulfilled") continue;
-            if (concurrency === 1 || ![429, 503].includes(result.reason?.status)) throw result.reason;
-            retry.push(ids[i]);
-          }
-          if (retry.length) {
-            concurrency = 1;
-            await new Promise((resolve) => setTimeout(resolve, 500));
-            for (const id of retry) await read(id);
-          }
-        }
+        await this.reads.each(missing.length, (i) => read(missing[i]));
         if (!active()) throw Error("Sync stopped.");
         return history;
       }
@@ -802,6 +825,32 @@ var require_core = __commonJS({
       }
       return { groups, localPaths };
     }
+    async function* prepareDownloads(paths, groups, baseline, localPaths, store, local, active, selection) {
+      let batch = [];
+      async function* flush() {
+        await store.reads.each(batch.length, async (i) => {
+          if (!active()) throw Error("Sync stopped.");
+          const item = batch[i], previous = await local.read(item.path);
+          const hash = previous === null ? null : await sha(previous);
+          if (hash !== item.expected) return;
+          item.body = await store.readBody(item.head);
+        });
+        yield* batch;
+        batch = [];
+      }
+      for (const path of paths) {
+        const heads = groups.get(path), base = baseline.get(path);
+        const expected = base?.hash ?? null, head = heads?.[0];
+        if (path !== selection?.path && heads?.length === 1 && head.hash !== null && head.hash !== expected && !head.parts && (base || !localPaths.has(path))) {
+          batch.push({ path, head, expected });
+          if (batch.length >= store.reads.limit) yield* flush();
+        } else {
+          if (batch.length) yield* flush();
+          yield { path };
+        }
+      }
+      if (batch.length) yield* flush();
+    }
     async function synchronize({ store, local, baseline, cache, checkpoint, resolve, selection, commitNames, progress, active = () => true }) {
       const history = await store.history(cache, commitNames, { progress, active });
       const { groups, localPaths } = await syncScope(local, history);
@@ -824,9 +873,19 @@ var require_core = __commonJS({
       checkAliases([...paths].filter((path) => localPaths.has(path) || groups.get(path)?.some((r) => r.hash !== null)));
       const conflicts = [];
       let sent = 0, received = 0, processed = 0;
-      for (const path of paths) {
+      progress?.("files", 0, paths.size);
+      for await (const item of prepareDownloads(paths, groups, baseline, localPaths, store, local, active, selection)) {
+        const { path } = item;
         if (!active()) throw Error("Sync stopped.");
-        progress?.("files", processed++, paths.size);
+        if (processed) progress?.("files", processed, paths.size);
+        processed++;
+        if (item.body !== void 0) {
+          await local.apply(path, item.expected, item.body);
+          baseline.set(path, { ids: [item.head.id], hash: item.head.hash });
+          checkpoint(baseline);
+          received++;
+          continue;
+        }
         let heads = groups.get(path) ?? [];
         let base = baseline.get(path);
         let bytes = await local.read(path);
@@ -929,7 +988,7 @@ var require_core = __commonJS({
           checkpoint(baseline);
         }
       }
-      progress?.("files", paths.size, paths.size);
+      if (paths.size) progress?.("files", paths.size, paths.size);
       return { history, sent, received, conflicts };
     }
     async function createVault(home, folder, material, id, previous = "") {
@@ -989,6 +1048,9 @@ var require_core = __commonJS({
       namespace,
       newHeader,
       unlock,
+      importKey,
+      checkRevision,
+      checkKnownIds,
       generateKey,
       checkAliases,
       randomId,
@@ -12987,6 +13049,7 @@ var require_adapter = __commonJS({
 var require_transfer = __commonJS({
   "src/transfer.cjs"(exports2, module2) {
     "use strict";
+    var { ReadWindow, limited } = require_parallel_reads();
     var core2 = require_core();
     var blockSize2 = 512 * 1024;
     var threshold = 4 * 1024 * 1024;
@@ -13083,13 +13146,13 @@ var require_transfer = __commonJS({
       checkActive() {
         if (!this.active()) throw Error("\u4F20\u8F93\u5DF2\u505C\u6B62\u3002");
       }
-      async retry(info, operation) {
+      async retry(info, operation, reads) {
         for (let attempt = 0; ; attempt++) {
           this.checkActive();
           try {
             return await operation(attempt);
           } catch (e) {
-            if (!transient(e)) throw e;
+            if (!transient(e) || reads?.limit > 1 && limited(e)) throw e;
             if (attempt >= 3) {
               throw Object.assign(Error(e.message + " \xB7 \u5DF2\u4FDD\u7559\u5206\u5757\u8FDB\u5EA6\uFF0C\u53EF\u91CD\u65B0\u540C\u6B65\u3002"), { status: e.status, offline: e.offline });
             }
@@ -13154,14 +13217,14 @@ var require_transfer = __commonJS({
         this.checkActive();
         return { id, parts, key: base64(new Uint8Array(raw)) };
       }
-      async download(objects, scope, rev, { audit = false } = {}) {
+      async download(objects, scope, rev, { audit = false, reads = new ReadWindow() } = {}) {
         const { parts, id, path } = rev;
         if (!validParts(parts)) throw Error("\u65E0\u6CD5\u8BC6\u522B\u9644\u4EF6\u5206\u5757\u683C\u5F0F\u3002");
         const total = Math.ceil(parts.size / blockSize2), key = await aes(from64(rev.key));
         let output;
         const info = { direction: "download", path, total, size: parts.size, done: 0 };
         this.progress(info);
-        for (let i = 0; i < total; i++) {
+        await reads.each(total, async (i) => {
           this.checkActive();
           const slot = [scope, "get", id, i], aad = label(scope, id, parts, i);
           let packet = audit ? void 0 : await this.cache.get(slot), clear;
@@ -13174,7 +13237,7 @@ var require_transfer = __commonJS({
           }
           if (!clear) {
             const name = await chunkName(parts, i);
-            packet = await this.retry(info, () => objects.read(name));
+            packet = await this.retry(info, () => objects.read(name), reads);
             clear = await core2.unseal(key, aad, packet);
             if (!audit) await this.cache.put(slot, packet);
           }
@@ -13184,7 +13247,7 @@ var require_transfer = __commonJS({
           output.set(new Uint8Array(clear), i * blockSize2);
           info.done++;
           this.progress(info);
-        }
+        });
         if (await core2.sha(output) !== rev.hash) throw Error("\u9644\u4EF6\u5B8C\u6574\u6027\u68C0\u67E5\u5931\u8D25\uFF1A" + path);
         if (!audit) await this.cache.clearDownload(scope, id);
         return output.buffer;
@@ -13219,7 +13282,8 @@ var require_personal = __commonJS({
           await store.publish(path, current.map((rev) => rev.id), bytes);
         }
       }
-      const { groups: published, localPaths: remaining } = await core2.syncScope(local, await store.history(/* @__PURE__ */ new Map()));
+      const history = await store.history(/* @__PURE__ */ new Map());
+      const { groups: published, localPaths: remaining } = await core2.syncScope(local, history);
       const baseline = /* @__PURE__ */ new Map();
       for (const [path, versions] of published) {
         checkActive(active);
@@ -13233,7 +13297,7 @@ var require_personal = __commonJS({
       }
       if (remaining.size) throw Error("\u6709\u6587\u4EF6\u5C1A\u672A\u4E0A\u4F20\uFF0C\u8BF7\u7EE7\u7EED\u91CD\u8BD5\u3002");
       checkActive(active);
-      return baseline;
+      return { baseline, history };
     }
     async function checkJoin2(history, local, previousBaseline = /* @__PURE__ */ new Map(), { progress, active = () => true } = {}) {
       const { groups: heads, localPaths: paths } = await core2.syncScope(local, history);
@@ -14305,6 +14369,13 @@ var require_settings = __commonJS({
         actionButton(advanced, tr2("Scan to rejoin", "\u91CD\u65B0\u626B\u7801\u52A0\u5165"), scan, "homebound-nav");
         actionButton(advanced, tr2("Join with a recovery key", "\u4F7F\u7528\u6062\u590D\u5BC6\u94A5\u52A0\u5165"), () => this.connectionForm("recover"), "homebound-nav");
         actionButton(advanced, tr2("Rotate key and move to a new folder\u2026", "\u6362\u94A5\u5E76\u8FC1\u5165\u65B0\u76EE\u5F55\u2026"), () => this.connectionForm("rotate"), "homebound-nav");
+        button(advanced, tr2("Rebuild local version cache", "\u91CD\u5EFA\u672C\u673A\u7248\u672C\u7F13\u5B58"), async () => {
+          const count = await p.rebuildRevisionCache(current.id);
+          new Notice2(tr2("Local version cache rebuilt: ", "\u5DF2\u91CD\u5EFA\u672C\u673A\u7248\u672C\u7F13\u5B58\uFF0C\u5171 ") + count + tr2(" revisions.", " \u6761\u7248\u672C\u8BB0\u5F55\u3002"));
+        }).setName(tr2("Local version cache", "\u672C\u673A\u7248\u672C\u7F13\u5B58")).setDesc(tr2(
+          "Verify versions against WebDAV again. Only this device\u2019s cache is updated; notes and remote history are preserved.",
+          "\u91CD\u65B0\u4ECE WebDAV \u6838\u5BF9\u7248\u672C\u8BB0\u5F55\u3002\u53EA\u66F4\u65B0\u6B64\u8BBE\u5907\u7684\u7F13\u5B58\uFF0C\u7B14\u8BB0\u548C\u8FDC\u7AEF\u5386\u53F2\u90FD\u4F1A\u4FDD\u7559\u3002"
+        ));
         button(advanced, tr2("Clear historical copies", "\u6E05\u7406\u5386\u53F2\u526F\u672C"), () => this.clearCopies()).setName(tr2("Local conflict copies", "\u672C\u673A\u51B2\u7A81\u526F\u672C")).setDesc(tr2(
           "Remove resolved copies. Pending versions and edited copies are kept.",
           "\u6E05\u7406\u5DF2\u89E3\u51B3\u7684\u526F\u672C\uFF0C\u4FDD\u7559\u5F85\u5904\u7406\u7248\u672C\u548C\u624B\u52A8\u7F16\u8F91\u8FC7\u7684\u526F\u672C\u3002"
@@ -14398,6 +14469,82 @@ var require_settings = __commonJS({
       }
     };
     module2.exports = { HomeboundSettings: HomeboundSettings2 };
+  }
+});
+
+// src/revision-cache.cjs
+var require_revision_cache = __commonJS({
+  "src/revision-cache.cjs"(exports2, module2) {
+    "use strict";
+    var core2 = require_core();
+    var token = /^[0-9a-f]{32}$/;
+    var pointerKey = (id) => "homebound-revision-cache-v1-" + id;
+    var label = (id, generation) => "homebound:revision-cache:1:" + id + ":" + generation;
+    var knownIds = (pointer) => (Array.isArray(pointer?.ids) ? pointer.ids : []).filter((value) => typeof value === "string" && token.test(value));
+    var RevisionCache2 = class {
+      constructor(app, directory) {
+        this.app = app;
+        this.disk = app.vault.adapter;
+        this.directory = directory;
+        this.loaded = null;
+      }
+      path(id, generation) {
+        if (!token.test(id) || !token.test(generation)) throw Error("Invalid version cache identifier.");
+        return this.directory + "/versions-" + id + "-" + generation + ".bin";
+      }
+      knownIds(id) {
+        return knownIds(this.app.loadLocalStorage(pointerKey(id)));
+      }
+      async load(id, material) {
+        this.loaded = null;
+        const pointer = this.app.loadLocalStorage(pointerKey(id));
+        if (!pointer) return /* @__PURE__ */ new Map();
+        const known = new Set(knownIds(pointer));
+        try {
+          const packet = await this.disk.readBinary(this.path(id, pointer.generation));
+          const key = await core2.importKey(material);
+          const entries = core2.parseBytes(await core2.unseal(key, label(id, pointer.generation), packet));
+          if (!Array.isArray(entries) || entries.length !== known.size) return /* @__PURE__ */ new Map();
+          const verified = /* @__PURE__ */ new Map();
+          for (const rev of entries) {
+            if (!known.has(rev.id) || verified.has(rev.id)) return /* @__PURE__ */ new Map();
+            core2.checkRevision(rev.id, rev);
+            verified.set(rev.id, rev);
+          }
+          this.loaded = pointer.generation;
+          return verified;
+        } catch {
+          return /* @__PURE__ */ new Map();
+        }
+      }
+      async save(store, history, active, force = false) {
+        const id = store.id, key = pointerKey(id);
+        const previous = this.app.loadLocalStorage(key);
+        const ids = knownIds(previous);
+        core2.checkKnownIds(ids, history);
+        if (!force && token.test(previous?.generation) && this.loaded === previous.generation && ids.length === history.size) return;
+        const generation = core2.randomId(), path = this.path(id, generation);
+        const packet = await core2.seal(store.key, label(id, generation), core2.jsonBytes([...history.values()]));
+        try {
+          await this.disk.writeBinary(path, packet);
+          const stored = new Uint8Array(await this.disk.readBinary(path)), expected = new Uint8Array(packet);
+          if (stored.length !== expected.length || !stored.every((value, i) => value === expected[i]))
+            throw Error("\u672C\u673A\u7248\u672C\u7F13\u5B58\u5199\u5165\u6821\u9A8C\u5931\u8D25\u3002");
+          if (!active()) throw Error("\u7248\u672C\u7F13\u5B58\u91CD\u5EFA\u5DF2\u4E2D\u6B62\u3002");
+          if (this.app.loadLocalStorage(key)?.generation !== previous?.generation)
+            throw Error("\u672C\u673A\u7248\u672C\u7F13\u5B58\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u8BD5\u3002");
+          this.app.saveLocalStorage(key, { generation, ids: [...history.keys()] });
+        } catch (error) {
+          await this.disk.remove(path).catch(() => {
+          });
+          throw error;
+        }
+        this.loaded = generation;
+        if (token.test(previous?.generation)) await this.disk.remove(this.path(id, previous.generation)).catch(() => {
+        });
+      }
+    };
+    module2.exports = { RevisionCache: RevisionCache2 };
   }
 });
 
@@ -14615,6 +14762,7 @@ var { ConflictFiles } = require_conflict_files();
 var { ConflictReview } = require_review();
 var { notePlan, isNote } = require_merge();
 var { HomeboundSettings } = require_settings();
+var { RevisionCache } = require_revision_cache();
 var { VersionWatch } = require_version();
 var historyTools = require_history();
 var { HistoryModal } = require_history_view();
@@ -14634,7 +14782,11 @@ module.exports = class HomeboundPlugin extends Plugin {
     this.closed = false;
     this.cache = /* @__PURE__ */ new Map();
     this.state = this.app.loadLocalStorage(stateKey) || {};
-    this.copies = new ConflictFiles(this.app, this.manifest.dir || this.app.vault.configDir + "/plugins/homebound-webdav");
+    const directory = this.manifest.dir || this.app.vault.configDir + "/plugins/homebound-webdav";
+    this.revisions = new RevisionCache(this.app, directory);
+    const current = this.state.current;
+    if (current) this.cache = await this.revisions.load(current.id, this.secret(current, "key"));
+    this.copies = new ConflictFiles(this.app, directory);
     await this.copies.load();
     this.restoreStatus();
     this.oldFormat = !this.state.current && Boolean((await this.loadData())?.id || this.app.loadLocalStorage("homebound-webdav-pqc-config")?.anchor);
@@ -14841,12 +14993,35 @@ module.exports = class HomeboundPlugin extends Plugin {
     const dav = this.vaultDav(config, password);
     const header = core.parseBytes(await dav.read("vault.json"));
     const key = await core.unlock(header, material, config.id);
-    return { store: new core.Store(dav, header.id, key, this.transfer), previous: header.previous };
+    return { store: new core.Store(dav, header.id, key, this.transfer, this.revisions.knownIds(header.id)), previous: header.previous };
   }
   async historyStore(id) {
     const c = this.state.current;
     if (this.closed || this.state.pending || !c || c.id !== id) throw Error(tr("Vault changed.", "\u5F53\u524D\u5E93\u5DF2\u53D8\u5316\u3002"));
     return (await this.connect(c, this.secret(c, "dav"), this.secret(c, "key"))).store;
+  }
+  async rebuildRevisionCache(id) {
+    return this.exclusive(async () => {
+      const active = () => !this.closed && this.state.current?.id === id;
+      this.setProgress("connecting");
+      try {
+        const store = await this.historyStore(id);
+        const known = new Map(this.cache);
+        for (const file of this.baseline(id).values()) for (const revision of file.ids) known.set(revision, null);
+        const history = await store.history(known, void 0, {
+          refresh: true,
+          active,
+          progress: this.setProgress.bind(this)
+        });
+        core.headsByPath(history);
+        await this.revisions.save(store, history, active, true);
+        this.watch.accepted = null;
+        this.cache = history;
+        return history.size;
+      } finally {
+        this.setProgress(null);
+      }
+    });
   }
   async setHistoryPeriod(id, days) {
     await this.exclusive(async () => historyTools.setPeriod(await this.historyStore(id), days));
@@ -14932,9 +15107,11 @@ module.exports = class HomeboundPlugin extends Plugin {
     if (enteredPassword) this.storeSecrets(config, material, password);
     await core.createVault(this.dav(config, password), config.folder, material, config.id, previous);
     const { store } = await this.connect(config, password, material);
-    const baseline = await new VersionWatch().trackWrites(store, () => seedSnapshot(store, this.local(), () => !this.closed));
+    const active = () => !this.closed;
+    const { baseline, history } = await new VersionWatch().trackWrites(store, () => seedSnapshot(store, this.local(), active));
+    await this.revisions.save(store, history, active);
     this.checkpoint(config.id, baseline);
-    this.activate(config);
+    this.activate(config, history);
     this.last = tr("Upload and readback verified.", "\u5DF2\u5B8C\u6210\u4E0A\u4F20\u548C\u8BFB\u56DE\u6821\u9A8C\u3002");
     this.recordSuccess([]);
     new Notice(this.last);
@@ -14952,12 +15129,18 @@ module.exports = class HomeboundPlugin extends Plugin {
       let verified;
       if (current?.id !== id) {
         if (current && current.id !== previous) throw Error("\u5F53\u524D\u672C\u5730\u5E93\u5DF2\u7ED1\u5B9A\u53E6\u4E00\u4E2A\u5E93\u3002\u8BF7\u6253\u5F00\u5BF9\u5E94\u7684\u72EC\u7ACB\u672C\u5730\u5E93\u3002");
+        if (!current) store.reads.limit = 8;
         const options = { progress: this.setProgress.bind(this), active: () => !this.closed };
-        verified = await store.history(/* @__PURE__ */ new Map(), void 0, options);
+        const previousCache = await this.revisions.load(id, material);
+        verified = await store.history(previousCache, void 0, options);
         await checkJoin(verified, this.local(), current ? this.baseline(current.id) : void 0, options);
+        await this.revisions.save(store, verified, options.active);
         if (current) config.joinedFrom = current.id;
-      } else if (current.joinedFrom) {
-        config.joinedFrom = current.joinedFrom;
+        else config.initialReadLimit = store.reads.limit;
+      } else {
+        verified = this.cache;
+        if (current.joinedFrom) config.joinedFrom = current.joinedFrom;
+        if (current.initialReadLimit) config.initialReadLimit = current.initialReadLimit;
       }
       if (this.closed) throw Error("\u63D2\u4EF6\u5DF2\u5173\u95ED\uFF0C\u8BF7\u91CD\u65B0\u6253\u5F00\u540E\u7EE7\u7EED\u3002");
       this.storeSecrets(config, material, password);
@@ -15070,6 +15253,7 @@ module.exports = class HomeboundPlugin extends Plugin {
         if (this.state.pending) throw Error("\u8BF7\u5148\u5B8C\u6210\u5EFA\u5E93\u6216\u6362\u94A5\u3002");
         if (!c) throw Error("\u8BF7\u5148\u521B\u5EFA\u6216\u626B\u7801\u52A0\u5165\u7B14\u8BB0\u5E93\u3002");
         const { store } = await this.connect(c, this.secret(c, "dav"), this.secret(c, "key"));
+        if (c.initialReadLimit === 8 || c.initialReadLimit === 1) store.reads.limit = c.initialReadLimit;
         const local = this.local();
         const watch = this.watch;
         const sample = probe?.sample ?? await watch.read(store.dav).catch(() => null);
@@ -15103,7 +15287,13 @@ module.exports = class HomeboundPlugin extends Plugin {
         }));
         progress("finishing");
         result2.received += reconciled;
+        await this.revisions.save(store, result2.history, active);
         this.cache = result2.history;
+        if (c.initialReadLimit) {
+          const updated = { ...this.state.current };
+          delete updated.initialReadLimit;
+          this.save({ current: updated });
+        }
         watch.accepted = sample;
         if (Date.now() >= this.nextHistoryCheck) {
           try {

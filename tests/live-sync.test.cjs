@@ -193,7 +193,7 @@ test("vault event debounce coalesces writes, queues edits during sync, and ignor
     let start, rounds=0;
     const current={id:"fixture",auto:false};
     p.manifest={dir:".obsidian/plugins/homebound-webdav"};
-    p.app={appId:"test", vault:{adapter:{exists:async()=>false},on:(event,fn)=>{events[event]=fn;}},
+    p.app={appId:"test", secretStorage:{getSecret:()=>null}, vault:{adapter:{exists:async()=>false},on:(event,fn)=>{events[event]=fn;}},
         workspace:{onLayoutReady:fn=>{start=fn;}},loadLocalStorage:k=>k==="homebound-personal-v2"?{current}:null};
     p.loadData=async()=>null;
     p.addSettingTab=p.addCommand=p.registerInterval=p.registerEvent=()=>{};

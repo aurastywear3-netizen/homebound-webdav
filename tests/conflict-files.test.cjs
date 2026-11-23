@@ -7,6 +7,7 @@ const fsp = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const {sha,randomId,synchronize} = require("../src/core.cjs");
+const {ReadWindow} = require("../src/parallel-reads.cjs");
 const {ConflictFiles,siblingPath} = require("../src/conflict-files.cjs");
 
 class TFile {}
@@ -157,7 +158,7 @@ test("an authenticated legacy copy is skipped on a peer without a marker; a simi
     await disk.write(rev.path,"branch");
     vault.getFiles=()=>[{path:rev.path}];
     const baseline=new Map([[leak.path,{ids:[leak.id],hash:leak.hash}]]);
-    const result=await synchronize({store:{history:async()=>history,readBody:r=>{
+    const result=await synchronize({store:{reads:new ReadWindow(),history:async()=>history,readBody:r=>{
         assert.equal(r.id,user.id);return bytes("ordinary note");
     }},local,baseline,checkpoint(){}});
     assert.equal(result.sent,0);

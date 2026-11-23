@@ -1,4 +1,4 @@
-# Homebound WebDAV 0.3.7
+# Homebound WebDAV 0.3.8
 
 Homebound WebDAV syncs encrypted notes and attachments between your Obsidian devices using an HTTPS WebDAV server you control. Each vault has its own folder and encryption key.
 
@@ -13,6 +13,8 @@ Homebound WebDAV syncs encrypted notes and attachments between your Obsidian dev
 Open **Settings → Community plugins → Browse** in Obsidian 1.11.4 or later. Search for **Homebound WebDAV**, choose **Install**, then **Enable**. Install the plugin in each local vault you want to sync.
 
 ## Usage
+
+On first join, Homebound reads up to eight revisions, files or attachment blocks at a time. Later syncs use up to four. Reads slow down if the server returns a rate limit or a temporary overload. Verified revisions are cached in an encrypted file on this device. **Advanced settings → Rebuild local version cache** verifies every remote revision again and replaces the cache when verification succeeds.
 
 1. On your first device, choose **Settings → Homebound WebDAV → Create new vault**, enter the WebDAV address, account and password, and choose a new, empty remote folder. Select **Continue**, confirm the upload and wait for upload verification.
 2. Select **Back up vault key** and save the recovery key in your password manager. Keep the WebDAV credentials and folder name available for recovery.
@@ -32,8 +34,10 @@ The default retention is **30 days**. Choose 30, 60, 90, 180 days or **Forever**
 
 1. 在当前库启用插件，点「创建新库」，填写 WebDAV 地址、账号、密码和一个新的子目录。点「继续」，核对目标并确认本地副本完整。插件会创建缺少的目录，上传笔记和附件，并读回校验。中断后在同一设备点「继续上传并校验」。
 2. 点「备份库密钥」，将恢复密钥、地址、账号、密码和子目录保存到密码管理器。丢失最后一份密钥将无法解密远端数据。
-3. 在另一台设备打开准备同步的本地库，启用插件并点「扫码加入」。扫描首台设备在「在另一台设备上使用此库」中显示的二维码，或在插件内读取二维码图片。核对本地库、远端地址和库标识后确认后，窗口显示已核对的远端版本数；验证通过后，设置页显示已处理的文件数和总数。首次同步会重新列出提交，只下载新增版本的记录，并校验下载的正文和附件。没有摄像头时，也可填写 WebDAV 配置、粘贴恢复密钥并连接。建议首次加入使用空本地库；若已有文件与远端冲突，插件会提示先备份。
+3. 在另一台设备打开准备同步的本地库，启用插件并点「扫码加入」。扫描首台设备在「在另一台设备上使用此库」中显示的二维码，或在插件内读取二维码图片。确认本地库、远端地址和库标识后，窗口显示已核对的远端版本数；验证通过后，设置页显示已处理的文件数和总数。首次同步会重新列出提交，只下载新增版本的记录，并校验下载的正文和附件。没有摄像头时，也可填写 WebDAV 配置、粘贴恢复密钥并连接。建议首次加入使用空本地库；若已有文件与远端冲突，插件会提示先备份。
 4. 在其他 Obsidian 库中重复建库，选用另一个远端子目录。库绑定后自动同步。文件编辑、创建、删除或改名后，停顿 2 秒即同步。应用在前台时每 5 秒轻量检查远端版本标记，有新提交就拉取。每 5 分钟、返回前台及恢复联网时还会完整检查。移动系统可能挂起后台应用。
+
+首次加入最多同时读取 8 条版本记录、文件或附件分块，日常同步最多 4 路，遇到 WebDAV 限流会降速。插件在本机插件目录加密保存已验证的版本记录。重新打开库时会核对远端提交清单，仅获取缺少的记录。可在「高级设置 → 重建本机版本缓存」重新核对，成功后替换旧缓存。
 
 共享码包含 WebDAV 地址、账号、密码、远端目录、库标识及库密钥。它可以重复使用，请仅当面展示给自己的设备。每张码只含一把库密钥；该账号可列举、写入或删除哪些目录取决于服务器权限。恢复密钥独立于 WebDAV 密码，更新账号密码时可在已连接设备的「高级设置 → 修改 WebDAV 连接」中验证并保存。
 

@@ -1,5 +1,6 @@
 "use strict";
 
+const {ReadWindow} = require("./parallel-reads.cjs");
 const {isNote,asText,notePlan} = require("./merge.cjs");
 
 const encoder = new TextEncoder();
@@ -93,6 +94,12 @@ async function unlock(header, material, pinned) {
     return key;
 }
 
+function checkKnownIds(ids, visible) {
+    let absent = 0;
+    for (const id of ids) if (!visible.has(id)) absent++;
+    if (absent) throw Error("Previously seen history is missing from this server. 远端缺少 " + absent + " 条已核对的提交。");
+}
+
 function checkRevision(id, rev) {
     if (rev.id !== id || !safePath(rev.path) || isRecovery(rev.path) ||
         !Array.isArray(rev.parents) || !rev.parents.every(p => idPattern.test(p)) ||
@@ -102,8 +109,10 @@ function checkRevision(id, rev) {
 // A revision is visible only after its immutable data and metadata have both arrived.
 // MKCOL publishes a unique completion marker with a single WebDAV operation.
 class Store {
-    constructor(dav, id, key, transfer) {
+    constructor(dav, id, key, transfer, knownIds = []) {
         this.transfer = transfer;
+        this.knownIds = knownIds;
+        this.reads = new ReadWindow();
         this.dav = dav;
         this.id = id;
         this.key = key;
@@ -136,7 +145,7 @@ class Store {
     async readBody(rev,options) {
         if (rev.parts) {
             if (!this.transfer) throw Error("此附件需要支持分块的客户端。");
-            return this.transfer.download(this.chunkObjects(),"personal/"+this.id,rev,options);
+            return this.transfer.download(this.chunkObjects(),"personal/"+this.id,rev,{...options, reads:this.reads});
         }
         const bytes = await this.readObject("b-" + rev.id);
         if (await sha(bytes) !== rev.hash) throw Error("File integrity check failed: " + rev.path);
@@ -204,16 +213,14 @@ class Store {
         if (generation) await dir.put("v-"+generation,new ArrayBuffer(0)).catch(()=>{});
         return true;
     }
-    async history(cache, names, {progress, active = () => true} = {}) {
+    async history(cache, names, {progress, active = () => true, refresh = false} = {}) {
         names ??= await this.dav.list("commits");
         const visible = new Set(names);
-        for (const id of cache.keys()) {
-            if (!visible.has(id)) throw Error("Previously seen history is missing from this server.");
-        }
+        checkKnownIds(new Set([...this.knownIds, ...cache.keys()]), visible);
         const history = new Map(), missing = [];
         for (const id of visible) {
             if (!idPattern.test(id)) throw Error("Unexpected entry in the vault history.");
-            const rev = cache.get(id);
+            const rev = refresh ? undefined : cache.get(id);
             if (rev) checkRevision(id, rev);
             else missing.push(id);
             // Preserve the listing order even when reads finish out of order.
@@ -229,25 +236,7 @@ class Store {
             history.set(id, rev);
             progress?.("versions", ++checked, history.size);
         };
-        let concurrency = 4;
-        for (let start = 0; start < missing.length;) {
-            const ids = missing.slice(start, start + concurrency);
-            const results = await Promise.allSettled(ids.map(read));
-            start += ids.length;
-            const retry = [];
-            for (const [i, result] of results.entries()) {
-                if (result.status === "fulfilled") continue;
-                if (concurrency === 1 || ![429,503].includes(result.reason?.status)) throw result.reason;
-                retry.push(ids[i]);
-            }
-            // A constrained WebDAV may refuse concurrent GETs. Keep the successful
-            // reads and finish this listing serially after a short backoff.
-            if (retry.length) {
-                concurrency = 1;
-                await new Promise(resolve => setTimeout(resolve, 500));
-                for (const id of retry) await read(id);
-            }
-        }
+        await this.reads.each(missing.length, i => read(missing[i]));
         if (!active()) throw Error("Sync stopped.");
         return history;
     }
@@ -297,6 +286,37 @@ async function syncScope(local, history) {
     return {groups,localPaths};
 }
 
+// Only fast-forward a single remote head. All mutations still happen in path
+// order and VaultFiles.apply checks the local hash again immediately before writing.
+async function* prepareDownloads(paths, groups, baseline, localPaths, store, local, active, selection) {
+    let batch = [];
+    async function* flush() {
+        await store.reads.each(batch.length, async i => {
+            if (!active()) throw Error("Sync stopped.");
+            const item = batch[i], previous = await local.read(item.path);
+            const hash = previous === null ? null : await sha(previous);
+            if (hash !== item.expected) return; // A concurrent local edit needs normal reconciliation.
+            item.body = await store.readBody(item.head);
+        });
+        yield* batch;
+        batch = [];
+    }
+    for (const path of paths) {
+        const heads = groups.get(path), base = baseline.get(path);
+        const expected = base?.hash ?? null, head = heads?.[0];
+        if (path !== selection?.path && heads?.length === 1 && head.hash !== null && head.hash !== expected &&
+            !head.parts && (base || !localPaths.has(path))) {
+            batch.push({path, head, expected});
+            if (batch.length >= store.reads.limit) yield* flush();
+        } else {
+            // In particular, assemble only one chunked attachment at a time.
+            if (batch.length) yield* flush();
+            yield {path};
+        }
+    }
+    if (batch.length) yield* flush();
+}
+
 async function synchronize({ store, local, baseline, cache, checkpoint, resolve, selection, commitNames, progress, active = () => true }) {
     const history = await store.history(cache, commitNames, {progress, active});
     const {groups,localPaths} = await syncScope(local,history);
@@ -323,9 +343,19 @@ async function synchronize({ store, local, baseline, cache, checkpoint, resolve,
     checkAliases([...paths].filter(path => localPaths.has(path) || groups.get(path)?.some(r => r.hash !== null)));
     const conflicts = [];
     let sent = 0, received = 0, processed = 0;
-    for (const path of paths) {
+    progress?.("files", 0, paths.size);
+    for await (const item of prepareDownloads(paths, groups, baseline, localPaths, store, local, active, selection)) {
+        const {path} = item;
         if (!active()) throw Error("Sync stopped.");
-        progress?.("files", processed++, paths.size);
+        if (processed) progress?.("files", processed, paths.size);
+        processed++;
+        if (item.body !== undefined) {
+            await local.apply(path, item.expected, item.body);
+            baseline.set(path, {ids:[item.head.id], hash:item.head.hash});
+            checkpoint(baseline);
+            received++;
+            continue;
+        }
         let heads = groups.get(path) ?? [];
         let base = baseline.get(path);
         let bytes = await local.read(path);
@@ -438,7 +468,7 @@ async function synchronize({ store, local, baseline, cache, checkpoint, resolve,
             checkpoint(baseline);
         }
     }
-    progress?.("files", paths.size, paths.size);
+    if (paths.size) progress?.("files", paths.size, paths.size);
     return { history, sent, received, conflicts };
 }
 
@@ -480,4 +510,4 @@ async function createVault(home, folder, material, id, previous = "") {
 }
 
 module.exports = { createVault, Store, synchronize, syncScope, headsByPath, safePath, isRecovery, conflictFolder, directory, endpoint, davAddress, encodePath,
-    namespace, newHeader, unlock, generateKey, checkAliases, randomId, sha, jsonBytes, parseBytes, seal, unseal };
+    namespace, newHeader, unlock, importKey, checkRevision, checkKnownIds, generateKey, checkAliases, randomId, sha, jsonBytes, parseBytes, seal, unseal };

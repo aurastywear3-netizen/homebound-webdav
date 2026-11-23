@@ -343,6 +343,12 @@ class HomeboundSettings extends PluginSettingTab {
         actionButton(advanced,tr("Scan to rejoin","重新扫码加入"),scan,"homebound-nav");
         actionButton(advanced,tr("Join with a recovery key","使用恢复密钥加入"),()=>this.connectionForm("recover"),"homebound-nav");
         actionButton(advanced,tr("Rotate key and move to a new folder…","换钥并迁入新目录…"),()=>this.connectionForm("rotate"),"homebound-nav");
+        button(advanced,tr("Rebuild local version cache","重建本机版本缓存"),async () => {
+            const count = await p.rebuildRevisionCache(current.id);
+            new Notice(tr("Local version cache rebuilt: ","已重建本机版本缓存，共 ") + count + tr(" revisions."," 条版本记录。"));
+        }).setName(tr("Local version cache","本机版本缓存"))
+            .setDesc(tr("Verify versions against WebDAV again. Only this device’s cache is updated; notes and remote history are preserved.",
+                "重新从 WebDAV 核对版本记录。只更新此设备的缓存，笔记和远端历史都会保留。"));
         button(advanced,tr("Clear historical copies","清理历史副本"),()=>this.clearCopies())
             .setName(tr("Local conflict copies","本机冲突副本"))
             .setDesc(tr("Remove resolved copies. Pending versions and edited copies are kept.",

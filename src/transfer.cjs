@@ -1,5 +1,6 @@
 "use strict";
 
+const {ReadWindow, limited} = require("./parallel-reads.cjs");
 const core = require("./core.cjs");
 
 const blockSize = 512 * 1024;
@@ -68,12 +69,12 @@ class ChunkTransfer {
     }
     shouldSplit(bytes) { return this.enabled && bytes?.byteLength >= threshold; }
     checkActive() { if (!this.active()) throw Error("传输已停止。"); }
-    async retry(info, operation) {
+    async retry(info, operation, reads) {
         for (let attempt=0;;attempt++) {
             this.checkActive();
             try { return await operation(attempt); }
             catch (e) {
-                if (!transient(e)) throw e;
+                if (!transient(e) || (reads?.limit > 1 && limited(e))) throw e;
                 if (attempt >= 3) {
                     throw Object.assign(Error(e.message + " · 已保留分块进度，可重新同步。"), {status:e.status, offline:e.offline});
                 }
@@ -129,14 +130,14 @@ class ChunkTransfer {
         this.checkActive();
         return {id,parts,key:base64(new Uint8Array(raw))};
     }
-    async download(objects,scope,rev,{audit=false} = {}) {
+    async download(objects,scope,rev,{audit=false, reads = new ReadWindow()} = {}) {
         const {parts,id,path}=rev;
         if (!validParts(parts)) throw Error("无法识别附件分块格式。");
         const total = Math.ceil(parts.size/blockSize), key = await aes(from64(rev.key));
         let output;
         const info = {direction:"download",path,total,size:parts.size,done:0};
         this.progress(info);
-        for (let i=0;i<total;i++) {
+        await reads.each(total, async i => {
             this.checkActive();
             const slot = [scope,"get",id,i], aad = label(scope,id,parts,i);
             // Recovery audits must verify every remote object even after an interrupted download.
@@ -147,7 +148,7 @@ class ChunkTransfer {
             }
             if (!clear) {
                 const name = await chunkName(parts,i);
-                packet = await this.retry(info, () => objects.read(name));
+                packet = await this.retry(info, () => objects.read(name), reads);
                 clear = await core.unseal(key,aad,packet);
                 if (!audit) await this.cache.put(slot,packet);
             }
@@ -157,7 +158,7 @@ class ChunkTransfer {
             if (!output) output = new Uint8Array(parts.size);
             output.set(new Uint8Array(clear),i*blockSize);
             info.done++; this.progress(info);
-        }
+        });
         if (await core.sha(output) !== rev.hash) throw Error("附件完整性检查失败：" + path);
         if (!audit) await this.cache.clearDownload(scope,id);
         return output.buffer;

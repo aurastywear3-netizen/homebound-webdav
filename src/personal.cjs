@@ -24,7 +24,8 @@ async function seedSnapshot(store, local, active) {
     }
 
     // Re-read the published metadata and ciphertext from storage, including chunked files.
-    const {groups:published,localPaths:remaining} = await core.syncScope(local,await store.history(new Map()));
+    const history = await store.history(new Map());
+    const {groups:published,localPaths:remaining} = await core.syncScope(local,history);
     const baseline = new Map();
     for (const [path, versions] of published) {
         checkActive(active);
@@ -38,7 +39,7 @@ async function seedSnapshot(store, local, active) {
     }
     if (remaining.size) throw Error("有文件尚未上传，请继续重试。");
     checkActive(active);
-    return baseline;
+    return {baseline,history};
 }
 
 // An old offline copy must never silently publish stale notes into a freshly rotated vault.

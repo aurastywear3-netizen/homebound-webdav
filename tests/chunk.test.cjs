@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const core = require("../src/core.cjs");
-const {ChunkTransfer,blockSize,threshold} = require("../src/transfer.cjs");
+const {ChunkTransfer,blockSize,threshold,chunkName} = require("../src/transfer.cjs");
 
 class Cache extends Map {
     async get(slot) { return structuredClone(super.get(JSON.stringify(slot))); }
@@ -63,16 +63,19 @@ test("download restarts at missing blocks, verifies cached bytes and refuses cor
     };
     await assert.rejects(client().readBody(rev));assert.equal(cache.size,3);
     broken=false;
-    const archived=files.get(seen[0]), missing=seen[0];
+    const first=[...seen], archived=files.get(seen[0]), missing=seen[0];
     files.delete(missing);
     await assert.rejects(client().readBody(rev,{audit:true}), e=>e.status===404);
     assert.equal(cache.size,3);
     files.set(missing,archived);
-    const first=[...new Set(seen)];seen.length=0;
+    seen.length=0;
     assert.deepEqual(new Uint8Array(await client().readBody(rev)),data);
     assert.equal(seen.length,6);assert.ok(first.every(n=>!seen.includes(n)));assert.equal(cache.size,0);
     const damaged=new Uint8Array(files.get(first[0]));damaged[20]^=255;
-    await assert.rejects(client().readBody(rev));assert.equal(cache.size,0);
+    await assert.rejects(client().readBody(rev));assert.equal(cache.size,3);
+    damaged[20]^=255; seen.length=0;
+    assert.deepEqual(new Uint8Array(await client().readBody(rev)),data);
+    assert.equal(seen.length,6);assert.equal(cache.size,0);
 });
 
 test("permanent errors are not retried; a changed attachment never resumes the old version",async()=>{
@@ -85,6 +88,45 @@ test("permanent errors are not retried; a changed attachment never resumes the o
     const rev=await client().publish("x",[],data);
     files.delete(first);
     assert.deepEqual(new Uint8Array(await client().readBody(rev)),data);
+});
+
+test("whole-file and chunk downloads share one limit and retry a throttled block without repeating successful reads",async()=>{
+    const {dav,client,data}=await fixture(), store=client();
+    for (let i=0;i<10;i++) await store.publish(i+".md",[],Uint8Array.of(i));
+    const attachment=await store.publish("audio.bin",[],data);
+    await store.publish("after.md",[],Uint8Array.of(31));
+    const blockNames=new Set();
+    for(let i=0;i<9;i++) blockNames.add("objects/b-"+await chunkName(attachment.parts,i));
+    const read=dav.read, completed=new Set();
+    let active=0, peak=0, chunkPeak=0, throttled=false, afterLimit;
+    let release;
+    const firstBlocks=new Promise(resolve=>{release=resolve;});
+    dav.read=async name=>{
+        if(!name.startsWith("objects/b-")) return read(name);
+        const n=++active;
+        peak=Math.max(peak,n);
+        const chunk=blockNames.has(name);
+        if(chunk) {
+            chunkPeak=Math.max(chunkPeak,n);
+            if(n===8) release();
+            await firstBlocks;
+        }
+        await new Promise(setImmediate);
+        active--;
+        if(chunk && !throttled) { throttled=true; throw networkError(429); }
+        if(throttled && !chunk) afterLimit=store.reads.limit;
+        assert(!completed.has(name)); completed.add(name);
+        return read(name);
+    };
+    store.reads.limit=8;
+    const files=new Map();
+    const local={paths:()=>new Set(files.keys()),allowed:()=>true,read:async p=>files.get(p)??null,
+        apply:async(p,previous,body)=>{assert.equal(previous,null);files.set(p,body);}};
+    const result=await core.synchronize({store,local,baseline:new Map(),cache:new Map(),checkpoint(){}});
+    assert.equal(result.received,12); assert.equal(result.sent,0);
+    assert.equal(peak,8); assert.equal(chunkPeak,8); assert.equal(afterLimit,1);
+    assert.equal(completed.size,20);
+    assert.deepEqual(new Uint8Array(files.get("audio.bin")),data);
 });
 
 test("small files, deletions and a large file without opt-in keep the old whole-object format",async()=>{

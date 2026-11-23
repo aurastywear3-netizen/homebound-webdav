@@ -9,8 +9,7 @@ function checkActive(active) {
 // The only writer during setup is the device holding the unpublished sharing key.
 // Retrying always takes the trusted local files as the source, never the partial remote copy.
 async function seedSnapshot(store, local, active) {
-    const heads = core.headsByPath(await store.history(new Map()));
-    const paths = local.paths();
+    const {groups:heads, localPaths:paths} = await core.syncScope(local,await store.history(new Map()));
     core.checkAliases([...paths]);
     for (const path of new Set([...paths, ...heads.keys()])) {
         checkActive(active);
@@ -25,9 +24,8 @@ async function seedSnapshot(store, local, active) {
     }
 
     // Re-read the published metadata and ciphertext from storage, including chunked files.
-    const published = core.headsByPath(await store.history(new Map()));
+    const {groups:published,localPaths:remaining} = await core.syncScope(local,await store.history(new Map()));
     const baseline = new Map();
-    const remaining = local.paths();
     for (const [path, versions] of published) {
         checkActive(active);
         const [rev] = versions;
@@ -45,8 +43,7 @@ async function seedSnapshot(store, local, active) {
 
 // An old offline copy must never silently publish stale notes into a freshly rotated vault.
 async function checkJoin(store, local, previousBaseline = new Map()) {
-    const heads = core.headsByPath(await store.history(new Map()));
-    const paths = local.paths();
+    const {groups:heads, localPaths:paths} = await core.syncScope(local,await store.history(new Map()));
     const updates = [];
     for (const path of paths) {
         const bytes = await local.read(path);

@@ -164,4 +164,4 @@ class ChunkTransfer {
     }
     uploaded(scope,path) { return this.cache.remove([scope,"put",path]); }
 }
-module.exports = {ChunkTransfer,TransferCache,blockSize,threshold,validParts};
+module.exports = {ChunkTransfer,TransferCache,blockSize,threshold,validParts,chunkName};

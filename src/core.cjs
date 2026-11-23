@@ -116,7 +116,7 @@ class Store {
         }) : null;
         const id = staged?.id || randomId();
         if (bytes !== null && !staged) await this.writeObject("b-" + id, bytes);
-        const rev = { id, path, parents, hash };
+        const rev = { id, path, parents, hash, time:Date.now() };
         if (staged) Object.assign(rev, {parts:staged.parts, key:staged.key});
         await this.writeObject("r-" + id, jsonBytes(rev));
         await this.dav.mkdir("commits/" + id);
@@ -135,6 +135,68 @@ class Store {
         const bytes = await this.readObject("b-" + rev.id);
         if (await sha(bytes) !== rev.hash) throw Error("File integrity check failed: " + rev.path);
         return bytes;
+    }
+    async readMergeBase(rev) {
+        try { return await this.readBody(rev); }
+        catch (error) {
+            if (error.status !== 404 || !(await this.readHistoryPolicy()).expired.includes(rev.id)) throw error;
+            return null;
+        }
+    }
+    async readHistoryPolicy(knownGeneration) {
+        if (knownGeneration !== undefined) {
+            // Slots are consecutive and never removed. Probe the next one without fetching a body.
+            const next=await this.dav.call("HEAD","history-policy/v-"+(knownGeneration+1),[200,204,404,405,501],
+                {headers:{"Cache-Control":"no-cache"}});
+            if (next.status===404) return null;
+        }
+        // Publish numbered policy snapshots with the same no-overwrite MOVE used by vault setup.
+        // Empty older slots remain reserved so a suspended writer can never publish into the past.
+        for (let attempt=0;attempt<5;attempt++) {
+            let entries;
+            try { entries=await this.dav.list("history-policy"); }
+            catch (error) { if (error.status!==404) throw error; entries=[]; }
+            let generation=0;
+            for (const name of entries) {
+                if (/^stage-[a-f0-9]{32}$/.test(name)) continue;
+                if (!/^v-[1-9]\d{0,12}$/.test(name)) throw Error("无法识别历史设置格式。");
+                generation=Math.max(generation,Number(name.slice(2)));
+            }
+            if (generation===knownGeneration) return null;
+            if (!generation) return {days:30,expired:[],pending:[],dates:{},generation:0};
+            const packet=await this.dav.read("history-policy/v-"+generation);
+            if (!packet.byteLength) continue; // A newer snapshot was published during this read.
+            const value=parseBytes(await unseal(this.key,this.id+"/history-policy/"+generation,packet));
+            if (![30,60,90,180,0].includes(value.days) || !Array.isArray(value.expired) ||
+                !value.expired.every(id=>idPattern.test(id)) || !Array.isArray(value.pending) ||
+                !value.pending.every(id=>idPattern.test(id)) || !value.dates || typeof value.dates!=="object" ||
+                !Object.entries(value.dates).every(([id,t])=>idPattern.test(id) && Number.isSafeInteger(t) && t>0))
+                throw Error("历史保留设置损坏，已停止处理历史版本。");
+            return {...value,generation};
+        }
+        throw Error("历史设置读取期间已变化，请重试。");
+    }
+    async saveHistoryPolicy({generation,days,expired,pending,dates}) {
+        if (!generation) {
+            try { await this.dav.mkdir("history-policy"); }
+            catch (error) { if (error.status!==405) throw error; }
+        }
+        const dir=this.dav.child("history-policy"), next=generation+1, stage="stage-"+randomId();
+        const body=await seal(this.key,this.id+"/history-policy/"+next,jsonBytes({days,expired,pending,dates}));
+        try {
+            await dir.put(stage,body);
+            const result=await dir.call("MOVE",stage,[201,412],{
+                headers:{Destination:dir.child("v-"+next).root,Overwrite:"F"}
+            });
+            if (result.status===412) return false;
+        } finally {
+            // A timed-out MOVE may already have committed. Only discard this writer's own stage.
+            await dir.call("DELETE",stage,[200,204,404]).catch(()=>{});
+        }
+        // The committed successor contains all prior decisions. Keep only a small reservation
+        // at the old name; compaction is optional and never affects the new generation.
+        if (generation) await dir.put("v-"+generation,new ArrayBuffer(0)).catch(()=>{});
+        return true;
     }
     async history(cache, names) {
         names ??= await this.dav.list("commits");
@@ -188,11 +250,28 @@ function checkAliases(paths) {
     }
 }
 
+async function syncScope(local, history) {
+    const groups = headsByPath(history);
+    const localPaths = local.paths();
+    if (local.prepareCopies) {
+        await local.prepareCopies(localPaths,history);
+        for (const path of localPaths) if (local.isConflictCopy(path)) localPaths.delete(path);
+        for (const path of groups.keys()) if (local.isConflictCopy(path)) groups.delete(path);
+    }
+    return {groups,localPaths};
+}
+
 async function synchronize({ store, local, baseline, cache, checkpoint, resolve, selection, commitNames, active = () => true }) {
     const history = await store.history(cache, commitNames);
-    const groups = headsByPath(history);
+    const {groups,localPaths} = await syncScope(local,history);
     if (selection && !groups.has(selection.path)) throw Error("冲突版本已变化，请重新同步并比较。");
-    const localPaths = local.paths();
+    // A checkpoint from an earlier version may still contain a leaked conflict copy.
+    let removedCopy = false;
+    for (const path of baseline.keys()) if (local.isConflictCopy?.(path)) {
+        baseline.delete(path);
+        removedCopy = true;
+    }
+    if (removedCopy) checkpoint(baseline);
     // Every checkpoint must still be backed by a published revision on this server.
     for (const [path, base] of baseline) {
         if (!local.allowed(path) || !base.ids.length || base.ids.some(id =>
@@ -256,7 +335,7 @@ async function synchronize({ store, local, baseline, cache, checkpoint, resolve,
                 if (isNote(path) && left.hash!==null && right.hash!==null) {
                     const leftText = asText(left.hash===hash ? bytes : await store.readBody(left));
                     const rightText = asText(await store.readBody(right));
-                    plan = await notePlan(history,heads,left.hash,right.hash,leftText,rightText,r=>store.readBody(r));
+                    plan = await notePlan(history,heads,left.hash,right.hash,leftText,rightText,r=>store.readMergeBase(r));
                 }
                 if (!plan || plan.some(part=>typeof part!=="string")) {
                     for (const rev of heads) {
@@ -362,5 +441,5 @@ async function createVault(home, folder, material, id, previous = "") {
     return header;
 }
 
-module.exports = { createVault, Store, synchronize, headsByPath, safePath, isRecovery, conflictFolder, directory, endpoint, davAddress, encodePath,
+module.exports = { createVault, Store, synchronize, syncScope, headsByPath, safePath, isRecovery, conflictFolder, directory, endpoint, davAddress, encodePath,
     namespace, newHeader, unlock, generateKey, checkAliases, randomId, sha, jsonBytes, parseBytes, seal, unseal };

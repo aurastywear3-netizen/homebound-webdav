@@ -2,6 +2,7 @@
 
 const {conflictFolder, safePath, isRecovery, sha} = require("./core.cjs");
 const revisionDir = /^([0-9a-f]{32})-([0-9a-f]{64})$/;
+const siblingSuffix = /-(\d{14})-conflict-([0-9a-f]{32})(?:-([1-9]\d*))?(?:\.[^/.]*)?$/;
 const encoder = new TextEncoder();
 
 function stamp(date) {
@@ -37,6 +38,7 @@ class ConflictFiles {
         this.markers = this.root + "/deferred";
         this.copies = new Map();
         this.paths = new Set();
+        this.legacyUploads = new Set();
         this.work = Promise.resolve();
     }
     serial(action) {
@@ -62,6 +64,27 @@ class ConflictFiles {
                 !/^\d{14}$/.test(record.time) || !Number.isSafeInteger(record.number) || record.number < 0)
                 throw Error("Invalid conflict copy record: " + file);
             this.track({...record,id:match[1],hash:match[2]});
+        }
+    }
+    excludes(path) { return this.paths.has(path) || this.legacyUploads.has(path); }
+    async prepare(paths, history) {
+        // A previous plugin instance may finish writing its marker after our startup load.
+        // Snapshot the candidate names first. A sibling created later waits for the next scan.
+        for (const path of paths) {
+            if (!this.excludes(path) && siblingSuffix.test(path)) {
+                await this.serial(() => this.load());
+                break;
+            }
+        }
+        // Older versions could publish a deferred copy. Recognize its original upload by
+        // authenticated source revision, generated path and matching bytes. Preserve the ledger.
+        for (const rev of history.values()) {
+            if (rev.parents.length || !rev.hash || this.legacyUploads.has(rev.path)) continue;
+            const match = siblingSuffix.exec(rev.path);
+            if (!match) continue;
+            const source = history.get(match[2]);
+            if (source?.hash === rev.hash && siblingPath({...source,time:match[1],number:Number(match[3] || 0)}) === rev.path)
+                this.legacyUploads.add(rev.path);
         }
     }
     async ensureDir(path) {

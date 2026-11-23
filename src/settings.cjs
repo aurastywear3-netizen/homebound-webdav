@@ -2,6 +2,7 @@
 const {Modal, Notice, PluginSettingTab, Setting, getLanguage} = require("obsidian");
 const qr = require("./pairing-invite.cjs");
 const core = require("./core.cjs");
+const {periods}=require("./history.cjs");
 const tr = (en, zh) => getLanguage().startsWith("zh") ? zh : en;
 
 function button(el, label, action) {
@@ -136,7 +137,7 @@ class HomeboundSettings extends PluginSettingTab {
         this.countEl.setText(p.uploads.known ? String(p.uploads.files.size) : unknown);
         this.conflictEl.setText(p.status.conflicts ? (p.conflicts.length ? String(p.conflicts.length) : tr("None","无冲突"))
             : tr("Awaiting first check","待首次检查"));
-        this.resultEl.setText(p.pollError || p.last || "");
+        this.resultEl.setText([p.pollError || p.last,p.historyError].filter(Boolean).join("\n"));
         if (this.listedConflicts === p.conflicts) return;
         this.listedConflicts = p.conflicts;
         this.conflictList.empty();
@@ -158,7 +159,63 @@ class HomeboundSettings extends PluginSettingTab {
         this.refreshStatus();
         this.plugin.scheduleCount();
     }
+    showHistory(el,id) {
+        const p=this.plugin;
+        button(el,tr("View version history","查看历史版本"),()=>p.openHistory());
+        const description=tr("Shared by all devices in this vault. The period starts when a version is replaced.",
+            "同一库的所有设备共用此设置，旧版本从被替换时开始计时。");
+        const setting=new Setting(el).setName(tr("Keep version history","历史版本保留期限")).setDesc(description);
+        setting.addDropdown(d=>{
+            d.addOption("",tr("Loading…","读取中…")).setDisabled(true);
+            for (const n of periods) d.addOption(String(n),n===0 ? tr("Forever","永久保存") : n+tr(" days"," 天"));
+            let store, saved, generation, reading=false, writing=false, edits=0;
+            const current=()=>this.refreshHistoryPeriod===refresh && !p.closed && !p.state.pending && p.state.current?.id===id;
+            const refresh=async(initial=false)=>{
+                const el=d.selectEl;
+                if (!current() || reading || writing) return;
+                if (!initial && (!el.isConnected || el.ownerDocument.visibilityState==="hidden" || !el.getClientRects().length)) return;
+                const edit=edits;
+                reading=true;
+                try {
+                    store ??= await p.historyStore(id);
+                    const policy=await store.readHistoryPolicy(generation);
+                    if (!current() || edits!==edit) return;
+                    if (policy) {
+                        if (saved===undefined) el.options[0].remove();
+                        saved=policy.days;
+                        generation=policy.generation;
+                        if (d.getValue()!==String(saved)) d.setValue(String(saved));
+                        d.setDisabled(false);
+                    }
+                    if (setting.descEl.textContent!==description) setting.setDesc(description);
+                } catch (error) {
+                    store=null;
+                    if (current() && edits===edit) setting.setDesc(error.message);
+                } finally { reading=false; }
+            };
+            this.refreshHistoryPeriod=refresh;
+            void refresh(true);
+            d.onChange(async value=>{
+                if (!current() || !value || writing) return;
+                edits++;
+                writing=true;
+                d.setDisabled(true);
+                try { await p.setHistoryPeriod(id,Number(value)); saved=Number(value); }
+                catch (error) { if (current()) { d.setValue(String(saved)); new Notice(error.message); } }
+                finally {
+                    writing=false;
+                    generation=undefined;
+                    if (current()) d.setDisabled(false);
+                }
+            });
+        });
+    }
+    hide() {
+        this.refreshHistoryPeriod=null;
+        super.hide?.();
+    }
     display() {
+        this.refreshHistoryPeriod=null;
         const p = this.plugin, el = this.containerEl;
         const {current, pending} = p.state;
         el.empty(); el.addClass("homebound-settings");
@@ -191,6 +248,7 @@ class HomeboundSettings extends PluginSettingTab {
         if (current) {
             el.createEl("p",{text:current.address + "/" + current.folder + " · " + current.username});
             button(el,tr("Sync now","立即同步"),() => p.run());
+            this.showHistory(el,current.id);
             button(el,tr("Show sharing QR code","显示共享二维码"),() => this.showCode());
             button(el,tr("Back up vault key","备份库密钥"),() => this.showBackup());
         }

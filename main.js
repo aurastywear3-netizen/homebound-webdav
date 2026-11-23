@@ -626,7 +626,7 @@ var require_core = __commonJS({
         }) : null;
         const id = staged?.id || randomId();
         if (bytes !== null && !staged) await this.writeObject("b-" + id, bytes);
-        const rev = { id, path, parents, hash };
+        const rev = { id, path, parents, hash, time: Date.now() };
         if (staged) Object.assign(rev, { parts: staged.parts, key: staged.key });
         await this.writeObject("r-" + id, jsonBytes(rev));
         await this.dav.mkdir("commits/" + id);
@@ -645,6 +645,73 @@ var require_core = __commonJS({
         const bytes = await this.readObject("b-" + rev.id);
         if (await sha(bytes) !== rev.hash) throw Error("File integrity check failed: " + rev.path);
         return bytes;
+      }
+      async readMergeBase(rev) {
+        try {
+          return await this.readBody(rev);
+        } catch (error) {
+          if (error.status !== 404 || !(await this.readHistoryPolicy()).expired.includes(rev.id)) throw error;
+          return null;
+        }
+      }
+      async readHistoryPolicy(knownGeneration) {
+        if (knownGeneration !== void 0) {
+          const next = await this.dav.call(
+            "HEAD",
+            "history-policy/v-" + (knownGeneration + 1),
+            [200, 204, 404, 405, 501],
+            { headers: { "Cache-Control": "no-cache" } }
+          );
+          if (next.status === 404) return null;
+        }
+        for (let attempt = 0; attempt < 5; attempt++) {
+          let entries;
+          try {
+            entries = await this.dav.list("history-policy");
+          } catch (error) {
+            if (error.status !== 404) throw error;
+            entries = [];
+          }
+          let generation = 0;
+          for (const name of entries) {
+            if (/^stage-[a-f0-9]{32}$/.test(name)) continue;
+            if (!/^v-[1-9]\d{0,12}$/.test(name)) throw Error("\u65E0\u6CD5\u8BC6\u522B\u5386\u53F2\u8BBE\u7F6E\u683C\u5F0F\u3002");
+            generation = Math.max(generation, Number(name.slice(2)));
+          }
+          if (generation === knownGeneration) return null;
+          if (!generation) return { days: 30, expired: [], pending: [], dates: {}, generation: 0 };
+          const packet = await this.dav.read("history-policy/v-" + generation);
+          if (!packet.byteLength) continue;
+          const value = parseBytes(await unseal(this.key, this.id + "/history-policy/" + generation, packet));
+          if (![30, 60, 90, 180, 0].includes(value.days) || !Array.isArray(value.expired) || !value.expired.every((id) => idPattern.test(id)) || !Array.isArray(value.pending) || !value.pending.every((id) => idPattern.test(id)) || !value.dates || typeof value.dates !== "object" || !Object.entries(value.dates).every(([id, t]) => idPattern.test(id) && Number.isSafeInteger(t) && t > 0))
+            throw Error("\u5386\u53F2\u4FDD\u7559\u8BBE\u7F6E\u635F\u574F\uFF0C\u5DF2\u505C\u6B62\u5904\u7406\u5386\u53F2\u7248\u672C\u3002");
+          return { ...value, generation };
+        }
+        throw Error("\u5386\u53F2\u8BBE\u7F6E\u8BFB\u53D6\u671F\u95F4\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u8BD5\u3002");
+      }
+      async saveHistoryPolicy({ generation, days, expired, pending, dates }) {
+        if (!generation) {
+          try {
+            await this.dav.mkdir("history-policy");
+          } catch (error) {
+            if (error.status !== 405) throw error;
+          }
+        }
+        const dir = this.dav.child("history-policy"), next = generation + 1, stage = "stage-" + randomId();
+        const body = await seal(this.key, this.id + "/history-policy/" + next, jsonBytes({ days, expired, pending, dates }));
+        try {
+          await dir.put(stage, body);
+          const result = await dir.call("MOVE", stage, [201, 412], {
+            headers: { Destination: dir.child("v-" + next).root, Overwrite: "F" }
+          });
+          if (result.status === 412) return false;
+        } finally {
+          await dir.call("DELETE", stage, [200, 204, 404]).catch(() => {
+          });
+        }
+        if (generation) await dir.put("v-" + generation, new ArrayBuffer(0)).catch(() => {
+        });
+        return true;
       }
       async history(cache, names) {
         names ??= await this.dav.list("commits");
@@ -693,11 +760,26 @@ var require_core = __commonJS({
         }
       }
     }
+    async function syncScope(local, history) {
+      const groups = headsByPath(history);
+      const localPaths = local.paths();
+      if (local.prepareCopies) {
+        await local.prepareCopies(localPaths, history);
+        for (const path of localPaths) if (local.isConflictCopy(path)) localPaths.delete(path);
+        for (const path of groups.keys()) if (local.isConflictCopy(path)) groups.delete(path);
+      }
+      return { groups, localPaths };
+    }
     async function synchronize({ store, local, baseline, cache, checkpoint, resolve, selection, commitNames, active = () => true }) {
       const history = await store.history(cache, commitNames);
-      const groups = headsByPath(history);
+      const { groups, localPaths } = await syncScope(local, history);
       if (selection && !groups.has(selection.path)) throw Error("\u51B2\u7A81\u7248\u672C\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u540C\u6B65\u5E76\u6BD4\u8F83\u3002");
-      const localPaths = local.paths();
+      let removedCopy = false;
+      for (const path of baseline.keys()) if (local.isConflictCopy?.(path)) {
+        baseline.delete(path);
+        removedCopy = true;
+      }
+      if (removedCopy) checkpoint(baseline);
       for (const [path, base] of baseline) {
         if (!local.allowed(path) || !base.ids.length || base.ids.some((id) => history.get(id)?.path !== path || history.get(id).hash !== base.hash)) {
           throw Error("Local checkpoint does not match the remote history. Sync stopped.");
@@ -751,7 +833,7 @@ var require_core = __commonJS({
             if (isNote2(path) && left.hash !== null && right.hash !== null) {
               const leftText = asText(left.hash === hash ? bytes : await store.readBody(left));
               const rightText = asText(await store.readBody(right));
-              plan = await notePlan2(history, heads, left.hash, right.hash, leftText, rightText, (r) => store.readBody(r));
+              plan = await notePlan2(history, heads, left.hash, right.hash, leftText, rightText, (r) => store.readMergeBase(r));
             }
             if (!plan || plan.some((part) => typeof part !== "string")) {
               for (const rev2 of heads) {
@@ -861,6 +943,7 @@ var require_core = __commonJS({
       createVault,
       Store,
       synchronize,
+      syncScope,
       headsByPath,
       safePath,
       isRecovery,
@@ -12739,11 +12822,11 @@ var require_adapter = __commonJS({
         if (etag || modified) return { tag: JSON.stringify([etag, modified]), coarse: true };
         return null;
       }
-      async list(path = "") {
+      async list(path = "", dates) {
         const result = await this.call("PROPFIND", path, [207], {
           headers: { Depth: "1" },
           contentType: "application/xml; charset=utf-8",
-          body: '<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>'
+          body: '<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/>' + (dates ? "<d:creationdate/><d:getlastmodified/>" : "") + "</d:prop></d:propfind>"
         });
         const xml = new DOMParser().parseFromString(result.text, "application/xml");
         const docs = (el, tag) => Array.from(el.getElementsByTagNameNS("DAV:", tag));
@@ -12766,6 +12849,15 @@ var require_adapter = __commonJS({
           }
           if (item.length !== base.length + 1) throw Error("WebDAV returned an unexpected child path.");
           names.push(item[item.length - 1]);
+          if (dates) {
+            for (const tag of ["creationdate", "getlastmodified"]) {
+              const time = Date.parse(docs(entry, tag)[0]?.textContent);
+              if (Number.isFinite(time) && time > 0) {
+                dates.set(item[item.length - 1], time);
+                break;
+              }
+            }
+          }
         }
         if (!self2) throw Error("WebDAV did not confirm the requested directory.");
         return names;
@@ -12783,9 +12875,15 @@ var require_adapter = __commonJS({
         this.vault = app.vault;
         this.copies = copies;
       }
+      isConflictCopy(path) {
+        return this.copies.excludes(path);
+      }
+      prepareCopies(paths, history) {
+        return this.copies.prepare(paths, history);
+      }
       allowed(path) {
         const first = path.split("/")[0].toLowerCase();
-        return !this.copies.paths.has(path) && !core2.isRecovery(path) && first !== this.vault.configDir.toLowerCase() && !path.split("/").some((part) => part.startsWith("."));
+        return !this.isConflictCopy(path) && !core2.isRecovery(path) && first !== this.vault.configDir.toLowerCase() && !path.split("/").some((part) => part.startsWith("."));
       }
       paths() {
         return new Set(this.vault.getFiles().map((f) => f.path).filter((path) => this.allowed(path)));
@@ -13061,7 +13159,7 @@ var require_transfer = __commonJS({
         return this.cache.remove([scope, "put", path]);
       }
     };
-    module2.exports = { ChunkTransfer: ChunkTransfer2, TransferCache: TransferCache2, blockSize: blockSize2, threshold, validParts };
+    module2.exports = { ChunkTransfer: ChunkTransfer2, TransferCache: TransferCache2, blockSize: blockSize2, threshold, validParts, chunkName };
   }
 });
 
@@ -13074,8 +13172,7 @@ var require_personal = __commonJS({
       if (!active()) throw Error("\u64CD\u4F5C\u5DF2\u505C\u6B62\uFF0C\u8BF7\u91CD\u65B0\u6253\u5F00\u63D2\u4EF6\u540E\u7EE7\u7EED\u3002");
     }
     async function seedSnapshot2(store, local, active) {
-      const heads = core2.headsByPath(await store.history(/* @__PURE__ */ new Map()));
-      const paths = local.paths();
+      const { groups: heads, localPaths: paths } = await core2.syncScope(local, await store.history(/* @__PURE__ */ new Map()));
       core2.checkAliases([...paths]);
       for (const path of /* @__PURE__ */ new Set([...paths, ...heads.keys()])) {
         checkActive(active);
@@ -13088,9 +13185,8 @@ var require_personal = __commonJS({
           await store.publish(path, current.map((rev) => rev.id), bytes);
         }
       }
-      const published = core2.headsByPath(await store.history(/* @__PURE__ */ new Map()));
+      const { groups: published, localPaths: remaining } = await core2.syncScope(local, await store.history(/* @__PURE__ */ new Map()));
       const baseline = /* @__PURE__ */ new Map();
-      const remaining = local.paths();
       for (const [path, versions] of published) {
         checkActive(active);
         const [rev] = versions;
@@ -13106,8 +13202,7 @@ var require_personal = __commonJS({
       return baseline;
     }
     async function checkJoin2(store, local, previousBaseline = /* @__PURE__ */ new Map()) {
-      const heads = core2.headsByPath(await store.history(/* @__PURE__ */ new Map()));
-      const paths = local.paths();
+      const { groups: heads, localPaths: paths } = await core2.syncScope(local, await store.history(/* @__PURE__ */ new Map()));
       const updates = [];
       for (const path of paths) {
         const bytes = await local.read(path);
@@ -13187,6 +13282,7 @@ var require_conflict_files = __commonJS({
     "use strict";
     var { conflictFolder, safePath, isRecovery, sha } = require_core();
     var revisionDir = /^([0-9a-f]{32})-([0-9a-f]{64})$/;
+    var siblingSuffix = /-(\d{14})-conflict-([0-9a-f]{32})(?:-([1-9]\d*))?(?:\.[^/.]*)?$/;
     var encoder = new TextEncoder();
     function stamp(date) {
       return [
@@ -13223,6 +13319,7 @@ var require_conflict_files = __commonJS({
         this.markers = this.root + "/deferred";
         this.copies = /* @__PURE__ */ new Map();
         this.paths = /* @__PURE__ */ new Set();
+        this.legacyUploads = /* @__PURE__ */ new Set();
         this.work = Promise.resolve();
       }
       serial(action) {
@@ -13254,6 +13351,25 @@ var require_conflict_files = __commonJS({
           if (!safePath(record.path) || isRecovery(record.path) || typeof record.time !== "string" || !/^\d{14}$/.test(record.time) || !Number.isSafeInteger(record.number) || record.number < 0)
             throw Error("Invalid conflict copy record: " + file);
           this.track({ ...record, id: match[1], hash: match[2] });
+        }
+      }
+      excludes(path) {
+        return this.paths.has(path) || this.legacyUploads.has(path);
+      }
+      async prepare(paths, history) {
+        for (const path of paths) {
+          if (!this.excludes(path) && siblingSuffix.test(path)) {
+            await this.serial(() => this.load());
+            break;
+          }
+        }
+        for (const rev of history.values()) {
+          if (rev.parents.length || !rev.hash || this.legacyUploads.has(rev.path)) continue;
+          const match = siblingSuffix.exec(rev.path);
+          if (!match) continue;
+          const source = history.get(match[2]);
+          if (source?.hash === rev.hash && siblingPath({ ...source, time: match[1], number: Number(match[3] || 0) }) === rev.path)
+            this.legacyUploads.add(rev.path);
         }
       }
       async ensureDir(path) {
@@ -13603,7 +13719,137 @@ var require_review = __commonJS({
         this.closed?.();
       }
     };
-    module2.exports = { ConflictReview: ConflictReview2 };
+    module2.exports = { ConflictReview: ConflictReview2, drawText, drawWindows, previewLimit };
+  }
+});
+
+// src/history.cjs
+var require_history = __commonJS({
+  "src/history.cjs"(exports2, module2) {
+    "use strict";
+    var { headsByPath, sha, safePath } = require_core();
+    var { validParts, blockSize: blockSize2, chunkName } = require_transfer();
+    var day = 864e5;
+    var periods = [30, 60, 90, 180, 0];
+    var validTime = (time) => Number.isSafeInteger(time) && time > 0;
+    async function updatePolicy(store, change) {
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const policy = await store.readHistoryPolicy();
+        if (!change(policy) || await store.saveHistoryPolicy(policy)) return policy;
+      }
+      throw Error("\u5176\u4ED6\u8BBE\u5907\u6B63\u5728\u66F4\u65B0\u5386\u53F2\u8BB0\u5F55\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002");
+    }
+    async function setPeriod(store, days) {
+      if (!periods.includes(days)) throw Error("\u65E0\u6548\u7684\u5386\u53F2\u4FDD\u7559\u671F\u9650\u3002");
+      return updatePolicy(store, (policy) => {
+        if (policy.days === days) return false;
+        policy.days = days;
+        return true;
+      });
+    }
+    async function loadDates(store, history, policy) {
+      const missing = [...history.values()].filter((r) => !validTime(r.time) && !policy.dates[r.id]);
+      if (!missing.length) return policy;
+      const dates = /* @__PURE__ */ new Map();
+      await store.dav.list("commits", dates);
+      const observed = Date.now();
+      return updatePolicy(store, (current) => {
+        let changed = false;
+        for (const r of missing) if (!current.dates[r.id]) {
+          current.dates[r.id] = dates.get(r.id) || observed;
+          changed = true;
+        }
+        return changed;
+      });
+    }
+    function revisionIndex(history, policy, now = Date.now()) {
+      const heads = headsByPath(history), superseded = /* @__PURE__ */ new Map(), conflicts = /* @__PURE__ */ new Set();
+      for (const [path, revs] of heads) if (new Set(revs.map((r) => r.hash)).size > 1) conflicts.add(path);
+      const date = (r) => validTime(r.time) ? r.time : policy.dates[r.id];
+      for (const r of history.values()) for (const id of r.parents) {
+        superseded.set(id, Math.max(superseded.get(id) || 0, date(r) || Infinity));
+      }
+      const expired = new Set(policy.expired);
+      const due = (r) => !!policy.days && !conflicts.has(r.path) && superseded.has(r.id) && superseded.get(r.id) <= now - policy.days * day;
+      const available = (r) => !superseded.has(r.id) || !expired.has(r.id) && !due(r);
+      return { heads, superseded, conflicts, expired, date, due, available };
+    }
+    async function snapshot(store, cache) {
+      const history = await store.history(cache);
+      const policy = await loadDates(store, history, await store.readHistoryPolicy());
+      return { history, policy, index: revisionIndex(history, policy) };
+    }
+    async function maintain(store, history, active = () => true) {
+      const original = await loadDates(store, history, await store.readHistoryPolicy());
+      const index = revisionIndex(history, original);
+      if (!original.pending.length && ![...history.values()].some((r) => !index.expired.has(r.id) && index.due(r))) return original;
+      const policy = await updatePolicy(store, (current) => {
+        const ix = revisionIndex(history, current);
+        const added = [...history.values()].filter((r) => !ix.expired.has(r.id) && ix.due(r));
+        for (const r of added) {
+          current.expired.push(r.id);
+          if (r.hash !== null) current.pending.push(r.id);
+        }
+        return added.length > 0;
+      });
+      const done = /* @__PURE__ */ new Set(), retired = new Set(policy.expired);
+      let remainingObjects, requests = 0;
+      const started = Date.now();
+      const budget = () => requests < 24 && (requests === 0 || Date.now() - started < 2e3);
+      for (const id of policy.pending) {
+        const rev = history.get(id);
+        if (!budget()) break;
+        if (!rev || !retired.has(id) || !index.superseded.has(id) || index.conflicts.has(rev.path)) continue;
+        const remove = async (name) => {
+          if (!active()) throw Error("\u5386\u53F2\u6E05\u7406\u5DF2\u6682\u505C\u3002");
+          await store.dav.call("DELETE", "objects/b-" + name, [200, 204, 404]);
+          requests++;
+        };
+        if (rev.parts) {
+          if (!validParts(rev.parts)) throw Error("\u65E0\u6CD5\u8BC6\u522B\u5386\u53F2\u9644\u4EF6\u5206\u5757\u683C\u5F0F\u3002");
+          remainingObjects ??= new Set(await store.dav.list("objects"));
+          let n = 0;
+          const count = Math.ceil(rev.parts.size / blockSize2);
+          for (; n < count && budget(); n++) {
+            const name = await chunkName(rev.parts, n);
+            if (remainingObjects.has("b-" + name)) await remove(name);
+          }
+          if (n < count) break;
+        } else await remove(id);
+        done.add(id);
+      }
+      if (!done.size) return policy;
+      return updatePolicy(store, (current) => {
+        const remaining = current.pending.filter((id) => !done.has(id));
+        if (remaining.length === current.pending.length) return false;
+        current.pending = remaining;
+        return true;
+      });
+    }
+    var headIds = (heads) => heads.map((r) => r.id).sort();
+    var digest = (bytes) => bytes === null ? null : sha(bytes);
+    async function restore({ store, local, cache, baseline, checkpoint, preview, active }) {
+      const { history, index } = await snapshot(store, cache);
+      const { path, revisionId, localHash } = preview, rev = history.get(revisionId);
+      await local.prepareCopies?.([path], history);
+      if (!safePath(path) || !local.allowed(path) || !rev || rev.path !== path || !index.available(rev))
+        throw Error("\u6240\u9009\u5386\u53F2\u7248\u672C\u5DF2\u7ECF\u8FC7\u671F\u6216\u65E0\u6CD5\u6062\u590D\u3002");
+      const heads = index.heads.get(path), ids = headIds(heads);
+      if (index.conflicts.has(path) || JSON.stringify(ids) !== JSON.stringify(preview.headIds) || heads[0].hash !== localHash || await digest(await local.read(path)) !== localHash)
+        throw Error("\u672C\u5730\u6216\u8FDC\u7AEF\u6587\u4EF6\u5DF2\u53D8\u5316\uFF0C\u8BF7\u5148\u540C\u6B65\uFF0C\u7136\u540E\u91CD\u65B0\u6BD4\u8F83\u3002");
+      if (rev.hash === localHash) throw Error("\u6B64\u7248\u672C\u4E0E\u5F53\u524D\u6587\u4EF6\u76F8\u540C\u3002");
+      const bytes = rev.hash === null ? null : await store.readBody(rev);
+      if (!active() || await digest(await local.read(path)) !== localHash) throw Error("\u6587\u4EF6\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u6BD4\u8F83\u3002");
+      baseline.set(path, { ids, hash: localHash });
+      checkpoint(baseline);
+      const next = await store.publish(path, ids, bytes);
+      if (!active()) throw Error("\u6062\u590D\u7248\u672C\u5DF2\u63D0\u4EA4\uFF0C\u8BF7\u5728\u91CD\u65B0\u540C\u6B65\u540E\u67E5\u770B\u3002");
+      await local.apply(path, localHash, bytes);
+      baseline.set(path, { ids: [next.id], hash: next.hash });
+      checkpoint(baseline);
+      return next;
+    }
+    module2.exports = { periods, day, setPeriod, revisionIndex, snapshot, maintain, restore, headIds, digest };
   }
 });
 
@@ -13614,6 +13860,7 @@ var require_settings = __commonJS({
     var { Modal, Notice: Notice2, PluginSettingTab, Setting, getLanguage: getLanguage2 } = require("obsidian");
     var qr = require_pairing_invite();
     var core2 = require_core();
+    var { periods } = require_history();
     var tr2 = (en, zh) => getLanguage2().startsWith("zh") ? zh : en;
     function button(el, label, action) {
       return new Setting(el).addButton((b) => b.setButtonText(label).onClick(async () => {
@@ -13802,7 +14049,7 @@ var require_settings = __commonJS({
         const unknown = p.uploads.failed ? tr2("Unavailable", "\u6682\u65F6\u65E0\u6CD5\u7EDF\u8BA1") : tr2("Checking\u2026", "\u6838\u5BF9\u4E2D\u2026");
         this.countEl.setText(p.uploads.known ? String(p.uploads.files.size) : unknown);
         this.conflictEl.setText(p.status.conflicts ? p.conflicts.length ? String(p.conflicts.length) : tr2("None", "\u65E0\u51B2\u7A81") : tr2("Awaiting first check", "\u5F85\u9996\u6B21\u68C0\u67E5"));
-        this.resultEl.setText(p.pollError || p.last || "");
+        this.resultEl.setText([p.pollError || p.last, p.historyError].filter(Boolean).join("\n"));
         if (this.listedConflicts === p.conflicts) return;
         this.listedConflicts = p.conflicts;
         this.conflictList.empty();
@@ -13826,7 +14073,73 @@ var require_settings = __commonJS({
         this.refreshStatus();
         this.plugin.scheduleCount();
       }
+      showHistory(el, id) {
+        const p = this.plugin;
+        button(el, tr2("View version history", "\u67E5\u770B\u5386\u53F2\u7248\u672C"), () => p.openHistory());
+        const description = tr2(
+          "Shared by all devices in this vault. The period starts when a version is replaced.",
+          "\u540C\u4E00\u5E93\u7684\u6240\u6709\u8BBE\u5907\u5171\u7528\u6B64\u8BBE\u7F6E\uFF0C\u65E7\u7248\u672C\u4ECE\u88AB\u66FF\u6362\u65F6\u5F00\u59CB\u8BA1\u65F6\u3002"
+        );
+        const setting = new Setting(el).setName(tr2("Keep version history", "\u5386\u53F2\u7248\u672C\u4FDD\u7559\u671F\u9650")).setDesc(description);
+        setting.addDropdown((d) => {
+          d.addOption("", tr2("Loading\u2026", "\u8BFB\u53D6\u4E2D\u2026")).setDisabled(true);
+          for (const n of periods) d.addOption(String(n), n === 0 ? tr2("Forever", "\u6C38\u4E45\u4FDD\u5B58") : n + tr2(" days", " \u5929"));
+          let store, saved, generation, reading = false, writing = false, edits = 0;
+          const current = () => this.refreshHistoryPeriod === refresh && !p.closed && !p.state.pending && p.state.current?.id === id;
+          const refresh = async (initial = false) => {
+            const el2 = d.selectEl;
+            if (!current() || reading || writing) return;
+            if (!initial && (!el2.isConnected || el2.ownerDocument.visibilityState === "hidden" || !el2.getClientRects().length)) return;
+            const edit = edits;
+            reading = true;
+            try {
+              store ??= await p.historyStore(id);
+              const policy = await store.readHistoryPolicy(generation);
+              if (!current() || edits !== edit) return;
+              if (policy) {
+                if (saved === void 0) el2.options[0].remove();
+                saved = policy.days;
+                generation = policy.generation;
+                if (d.getValue() !== String(saved)) d.setValue(String(saved));
+                d.setDisabled(false);
+              }
+              if (setting.descEl.textContent !== description) setting.setDesc(description);
+            } catch (error) {
+              store = null;
+              if (current() && edits === edit) setting.setDesc(error.message);
+            } finally {
+              reading = false;
+            }
+          };
+          this.refreshHistoryPeriod = refresh;
+          void refresh(true);
+          d.onChange(async (value) => {
+            if (!current() || !value || writing) return;
+            edits++;
+            writing = true;
+            d.setDisabled(true);
+            try {
+              await p.setHistoryPeriod(id, Number(value));
+              saved = Number(value);
+            } catch (error) {
+              if (current()) {
+                d.setValue(String(saved));
+                new Notice2(error.message);
+              }
+            } finally {
+              writing = false;
+              generation = void 0;
+              if (current()) d.setDisabled(false);
+            }
+          });
+        });
+      }
+      hide() {
+        this.refreshHistoryPeriod = null;
+        super.hide?.();
+      }
       display() {
+        this.refreshHistoryPeriod = null;
         const p = this.plugin, el = this.containerEl;
         const { current, pending } = p.state;
         el.empty();
@@ -13871,6 +14184,7 @@ var require_settings = __commonJS({
         if (current) {
           el.createEl("p", { text: current.address + "/" + current.folder + " \xB7 " + current.username });
           button(el, tr2("Sync now", "\u7ACB\u5373\u540C\u6B65"), () => p.run());
+          this.showHistory(el, current.id);
           button(el, tr2("Show sharing QR code", "\u663E\u793A\u5171\u4EAB\u4E8C\u7EF4\u7801"), () => this.showCode());
           button(el, tr2("Back up vault key", "\u5907\u4EFD\u5E93\u5BC6\u94A5"), () => this.showBackup());
         }
@@ -13967,6 +14281,164 @@ var require_version = __commonJS({
   }
 });
 
+// src/history-view.cjs
+var require_history_view = __commonJS({
+  "src/history-view.cjs"(exports2, module2) {
+    "use strict";
+    var { Modal, Setting, Notice: Notice2, getLanguage: getLanguage2 } = require("obsidian");
+    var { snapshot, headIds, digest } = require_history();
+    var { asText } = require_merge();
+    var { textWindow } = require_diff();
+    var { drawText, drawWindows, previewLimit } = require_review();
+    var tr2 = (en, zh) => getLanguage2().startsWith("zh") ? zh : en;
+    var HistoryModal2 = class extends Modal {
+      constructor(plugin, id, path) {
+        super(plugin.app);
+        this.plugin = plugin;
+        this.vaultId = id;
+        this.path = path;
+        this.generation = 0;
+      }
+      onOpen() {
+        this.setTitle(tr2("View version history", "\u67E5\u770B\u5386\u53F2\u7248\u672C"));
+        this.load();
+      }
+      async load() {
+        const seq = ++this.generation, el = this.contentEl;
+        el.empty();
+        el.createEl("p", { text: tr2("Loading history\u2026", "\u6B63\u5728\u8BFB\u53D6\u5386\u53F2\u7248\u672C\u2026") });
+        try {
+          const p = this.plugin;
+          const local = p.local();
+          const data = await p.exclusive(async () => {
+            const data2 = await snapshot(await p.historyStore(this.vaultId), p.cache);
+            await local.prepareCopies([this.path].filter(Boolean), data2.history);
+            return data2;
+          });
+          if (seq !== this.generation) return;
+          this.data = data;
+          const paths = /* @__PURE__ */ new Set();
+          for (const rev of data.history.values())
+            if (rev.hash !== null && data.index.available(rev) && local.allowed(rev.path)) paths.add(rev.path);
+          this.paths = [...paths].sort((a, b) => a.localeCompare(b));
+          if (!this.paths.includes(this.path)) this.path = this.paths[0];
+          el.empty();
+          if (!this.paths.length) {
+            el.createEl("p", { text: tr2("No synced files yet.", "\u6682\u65E0\u5DF2\u540C\u6B65\u6587\u4EF6\u3002") });
+            return;
+          }
+          const files = new Setting(el).setName(tr2("File", "\u6587\u4EF6"));
+          files.addDropdown((d) => {
+            for (const path of this.paths) d.addOption(path, path);
+            d.setValue(this.path).onChange((path) => {
+              this.path = path;
+              this.showVersions();
+            });
+          });
+          files.addButton((b) => b.setButtonText(tr2("Refresh", "\u5237\u65B0")).onClick(() => this.load()));
+          this.versions = el.createDiv();
+          this.showVersions();
+        } catch (error) {
+          if (seq !== this.generation) return;
+          el.empty();
+          el.createEl("p", { text: error.message });
+          new Setting(el).addButton((b) => b.setButtonText(tr2("Retry", "\u91CD\u8BD5")).onClick(() => this.load()));
+        }
+      }
+      showVersions() {
+        this.generation++;
+        const { index, history } = this.data, path = this.path, el = this.versions;
+        el.empty();
+        const heads = new Set(headIds(index.heads.get(path)));
+        const revisions = [...history.values()].filter((rev) => rev.path === path && index.available(rev));
+        revisions.sort((a, b) => Number(heads.has(b.id)) - Number(heads.has(a.id)) || index.date(b) - index.date(a) || b.id.localeCompare(a.id));
+        const controls = new Setting(el).setName(tr2("Version", "\u7248\u672C"));
+        let selected = revisions[0];
+        controls.addDropdown((d) => {
+          for (const r of revisions) {
+            const when = new Date(index.date(r)).toLocaleString();
+            const tag = heads.has(r.id) ? tr2("Current \xB7 ", "\u5F53\u524D \xB7 ") : "";
+            d.addOption(r.id, tag + when + " \xB7 " + (r.hash === null ? tr2("Deleted \xB7 ", "\u5DF2\u5220\u9664 \xB7 ") : "") + r.id.slice(0, 8));
+          }
+          d.setValue(selected.id).onChange((id) => {
+            selected = history.get(id);
+            this.generation++;
+            this.details.empty();
+          });
+        });
+        controls.addButton((b) => b.setButtonText(tr2("Compare changes", "\u6BD4\u8F83\u5DEE\u5F02")).onClick(() => this.compare(selected)));
+        this.details = el.createDiv();
+      }
+      async compare(rev) {
+        const p = this.plugin, seq = ++this.generation, el = this.details;
+        el.empty();
+        el.createEl("p", { text: tr2("Loading comparison\u2026", "\u6B63\u5728\u8BFB\u53D6\u5DEE\u5F02\u2026") });
+        try {
+          const { bytes, old, localHash } = await p.exclusive(async () => {
+            const store = await p.historyStore(this.vaultId), bytes2 = await p.local().read(rev.path);
+            const largeBinary = rev.parts && !/\.(md|txt|canvas|json|csv|tsv|yaml|yml|xml|html|css|js|ts|tex|log)$/i.test(rev.path);
+            const old2 = rev.hash === null || largeBinary ? null : await store.readBody(rev);
+            return { bytes: bytes2, old: old2, localHash: await digest(bytes2) };
+          });
+          if (seq !== this.generation) return;
+          el.empty();
+          const heads = this.data.index.heads.get(rev.path);
+          const preview = { path: rev.path, revisionId: rev.id, localHash, headIds: headIds(heads) };
+          if (localHash === rev.hash) {
+            el.createEl("p", { text: tr2("This version matches the local file.", "\u6B64\u7248\u672C\u4E0E\u672C\u5730\u6587\u4EF6\u76F8\u540C\u3002") });
+            return;
+          }
+          if (rev.hash === null) el.createEl("p", { text: tr2("This version records a deletion. Restoring it will delete the current file.", "\u6B64\u7248\u672C\u8BB0\u5F55\u4E86\u4E00\u6B21\u5220\u9664\uFF0C\u6062\u590D\u540E\u5C06\u5220\u9664\u5F53\u524D\u6587\u4EF6\u3002") });
+          if (localHash === null) el.createEl("p", { text: tr2("The local file is deleted. Restoring will recreate it.", "\u672C\u5730\u6587\u4EF6\u5DF2\u5220\u9664\uFF0C\u6062\u590D\u540E\u5C06\u91CD\u65B0\u521B\u5EFA\u3002") });
+          const large = (bytes?.byteLength || 0) + (old?.byteLength || 0) > previewLimit;
+          const textLike = (rev.hash === null || old !== null) && [bytes, old].every((data) => data === null || asText(large ? textWindow(data, 0).slice : data) !== null);
+          if (textLike && large) {
+            drawWindows(el.createDiv(), bytes, old);
+          } else if (textLike) {
+            drawText(el, asText(bytes) ?? "", asText(old) ?? "");
+          } else {
+            for (const [label, hash, size] of [
+              [tr2("Local", "\u672C\u5730"), localHash, bytes?.byteLength],
+              [tr2("Selected version", "\u6240\u9009\u7248\u672C"), rev.hash, rev.parts?.size ?? old?.byteLength]
+            ]) {
+              el.createEl("p", { cls: "homebound-version", text: label + " \xB7 " + (hash === null ? tr2("Deleted", "\u5DF2\u5220\u9664") : size + tr2(" bytes \xB7 SHA-256 ", " \u5B57\u8282 \xB7 SHA-256 ") + hash) });
+            }
+          }
+          if (this.data.index.conflicts.has(rev.path) || heads[0].hash !== localHash) {
+            el.createEl("p", { text: tr2("Sync local changes and resolve any conflict before restoring.", "\u8BF7\u5148\u540C\u6B65\u672C\u5730\u6539\u52A8\u5E76\u5904\u7406\u51B2\u7A81\uFF0C\u518D\u6062\u590D\u5386\u53F2\u7248\u672C\u3002") });
+            return;
+          }
+          const message = el.createDiv({ attr: { role: "status" } });
+          new Setting(el).addButton((b) => b.setCta().setButtonText(tr2("Restore this version", "\u6062\u590D\u6B64\u7248\u672C")).onClick(async () => {
+            b.setDisabled(true);
+            try {
+              await p.restoreHistory(this.vaultId, preview);
+              new Notice2(tr2("Restored as a new version.", "\u5DF2\u6062\u590D\u5E76\u4FDD\u5B58\u4E3A\u65B0\u7248\u672C\u3002"));
+              if (seq === this.generation) this.close();
+            } catch (error) {
+              if (seq === this.generation) {
+                message.setText(error.message);
+                b.setDisabled(false);
+              }
+            }
+          }));
+        } catch (error) {
+          if (seq === this.generation) {
+            el.empty();
+            el.createEl("p", { text: error.message });
+          }
+        }
+      }
+      onClose() {
+        this.generation++;
+        this.contentEl.empty();
+        if (this.plugin.historyModal === this) this.plugin.historyModal = null;
+      }
+    };
+    module2.exports = { HistoryModal: HistoryModal2 };
+  }
+});
+
 // src/plugin.cjs
 var { Plugin, Notice, getLanguage } = require("obsidian");
 var core = require_core();
@@ -13980,6 +14452,8 @@ var { ConflictReview } = require_review();
 var { notePlan, isNote } = require_merge();
 var { HomeboundSettings } = require_settings();
 var { VersionWatch } = require_version();
+var historyTools = require_history();
+var { HistoryModal } = require_history_view();
 var tr = (en, zh) => getLanguage().startsWith("zh") ? zh : en;
 var stateKey = "homebound-personal-v2";
 var openReviewKey = stateKey + "-open-review";
@@ -14008,6 +14482,11 @@ module.exports = class HomeboundPlugin extends Plugin {
     this.settingsTab = new HomeboundSettings(this.app, this);
     this.addSettingTab(this.settingsTab);
     this.addCommand({ id: "sync", name: tr("Sync now", "\u7ACB\u5373\u540C\u6B65"), callback: () => this.run() });
+    this.addCommand({ id: "view-history", name: tr("View version history", "\u67E5\u770B\u5386\u53F2\u7248\u672C"), checkCallback: (checking) => {
+      if (!this.state.current || this.state.pending) return false;
+      if (!checking) this.openHistory();
+      return true;
+    } });
     this.addCommand({ id: "resolve", name: tr("Compare and resolve file conflict", "\u6BD4\u8F83\u5E76\u89E3\u51B3\u6587\u4EF6\u51B2\u7A81"), checkCallback: (checking) => {
       const path = this.app.workspace.getActiveFile()?.path;
       if (!this.conflicts.includes(path)) return false;
@@ -14028,9 +14507,15 @@ module.exports = class HomeboundPlugin extends Plugin {
     this.registerDomEvent(document, "visibilitychange", check);
     this.registerDomEvent(window, "online", check);
     this.registerInterval(window.setInterval(check, 3e5));
-    this.registerInterval(window.setInterval(() => this.pollRemote(), 5e3));
+    this.registerInterval(window.setInterval(() => {
+      this.settingsTab.refreshHistoryPeriod?.();
+      this.pollRemote();
+    }, 5e3));
   }
   restoreStatus() {
+    this.historyModal?.close();
+    this.nextHistoryCheck = 0;
+    this.historyError = "";
     this.watch = new VersionWatch();
     this.pollError = "";
     this.syncSerial = 0;
@@ -14192,6 +14677,36 @@ module.exports = class HomeboundPlugin extends Plugin {
     const key = await core.unlock(header, material, config.id);
     return { store: new core.Store(dav, header.id, key, this.transfer), previous: header.previous };
   }
+  async historyStore(id) {
+    const c = this.state.current;
+    if (this.closed || this.state.pending || !c || c.id !== id) throw Error(tr("Vault changed.", "\u5F53\u524D\u5E93\u5DF2\u53D8\u5316\u3002"));
+    return (await this.connect(c, this.secret(c, "dav"), this.secret(c, "key"))).store;
+  }
+  async setHistoryPeriod(id, days) {
+    await this.exclusive(async () => historyTools.setPeriod(await this.historyStore(id), days));
+    this.nextHistoryCheck = 0;
+    this.requestAuto(true);
+  }
+  openHistory() {
+    if (this.historyModal || !this.state.current || this.state.pending) return;
+    this.historyModal = new HistoryModal(this, this.state.current.id, this.app.workspace.getActiveFile()?.path);
+    this.historyModal.open();
+  }
+  async restoreHistory(id, preview) {
+    await this.exclusive(async () => {
+      const store = await this.historyStore(id);
+      await this.watch.trackWrites(store, () => historyTools.restore({
+        store,
+        local: this.local(),
+        cache: this.cache,
+        baseline: this.baseline(id),
+        checkpoint: (data) => this.checkpoint(id, data),
+        preview,
+        active: () => !this.closed && this.state.current?.id === id
+      }));
+    });
+    await this.run(null, true);
+  }
   async exclusive(action) {
     if (this.closed || this.busy) throw Error("\u8BF7\u7B49\u5F53\u524D\u64CD\u4F5C\u5B8C\u6210\u540E\u518D\u8BD5\u3002");
     this.busy = true;
@@ -14291,6 +14806,7 @@ module.exports = class HomeboundPlugin extends Plugin {
   }
   onunload() {
     this.closed = true;
+    this.historyModal?.close();
     this.reviewModal?.close();
     clearTimeout(this.editTimer);
     clearTimeout(this.countTimer);
@@ -14306,6 +14822,7 @@ module.exports = class HomeboundPlugin extends Plugin {
     }
   }
   async finishReview(ticket, peer, confirmed = false) {
+    if (this.closed) return;
     if (!confirmed && ticket.vaultId === this.state.current?.id && peer && this.conflicts?.includes(peer.path) && this.conflictVersions.get(peer.path) !== ticket.version) return;
     if (ticket.vaultId === this.state.current?.id && peer && this.conflictVersions.get(peer.path) === ticket.version) {
       await this.copies.defer(peer, this.local(), this.cache, ticket.version.split(","));
@@ -14332,7 +14849,7 @@ module.exports = class HomeboundPlugin extends Plugin {
           return this.exclusive(() => store.readBody(rev));
         };
         const localHash = bytes === null ? null : await core.sha(bytes);
-        const planFor = (peer2, left, right) => isNote(path) ? notePlan(history, heads, localHash, peer2.hash, left, right, readVersion) : null;
+        const planFor = (peer2, left, right) => isNote(path) ? notePlan(history, heads, localHash, peer2.hash, left, right, (r) => this.exclusive(() => store.readMergeBase(r))) : null;
         return { path, vaultId: c.id, heads, headIds: heads.map((r) => r.id).sort(), bytes, localHash, readVersion, planFor };
       });
       if (this.closed || this.state.current?.id !== review.vaultId) return;
@@ -14399,6 +14916,16 @@ module.exports = class HomeboundPlugin extends Plugin {
         result2.received += reconciled;
         this.cache = result2.history;
         watch.accepted = sample;
+        if (Date.now() >= this.nextHistoryCheck) {
+          try {
+            const policy = await historyTools.maintain(store, result2.history, () => !this.closed);
+            this.nextHistoryCheck = Date.now() + (policy.pending.length ? 3e5 : historyTools.day);
+            this.historyError = "";
+          } catch (error) {
+            this.nextHistoryCheck = Date.now() + 3e5;
+            this.historyError = error.message;
+          }
+        }
         const heads = result2.conflicts.length ? core.headsByPath(result2.history) : /* @__PURE__ */ new Map();
         this.conflictVersions = new Map(result2.conflicts.map((path) => [path, heads.get(path).map((r) => r.id).sort().join(",")]));
         try {

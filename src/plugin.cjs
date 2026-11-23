@@ -12,6 +12,8 @@ const {ConflictReview} = require("./review.cjs");
 const {notePlan,isNote} = require("./merge.cjs");
 const {HomeboundSettings} = require("./settings.cjs");
 const {VersionWatch} = require("./version.cjs");
+const historyTools = require("./history.cjs");
+const {HistoryModal} = require("./history-view.cjs");
 
 const tr = (en, zh) => getLanguage().startsWith("zh") ? zh : en;
 const stateKey = "homebound-personal-v2";
@@ -42,6 +44,11 @@ module.exports = class HomeboundPlugin extends Plugin {
         this.settingsTab = new HomeboundSettings(this.app, this);
         this.addSettingTab(this.settingsTab);
         this.addCommand({id:"sync", name:tr("Sync now","立即同步"), callback:() => this.run()});
+        this.addCommand({id:"view-history",name:tr("View version history","查看历史版本"),checkCallback:checking=>{
+            if (!this.state.current || this.state.pending) return false;
+            if (!checking) this.openHistory();
+            return true;
+        }});
         this.addCommand({id:"resolve", name:tr("Compare and resolve file conflict","比较并解决文件冲突"), checkCallback:checking => {
             const path = this.app.workspace.getActiveFile()?.path;
             if (!this.conflicts.includes(path)) return false;
@@ -62,10 +69,16 @@ module.exports = class HomeboundPlugin extends Plugin {
         this.registerDomEvent(document, "visibilitychange", check);
         this.registerDomEvent(window, "online", check);
         this.registerInterval(window.setInterval(check, 300000));
-        this.registerInterval(window.setInterval(() => this.pollRemote(), 5000));
+        this.registerInterval(window.setInterval(() => {
+            this.settingsTab.refreshHistoryPeriod?.();
+            this.pollRemote();
+        }, 5000));
     }
 
     restoreStatus() {
+        this.historyModal?.close();
+        this.nextHistoryCheck = 0;
+        this.historyError = "";
         this.watch = new VersionWatch();
         this.pollError = "";
         this.syncSerial = 0;
@@ -212,6 +225,30 @@ module.exports = class HomeboundPlugin extends Plugin {
         const key = await core.unlock(header, material, config.id);
         return {store:new core.Store(dav, header.id, key, this.transfer), previous:header.previous};
     }
+    async historyStore(id) {
+        const c=this.state.current;
+        if (this.closed || this.state.pending || !c || c.id!==id) throw Error(tr("Vault changed.","当前库已变化。"));
+        return (await this.connect(c,this.secret(c,"dav"),this.secret(c,"key"))).store;
+    }
+    async setHistoryPeriod(id,days) {
+        await this.exclusive(async()=>historyTools.setPeriod(await this.historyStore(id),days));
+        this.nextHistoryCheck=0;
+        this.requestAuto(true);
+    }
+    openHistory() {
+        if (this.historyModal || !this.state.current || this.state.pending) return;
+        this.historyModal=new HistoryModal(this,this.state.current.id,this.app.workspace.getActiveFile()?.path);
+        this.historyModal.open();
+    }
+    async restoreHistory(id,preview) {
+        await this.exclusive(async()=>{
+            const store=await this.historyStore(id);
+            await this.watch.trackWrites(store,()=>historyTools.restore({store,local:this.local(),cache:this.cache,
+                baseline:this.baseline(id),checkpoint:data=>this.checkpoint(id,data),preview,
+                active:()=>!this.closed && this.state.current?.id===id}));
+        });
+        await this.run(null,true);
+    }
     async exclusive(action) {
         if (this.closed || this.busy) throw Error("请等当前操作完成后再试。");
         this.busy = true;
@@ -313,6 +350,7 @@ module.exports = class HomeboundPlugin extends Plugin {
     }
     onunload() {
         this.closed = true;
+        this.historyModal?.close();
         this.reviewModal?.close();
         clearTimeout(this.editTimer);
         clearTimeout(this.countTimer);
@@ -330,6 +368,9 @@ module.exports = class HomeboundPlugin extends Plugin {
     }
 
     async finishReview(ticket, peer, confirmed = false) {
+        // Unloading closes modals too. Let the next live instance recover the saved
+        // ticket rather than starting a second asynchronous writer during teardown.
+        if (this.closed) return;
         // A comparison opened from saved status may precede the first sync after restart.
         // Leave its ticket for that sync to check before deciding whether to create a copy.
         if (!confirmed && ticket.vaultId === this.state.current?.id && peer &&
@@ -362,7 +403,7 @@ module.exports = class HomeboundPlugin extends Plugin {
                 };
                 const localHash=bytes===null ? null : await core.sha(bytes);
                 const planFor=(peer,left,right)=>isNote(path)
-                    ? notePlan(history,heads,localHash,peer.hash,left,right,readVersion) : null;
+                    ? notePlan(history,heads,localHash,peer.hash,left,right,r=>this.exclusive(()=>store.readMergeBase(r))) : null;
                 return {path, vaultId:c.id, heads, headIds:heads.map(r => r.id).sort(), bytes,localHash,readVersion,planFor};
             });
             if (this.closed || this.state.current?.id !== review.vaultId) return;
@@ -424,6 +465,16 @@ module.exports = class HomeboundPlugin extends Plugin {
                 result.received += reconciled;
                 this.cache = result.history;
                 watch.accepted = sample;
+                if (Date.now()>=this.nextHistoryCheck) {
+                    try {
+                        const policy=await historyTools.maintain(store,result.history,()=>!this.closed);
+                        this.nextHistoryCheck=Date.now()+(policy.pending.length ? 300000 : historyTools.day);
+                        this.historyError="";
+                    } catch (error) {
+                        this.nextHistoryCheck=Date.now()+300000;
+                        this.historyError=error.message;
+                    }
+                }
                 const heads = result.conflicts.length ? core.headsByPath(result.history) : new Map();
                 this.conflictVersions = new Map(result.conflicts.map(path => [path,heads.get(path).map(r => r.id).sort().join(",")]));
                 try {

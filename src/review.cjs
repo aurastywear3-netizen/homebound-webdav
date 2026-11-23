@@ -183,4 +183,4 @@ class ConflictReview extends Modal {
     }
     onClose() { this.generation++; this.contentEl.empty(); this.closed?.(); }
 }
-module.exports = {ConflictReview};
+module.exports = {ConflictReview,drawText,drawWindows,previewLimit};

@@ -59,10 +59,11 @@ class Dav {
         if (etag || modified) return {tag:JSON.stringify([etag,modified]), coarse:true};
         return null;
     }
-    async list(path = "") {
+    async list(path = "", dates) {
         const result = await this.call("PROPFIND", path, [207], {
             headers: { Depth: "1" }, contentType: "application/xml; charset=utf-8",
-            body: '<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>'
+            body: '<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/>' +
+                (dates ? '<d:creationdate/><d:getlastmodified/>' : '') + '</d:prop></d:propfind>'
         });
         const xml = new DOMParser().parseFromString(result.text, "application/xml");
         const docs = (el, tag) => Array.from(el.getElementsByTagNameNS("DAV:", tag));
@@ -82,6 +83,12 @@ class Dav {
             if (item.length === base.length) { self = true; continue; }
             if (item.length !== base.length + 1) throw Error("WebDAV returned an unexpected child path.");
             names.push(item[item.length - 1]);
+            if (dates) {
+                for (const tag of ["creationdate","getlastmodified"]) {
+                    const time=Date.parse(docs(entry,tag)[0]?.textContent);
+                    if (Number.isFinite(time) && time>0) { dates.set(item[item.length-1],time); break; }
+                }
+            }
         }
         if (!self) throw Error("WebDAV did not confirm the requested directory.");
         return names;
@@ -97,9 +104,11 @@ function credentials(username, password) {
 
 class VaultFiles {
     constructor(app, copies) { this.app = app; this.vault = app.vault; this.copies = copies; }
+    isConflictCopy(path) { return this.copies.excludes(path); }
+    prepareCopies(paths, history) { return this.copies.prepare(paths, history); }
     allowed(path) {
         const first = path.split("/")[0].toLowerCase();
-        return !this.copies.paths.has(path) && !core.isRecovery(path) && first !== this.vault.configDir.toLowerCase() &&
+        return !this.isConflictCopy(path) && !core.isRecovery(path) && first !== this.vault.configDir.toLowerCase() &&
             !path.split("/").some(part => part.startsWith("."));
     }
     paths() { return new Set(this.vault.getFiles().map(f => f.path).filter(path => this.allowed(path))); }

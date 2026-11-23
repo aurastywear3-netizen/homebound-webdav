@@ -1,4 +1,4 @@
-# Homebound WebDAV 0.3.4
+# Homebound WebDAV 0.3.5
 
 Homebound WebDAV syncs encrypted notes and attachments between your Obsidian devices using an HTTPS WebDAV server you control. Each vault has its own folder and encryption key.
 
@@ -22,6 +22,12 @@ Open **Settings → Community plugins → Browse** in Obsidian 1.11.4 or later. 
 
 When a conflict needs a decision, Homebound saves the versions in the plugin’s private `conflicts/` folder. Dismissing the comparison puts one local copy next to the original, for example `Note-20261123143005-conflict-<revision ID>.md`. The copy is excluded from sync. Once the conflict is resolved on either device, the next successful sync removes the unchanged sibling. **Clear historical conflict files** in settings removes resolved local archives. Edited copies are kept.
 
+## Version history
+
+Open **View version history** in settings or the command palette. Select a synced file (including a recently deleted one) and a version, then **Compare changes → Restore this version**. Text has a line diff; attachments have sizes and SHA-256 digests. Restoration publishes a new revision and syncs it to other devices. Sync outstanding edits and resolve conflicts before restoring.
+
+The default retention is **30 days**. Choose 30, 60, 90, 180 days or **Forever** per vault. The clock starts when a newer revision replaces a version. The current version and outstanding conflicts are protected. While a client is active, it periodically removes expired encrypted bodies and attachment blocks; the sync graph and deletion markers stay available for offline devices. Increasing retention cannot bring back a body already removed.
+
 ## 创建与加入
 
 1. 在当前库启用插件，填写 WebDAV 地址、账号、密码和一个新的子目录。点「创建加密库」，核对目标并确认本地副本完整。插件会创建缺少的目录，上传笔记和附件，并读回校验。中断后在同一设备点「继续上传并校验」。
@@ -36,6 +42,14 @@ When a conflict needs a decision, Homebound saves the versions in the plugin’s
 先在 WebDAV 服务器撤销遗失设备知道的凭据。在可信设备和相关 Vault 中更新共享账号的密码。核对离线修改、冲突和本地副本的完整性。对遗失设备持有密钥的每个库，在配置中填写新的独立空目录，点「换钥并迁入新目录」。插件为新库生成独立密钥，逐个上传并验证当前文件，然后切换本机绑定。原目录和历史仍可用原密钥离线恢复。请事先保存原密钥及备份。换钥后的历史从当前快照开始。遗失设备已取得的文件和旧密文仍可能被读取。
 
 在其余设备上扫码加入新库。直接从上一代重新加入时，仍匹配旧检查点的本地文件会跟随新快照更新或移入回收站；跨过多次换钥的设备可打开空本地库恢复。如果设备有未汇集的离线编辑，先备份这些编辑再合并。只共用账号、没有泄露库密钥的其他 Vault 可以只更新 WebDAV 密码。
+
+## 历史版本与恢复
+
+在插件设置或命令面板选择 **查看历史版本**，选中文件和版本，点 **比较差异 → 恢复此版本**。文本可以逐行查看增删，二进制附件可比较大小和 SHA-256。已删除的文件也可以从设置中找回。恢复会作为一次新修改同步到其他设备，恢复前的内容仍可在保留期内查看。若有尚未同步的改动或冲突，请先处理再恢复。
+
+每个库默认保留 **30 天**，可选 **30、60、90、180 天或永久保存**，所有设备共用同一设置。历史版本从被新版本替换时开始计时。只要仍是当前版本，即使多年未改也会保留。存在待处理冲突的文件会暂缓清理。期限更改存入加密的 WebDAV 设置；缩短后，超期版本会从列表隐藏，客户端在成功同步时分批清理旧正文和附件分块。已清除的正文无法通过延长期限找回。已解决冲突的本机副本仍由「清理历史冲突文件」管理。
+
+升级后，已有修订优先采用 WebDAV 的提交目录时间；服务器缺少日期时，从新版首次读取该修订起记录时间。修订关系和删除标记会保留，使离线设备能核对旧检查点。建议各端升级至 0.3.5；若长期离线后共同底稿已经过期，两端各自的修改会进入冲突比较，由用户选择版本。
 
 ## 数据与同步范围
 

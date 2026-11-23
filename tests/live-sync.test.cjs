@@ -130,6 +130,10 @@ test("interrupted comparisons only create a sibling after the same conflict is c
     await p.finishReview(ticket,peer);
     assert.equal(saved.get(key),ticket); assert.deepEqual(deferred,[]);
     p.conflictVersions.set(peer.path,ticket.version);
+    p.closed=true;
+    await p.finishReview(ticket,peer);
+    assert.equal(saved.get(key),ticket); assert.deepEqual(deferred,[]);
+    p.closed=false;
     await p.finishReview(ticket,peer,true);
     assert.equal(saved.get(key),null); assert.deepEqual(deferred,[peer.id]);
     saved.set(key,ticket); p.conflictVersions.clear(); p.conflicts=[];

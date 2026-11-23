@@ -6,7 +6,7 @@ const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
-const {sha,randomId} = require("../src/core.cjs");
+const {sha,randomId,synchronize} = require("../src/core.cjs");
 const {ConflictFiles,siblingPath} = require("../src/conflict-files.cjs");
 
 class TFile {}
@@ -125,6 +125,48 @@ test("sibling names fit a filesystem component and retain the original extension
     const name=siblingPath({path:"d/"+"画".repeat(75)+".canvas",id:"a".repeat(32),time:"20261123161159",number:0});
     assert(Buffer.byteLength(path.basename(name))<=255);
     assert.match(name,/^d\/画+-20261123161159-conflict-a{32}\.canvas$/);
+});
+
+test("a marker written after startup still excludes an edited sibling, including across a second sync",async t=>{
+    const {copies,disk,local,vault,reload,plugin}=await fixture(t);
+    const rev={...await revision("note.md","branch"),parents:[]};
+    const history=new Map([[rev.id,rev]]);
+    await disk.write(rev.path,"branch");
+    await copies.archive(rev,()=>bytes("branch"));
+    const next=await reload(); // Snapshot taken before the old instance finishes dismissing its modal.
+    await copies.defer(rev,local,history);
+    const [sibling]=copies.paths;
+    assert(!next.paths.has(sibling));
+    await disk.write(sibling,"edited private draft");
+    vault.getFiles=()=>[rev.path,sibling].map(path=>({path}));
+    const run=()=>synchronize({store:{history:async()=>history,publish:()=>assert.fail("uploaded local copy")},
+        local:plugin.local(),baseline:new Map(),checkpoint(){}});
+    assert.equal((await run()).sent,0);
+    assert(next.paths.has(sibling));
+    assert.equal((await run()).sent,0);
+    assert.equal(await disk.read(sibling),"edited private draft");
+});
+
+test("an authenticated legacy copy is skipped on a peer without a marker; a similar real note still downloads",async t=>{
+    const {copies,disk,local,vault}=await fixture(t);
+    const rev={...await revision("note.md","branch"),parents:[]};
+    const record={...rev,time:"20261123131005",number:0};
+    const leak={...await revision(siblingPath(record),"branch"),parents:[]};
+    const user={...await revision(siblingPath({...record,number:1}),"ordinary note"),parents:[]};
+    const history=new Map([rev,leak,user].map(r=>[r.id,r]));
+    await disk.write(rev.path,"branch");
+    vault.getFiles=()=>[{path:rev.path}];
+    const baseline=new Map([[leak.path,{ids:[leak.id],hash:leak.hash}]]);
+    const result=await synchronize({store:{history:async()=>history,readBody:r=>{
+        assert.equal(r.id,user.id);return bytes("ordinary note");
+    }},local,baseline,checkpoint(){}});
+    assert.equal(result.sent,0);
+    assert.equal(result.received,1);
+    assert(!baseline.has(leak.path));
+    assert.equal(await disk.exists(leak.path),false);
+    assert.equal(await disk.read(user.path),"ordinary note");
+    assert(local.allowed(rev.path));
+    assert.equal(copies.copies.size,0);
 });
 
 test("additional conflicting heads keep a single sibling and history cleanup protects only pending revisions",async t=>{

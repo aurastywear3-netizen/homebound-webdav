@@ -221,7 +221,9 @@ test("vault event debounce coalesces writes, queues edits during sync, and ignor
         setAttribute(name,value){this.attributes[name]=value;},getAttribute(name){return this.attributes[name];},
         ownerDocument:{defaultView:{navigator:{onLine:true},crypto,requestAnimationFrame:cb=>setTimeout(cb,16),
             cancelAnimationFrame:clearTimeout}},remove(){this.removed=true;}};
-    p.addStatusBarItem=()=>status;
+    const pane={ownerDocument:status.ownerDocument,append(el){el.parentElement=this;}};
+    status.ownerDocument.createElement=()=>status;
+    Object.assign(p.app.workspace,{containerEl:pane,on(){},getMostRecentLeaf:()=>({view:{containerEl:pane}})});
     p.loadData=async()=>null;
     p.addSettingTab=p.addCommand=p.registerInterval=p.registerEvent=()=>{};
     p.registerDomEvent=(_,event,fn)=>{dom[event]=fn;};

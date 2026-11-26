@@ -13973,25 +13973,34 @@ var require_foreground = __commonJS({
       return "idle";
     }
     var ForegroundStatus2 = class {
-      constructor(plugin, mobile, tr2) {
+      constructor(plugin, tr2) {
         this.plugin = plugin;
         this.tr = tr2;
         const workspace = plugin.app.workspace;
-        if (mobile) {
-          this.el = workspace.containerEl.ownerDocument.createElement("div");
-          this.el.classList.add("homebound-mobile-status");
-          const attach = () => {
-            const host = workspace.getMostRecentLeaf(workspace.rootSplit)?.view.containerEl;
-            if (host && this.el.parentElement !== host) host.append(this.el);
-          };
-          for (const event of ["active-leaf-change", "layout-change", "file-open"])
-            plugin.registerEvent(workspace.on(event, attach));
-          attach();
-        } else this.el = plugin.addStatusBarItem();
+        this.el = workspace.containerEl.ownerDocument.createElement("div");
         this.win = this.el.ownerDocument.defaultView;
         this.el.classList.add("homebound-foreground");
         this.el.setAttribute("role", "img");
         this.el.createSpan({ cls: "homebound-status-dot", attr: { "aria-hidden": "true" } });
+        const attach = () => {
+          const host = workspace.getMostRecentLeaf()?.view.containerEl;
+          if (!host) {
+            this.el.remove();
+            return;
+          }
+          if (this.el.parentElement === host) return;
+          host.append(this.el);
+          const win = host.ownerDocument.defaultView;
+          if (this.win !== win) {
+            if (this.frame != null) this.win.cancelAnimationFrame(this.frame);
+            this.frame = null;
+            this.win = win;
+            this.render();
+          }
+        };
+        for (const event of ["active-leaf-change", "layout-change", "file-open"])
+          plugin.registerEvent(workspace.on(event, attach));
+        attach();
         this.render();
       }
       refresh() {
@@ -14951,7 +14960,7 @@ var require_history_view = __commonJS({
 });
 
 // src/plugin.cjs
-var { Plugin, Notice, Platform, getLanguage } = require("obsidian");
+var { Plugin, Notice, getLanguage } = require("obsidian");
 var core = require_core();
 var sharing = require_pairing_invite();
 var { Dav, VaultFiles, credentials } = require_adapter();
@@ -14989,7 +14998,7 @@ module.exports = class HomeboundPlugin extends Plugin {
     const current = this.state.current;
     if (current || this.state.pending) this.setProgress("loadingLocal");
     this.app.workspace.onLayoutReady(() => {
-      if (!this.closed) this.foreground = new ForegroundStatus(this, Platform.isMobile, tr);
+      if (!this.closed) this.foreground = new ForegroundStatus(this, tr);
     });
     if (current) this.cache = await this.revisions.load(current.id, this.secret(current, "key"));
     this.copies = new ConflictFiles(this.app, directory);

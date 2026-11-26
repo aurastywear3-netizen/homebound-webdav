@@ -1,6 +1,6 @@
 "use strict";
 
-const {Plugin, Notice, Platform, getLanguage} = require("obsidian");
+const {Plugin, Notice, getLanguage} = require("obsidian");
 const core = require("./core.cjs");
 const sharing = require("./pairing-invite.cjs");
 const {Dav, VaultFiles, credentials} = require("./adapter.cjs");
@@ -41,7 +41,7 @@ module.exports = class HomeboundPlugin extends Plugin {
         const current = this.state.current;
         if (current || this.state.pending) this.setProgress("loadingLocal");
         this.app.workspace.onLayoutReady(() => {
-            if (!this.closed) this.foreground = new ForegroundStatus(this, Platform.isMobile, tr);
+            if (!this.closed) this.foreground = new ForegroundStatus(this, tr);
         });
         if (current) this.cache = await this.revisions.load(current.id, this.secret(current, "key"));
         this.copies = new ConflictFiles(this.app, directory);

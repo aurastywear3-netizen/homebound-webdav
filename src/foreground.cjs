@@ -41,25 +41,34 @@ function foregroundTone(p, online) {
 }
 
 class ForegroundStatus {
-    constructor(plugin, mobile, tr) {
+    constructor(plugin, tr) {
         this.plugin = plugin;
         this.tr = tr;
         const workspace = plugin.app.workspace;
-        if (mobile) {
-            this.el = workspace.containerEl.ownerDocument.createElement("div");
-            this.el.classList.add("homebound-mobile-status");
-            const attach = () => {
-                const host = workspace.getMostRecentLeaf(workspace.rootSplit)?.view.containerEl;
-                if (host && this.el.parentElement !== host) host.append(this.el);
-            };
-            for (const event of ["active-leaf-change","layout-change","file-open"])
-                plugin.registerEvent(workspace.on(event,attach));
-            attach();
-        } else this.el = plugin.addStatusBarItem();
+        this.el = workspace.containerEl.ownerDocument.createElement("div");
         this.win = this.el.ownerDocument.defaultView;
         this.el.classList.add("homebound-foreground");
         this.el.setAttribute("role","img");
         this.el.createSpan({cls:"homebound-status-dot",attr:{"aria-hidden":"true"}});
+        const attach = () => {
+            const host = workspace.getMostRecentLeaf()?.view.containerEl;
+            if (!host) {
+                this.el.remove();
+                return;
+            }
+            if (this.el.parentElement === host) return;
+            host.append(this.el);
+            const win = host.ownerDocument.defaultView;
+            if (this.win !== win) {
+                if (this.frame != null) this.win.cancelAnimationFrame(this.frame);
+                this.frame = null;
+                this.win = win;
+                this.render();
+            }
+        };
+        for (const event of ["active-leaf-change","layout-change","file-open"])
+            plugin.registerEvent(workspace.on(event,attach));
+        attach();
         this.render();
     }
     refresh() {

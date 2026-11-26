@@ -205,10 +205,16 @@
 }
 
 .homebound-foreground {
+    position: absolute;
+    left: calc(12px + max(env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px)));
+    /* A docked keyboard already lifts the note pane clear of the screen edge. */
+    --homebound-safe-bottom: env(safe-area-inset-bottom, var(--safe-area-inset-bottom, 0px));
+    bottom: calc(8px + max(0px, var(--homebound-safe-bottom) - var(--keyboard-height, 0px), var(--homebound-nav-clearance, 0px)));
+    pointer-events: none;
+    z-index: 1;
     display: grid;
     place-items: center;
     box-sizing: border-box;
-    flex: none;
     inline-size: 18px;
     block-size: 18px;
     padding: 0;
@@ -224,15 +230,11 @@
 .homebound-foreground[data-tone="active"] > .homebound-status-dot { background: var(--interactive-accent); }
 .homebound-foreground[data-tone="waiting"] > .homebound-status-dot { background: var(--text-warning); }
 .homebound-foreground[data-tone="issue"] > .homebound-status-dot { background: var(--text-error); }
-.homebound-mobile-status {
-    position: absolute;
-    inset-inline-start: var(--size-4-3);
-    inset-block-end: 4px;
-    z-index: 1;
-    pointer-events: none;
+/* Obsidian already pads the mobile root by the left safe-area inset. */
+.is-mobile .workspace > .mod-root .homebound-foreground {
+    left: calc(12px + max(0px, env(safe-area-inset-left, 0px) - var(--safe-area-inset-left, 0px)));
 }
-.is-tablet .homebound-mobile-status {
-    inset-inline: 0;
-    margin-inline: auto;
+.is-phone:is(.is-floating-nav, .auto-full-screen):not(.is-hidden-nav) .homebound-foreground {
+    --homebound-nav-clearance: calc(var(--navbar-height, 0px) + max(12px, var(--homebound-safe-bottom)) - var(--keyboard-height, 0px));
 }
 .homebound-setup-transfer summary { width: fit-content; cursor: pointer; }

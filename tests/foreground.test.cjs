@@ -3,58 +3,72 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const {ForegroundStatus} = require("../src/foreground.cjs");
 
-test("the mobile indicator follows the active view, coalesces progress, and clears completed transfers", () => {
-    const frames = new Map(), events = new Map();
-    let nextFrame = 0;
-    const win = {navigator:{onLine:true},requestAnimationFrame:cb=>{frames.set(++nextFrame,cb);return nextFrame;},
-        cancelAnimationFrame:id=>frames.delete(id)};
-    const el = {classList:{add(){}}, dataset:{}, ownerDocument:{defaultView:win},
-        createSpan:()=>({textContent:""}), remove(){this.parentElement=null;}};
-    const host = () => ({append(child){child.parentElement=this;}});
-    const first = host(), second = host();
-    let current = first;
-    const plugin = {state:{},conflicts:[],status:{},registerEvent(){},
-        app:{workspace:{containerEl:{ownerDocument:{createElement:()=>el}},
-            on:(name,fn)=>events.set(name,fn),getMostRecentLeaf:()=>({view:{containerEl:current}})}}};
-    const view = new ForegroundStatus(plugin,true,()=>"en",en=>en);
-    function paint() {
+for (const mobile of [false,true]) {
+    test(`the ${mobile ? "mobile" : "desktop"} light shows four states without visible text or editor controls`, () => {
+        const frames=new Map(), events=new Map();
+        let next=0;
+        const win={navigator:{onLine:true},requestAnimationFrame:fn=>{frames.set(++next,fn);return next;},
+            cancelAnimationFrame:id=>frames.delete(id)};
+        const doc={defaultView:win,createElement:()=>new Element()};
+        class Element {
+            ownerDocument=doc; classList={add(){}}; dataset={}; attributes={}; textContent="";
+            createSpan(options) { this.dot=options; }
+            setAttribute(name,value) { this.attributes[name]=value; }
+            getAttribute(name) { return this.attributes[name] ?? null; }
+            append(child) { child.parentElement=this; }
+            remove() { this.parentElement=null; }
+        }
+        const statusBar=new Element();
+        let host=new Element();
+        const plugin={state:{},conflicts:[],status:{},registerEvent(){},
+            addStatusBarItem() { const el=new Element(); statusBar.append(el); return el; },
+            app:{workspace:{containerEl:{ownerDocument:doc},on:(name,fn)=>events.set(name,fn),
+                getMostRecentLeaf:()=>({view:{containerEl:host}})}}};
+        const view=new ForegroundStatus(plugin,mobile,en=>en), el=view.el;
+        function check(tone,label) {
+            view.refresh();
+            assert.equal(frames.size,1);
+            const [id,paint]=frames.entries().next().value;
+            frames.delete(id);paint();
+            assert.equal(el.hidden,false);
+            assert.equal(el.dataset.tone,tone);
+            assert.equal(el.textContent,"");
+            assert.equal(el.attributes.role,"img");
+            assert.equal(el.attributes["aria-label"],"Homebound · "+label);
+            assert.ok(!el.title);
+        }
+        assert.equal(el.hidden,true);
+        assert.equal(el.dot.cls,"homebound-status-dot");
+        assert.equal(el.parentElement,mobile ? host : statusBar);
+        plugin.progress={phase:"versions",done:2,total:200};
         view.refresh();
-        assert.equal(frames.size,1);
-        const [id,work] = frames.entries().next().value;
-        frames.delete(id);work();
-    }
-    assert.equal(el.hidden,true);
-    plugin.progress={phase:"connecting",total:null};
-    paint();
-    assert.equal(el.hidden,false);
-    assert.match(view.label.textContent,/Verifying connection/);
-    plugin.progress={phase:"versions",done:2,total:20};
-    view.refresh();
-    plugin.progress.done=7;
-    paint();
-    assert.equal(view.count.textContent,"7 / 20");
-
-    current=second;events.get("active-leaf-change")();
-    assert.equal(el.parentElement,second);
-    plugin.progress={phase:"readback",done:2,total:5,block:{direction:"download",done:12,total:25}};
-    paint();
-    assert.equal(view.label.textContent,"Verifying blocks");
-    assert.equal(view.count.textContent,"12 / 25");
-    plugin.progress=null;
-    plugin.state.pending={};
-    paint();assert.equal(view.label.textContent,"Setup awaiting verification");
-    plugin.state.current={};
-    paint();assert.equal(view.label.textContent,"Key rotation awaiting verification");
-    delete plugin.state.pending;
-    plugin.status.lastSuccess=Date.now();
-    paint();assert.match(view.label.textContent,/Last synced/);
-    assert.equal(view.count.textContent,"");
-    plugin.conflicts=["A","B"];paint();
-    assert.equal(view.count.textContent,"2");
-    plugin.pollError="test";paint();assert.equal(el.dataset.tone,"issue");
-    assert.equal(view.label.textContent,"Sync needs attention");
-    win.navigator.onLine=false;paint();assert.match(view.label.textContent,/Offline/);
-    view.refresh();view.close();
-    assert.equal(frames.size,0);
-    assert.equal(el.parentElement,null);
-});
+        plugin.progress.done=123;
+        check("active","Syncing");
+        plugin.progress={phase:"files",done:3,total:8};
+        plugin.transferBlock={direction:"upload",path:"private.pdf",done:7,total:25};
+        check("active","Syncing");
+        plugin.progress=null;
+        plugin.transferBlock.direction="download";
+        check("active","Syncing");
+        plugin.transferBlock=null;
+        plugin.state.pending={};check("issue","Needs attention");
+        plugin.state.current={};check("issue","Needs attention");
+        delete plugin.state.pending;
+        check("waiting","Waiting to sync");
+        plugin.status.lastSuccess=Date.now();check("idle","Synced");
+        plugin.editTimer=1;check("waiting","Waiting to sync");
+        plugin.editTimer=null;
+        plugin.conflicts=["Note.md"];check("issue","Needs attention");
+        plugin.conflicts=[];plugin.pollError="error";check("issue","Needs attention");
+        plugin.pollError="";win.navigator.onLine=false;check("waiting","Waiting to sync");
+        if (mobile) {
+            host=new Element(); events.get("active-leaf-change")();
+            assert.equal(el.parentElement,host);
+        }
+        plugin.state.current=null;
+        view.render();assert.equal(el.hidden,true);
+        view.refresh();view.close();
+        assert.equal(frames.size,0);
+        assert.equal(el.parentElement,null);
+    });
+}

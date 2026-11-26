@@ -1,4 +1,4 @@
-# Homebound WebDAV 0.3.10
+# Homebound WebDAV 0.3.11
 
 Homebound WebDAV syncs encrypted notes and attachments between your Obsidian devices using an HTTPS WebDAV server you control. Each vault has its own folder and encryption key.
 
@@ -14,7 +14,7 @@ Open **Settings → Community plugins → Browse** in Obsidian 1.11.4 or later. 
 
 ## Usage
 
-While editing, the desktop status bar or the strip below the active view on mobile shows the sync stage and progress. At rest it shows the last successful sync.
+A single dot shows sync status in the desktop status bar and sits at the bottom center of the active view on tablets. It uses the theme’s muted color for synced, warning color for waiting, accent color for syncing, and error color when attention is needed. Screen readers can read the current state. Homebound settings show the last successful sync, pending uploads, and conflicts.
 
 Initial vault creation, first join, and key rotation start with up to 20 concurrent WebDAV requests. A batch that receives HTTP 429 or 503 lowers the limit one step (20 → 12 → 8 → 4 → 1). Successful requests are retained. Verification and file transfers share the reduced limit. Resuming an interrupted creation or rotation on the same device keeps the last limit. Later syncs use up to four requests. Verified revisions are cached in an encrypted file on this device. **Advanced settings → Rebuild local version cache** verifies every remote revision again and replaces the cache when verification succeeds.
 
@@ -39,7 +39,7 @@ The default retention is **30 days**. Choose 30, 60, 90, 180 days or **Forever**
 3. 在另一台设备打开准备同步的本地库，启用插件并点「扫码加入」。扫描首台设备在「在另一台设备上使用此库」中显示的二维码，或在插件内读取二维码图片。确认本地库、远端地址和库标识后，窗口显示已核对的远端版本数；验证通过后，设置页显示已处理的文件数和总数。首次同步会重新列出提交，只下载新增版本的记录，并校验下载的正文和附件。没有摄像头时，也可填写 WebDAV 配置、粘贴恢复密钥并连接。建议首次加入使用空本地库；若已有文件与远端冲突，插件会提示先备份。
 4. 在其他 Obsidian 库中重复建库，选用另一个远端子目录。库绑定后自动同步。文件编辑、创建、删除或改名后，停顿 2 秒即同步。应用在前台时每 5 秒轻量检查远端版本标记，有新提交就拉取。每 5 分钟、返回前台及恢复联网时还会完整检查。移动系统可能挂起后台应用。
 
-编辑笔记时，Mac 底部状态栏和 iPad 当前页面下方会显示同步阶段和进度，空闲时显示上次成功同步的时间。
+Mac 状态栏只显示一个小圆点，平板上的圆点位于当前笔记视图底部正中。颜色沿用主题配置：淡色表示已同步，警告色表示等待同步，强调色表示同步中，错误色表示需处理。读屏可读出当前状态。上次成功同步时间、待上传文件数和冲突可在 Homebound 设置中查看。
 
 首次建库、首次加入和换钥均从最多 20 路并发开始。某一批请求收到 HTTP 429 或 503 时，按 20 → 12 → 8 → 4 → 1 降一档，保留该批已成功的请求。后续版本核对和文件传输沿用降后的档位。建库或换钥中断后，在同一设备继续会沿用上次的档位。日常同步最多 4 路。插件在本机插件目录加密保存已验证的版本记录。重新打开库时会核对远端提交清单，仅获取缺少的记录。可在「高级设置 → 重建本机版本缓存」重新核对，成功后替换旧缓存。
 

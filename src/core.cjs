@@ -49,9 +49,10 @@ const encodePath = path => path.split("/").map(encodeURIComponent).join("/");
 const isRecovery = path => path.split("/")[0].toLowerCase() === conflictFolder.toLowerCase();
 
 const generateKey = () => hex(crypto.getRandomValues(new Uint8Array(32)));
+const validKey = material => typeof material === "string" && hashPattern.test(material);
 
 async function importKey(material) {
-    if (typeof material !== "string" || !/^[a-f0-9]{64}$/.test(material)) throw Error("库密钥格式错误。");
+    if (!validKey(material)) throw Error("库密钥格式错误。");
     const bytes = Uint8Array.from(material.match(/../g), part => parseInt(part, 16));
     return crypto.subtle.importKey("raw", bytes, "AES-GCM", false, ["encrypt", "decrypt"]);
 }
@@ -544,4 +545,4 @@ async function createVault(home, folder, material, id, previous = "", window = n
 }
 
 module.exports = { createVault, Store, synchronize, syncScope, headsByPath, safePath, isRecovery, conflictFolder, directory, endpoint, davAddress, encodePath,
-    namespace, newHeader, unlock, importKey, checkRevision, checkKnownIds, generateKey, checkAliases, randomId, sha, jsonBytes, parseBytes, seal, unseal };
+    namespace, newHeader, unlock, importKey, validKey, checkRevision, checkKnownIds, generateKey, checkAliases, randomId, sha, jsonBytes, parseBytes, seal, unseal };

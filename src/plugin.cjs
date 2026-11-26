@@ -4,7 +4,7 @@ const {Plugin, Notice, Platform, getLanguage} = require("obsidian");
 const core = require("./core.cjs");
 const sharing = require("./pairing-invite.cjs");
 const {Dav, VaultFiles, credentials} = require("./adapter.cjs");
-const {ChunkTransfer, TransferCache, blockSize} = require("./transfer.cjs");
+const {ChunkTransfer, TransferCache} = require("./transfer.cjs");
 const {ReadWindow, concurrencyLevels} = require("./parallel-reads.cjs");
 const {seedSnapshot, checkJoin} = require("./personal.cjs");
 const {PendingUploads} = require("./pending.cjs");
@@ -41,7 +41,7 @@ module.exports = class HomeboundPlugin extends Plugin {
         const current = this.state.current;
         if (current || this.state.pending) this.setProgress("loadingLocal");
         this.app.workspace.onLayoutReady(() => {
-            if (!this.closed) this.foreground = new ForegroundStatus(this, Platform.isMobile, getLanguage, tr);
+            if (!this.closed) this.foreground = new ForegroundStatus(this, Platform.isMobile, tr);
         });
         if (current) this.cache = await this.revisions.load(current.id, this.secret(current, "key"));
         this.copies = new ConflictFiles(this.app, directory);
@@ -219,9 +219,32 @@ module.exports = class HomeboundPlugin extends Plugin {
     secret(config, kind) {
         return this.app.secretStorage.getSecret("homebound-personal-" + config.secretId + "-" + kind) || "";
     }
+    savedKey(config) {
+        const material = this.secret(config, "key");
+        if (core.validKey(material)) return material;
+        const reason = material ? tr("This device's saved vault key has an invalid format.", "本机保存的库密钥格式异常。")
+            : tr("The saved vault key could not be read on this device.", "当前未能读取本机保存的库密钥。");
+        if (this.state.pending?.secretId === config.secretId)
+            throw Error(reason + tr(" Reopen this vault on the device that started setup and retry verification.",
+                "请在发起建库或换钥的设备上重新打开此库，再继续校验。"));
+        throw Error(reason + tr(" Reopen this vault and retry. If this continues, use Advanced settings to scan the same vault's QR code or enter its recovery key.",
+            "请重新打开此库后重试。若仍提示，请在高级设置中重新扫描同一库的共享码，或使用该库的恢复密钥加入。"));
+    }
     storeSecrets(config, key, password) {
         this.app.secretStorage.setSecret("homebound-personal-" + config.secretId + "-key", key);
         this.app.secretStorage.setSecret("homebound-personal-" + config.secretId + "-dav", password);
+    }
+    storeNewSecrets(config, key, password) {
+        // Both entries belong to a fresh secretId. Keep the previous binding until both read back.
+        try {
+            this.storeSecrets(config, key, password);
+            if (this.secret(config, "key") === key && this.secret(config, "dav") === password) return;
+        } catch {
+            // A platform write can fail after only one entry has been saved.
+        }
+        try { this.forgetSecrets(config); } catch { /* The new entries are unreferenced. */ }
+        throw Error(tr("Could not save and read back the credentials on this device. Reopen the vault and retry.",
+            "未能在本机保存并读回库密钥和 WebDAV 凭据。请重新打开此库后重试。"));
     }
     forgetSecrets(config) {
         this.storeSecrets(config, "", "");
@@ -257,7 +280,7 @@ module.exports = class HomeboundPlugin extends Plugin {
     async historyStore(id) {
         const c=this.state.current;
         if (this.closed || this.state.pending || !c || c.id!==id) throw Error(tr("Vault changed.","当前库已变化。"));
-        return (await this.connect(c,this.secret(c,"dav"),this.secret(c,"key"))).store;
+        return (await this.connect(c,this.secret(c,"dav"),this.savedKey(c))).store;
     }
     async rebuildRevisionCache(id) {
         return this.exclusive(async () => {
@@ -315,6 +338,7 @@ module.exports = class HomeboundPlugin extends Plugin {
         }
     }
     setProgress(phase, done = 0, total = null) {
+        this.transferBlock = null;
         this.progress = phase && !this.closed ? {phase, done, total} : null;
         this.settingsTab?.refreshProgress?.();
         this.foreground?.refresh();
@@ -345,7 +369,7 @@ module.exports = class HomeboundPlugin extends Plugin {
         }
         const password = this.passwordFor(target, enteredPassword);
         const config = {...target, id:core.randomId(), secretId:core.randomId(), auto:true};
-        this.storeSecrets(config, core.generateKey(), password);
+        this.storeNewSecrets(config, core.generateKey(), password);
         this.save({...this.state, pending:config});
         onPending?.();
         return this.resumeSetup();
@@ -353,8 +377,8 @@ module.exports = class HomeboundPlugin extends Plugin {
     async resumeSetup(enteredPassword = "") {
         const config = this.state.pending;
         if (!config) throw Error("没有待完成的建库。");
-        const password = enteredPassword || this.secret(config, "dav"), material = this.secret(config, "key");
-        if (!password || !material) throw Error("缺少本机保存的建库凭据。");
+        const password = enteredPassword || this.secret(config, "dav"), material = this.savedKey(config);
+        if (!password) throw Error("缺少本机保存的建库凭据。");
         const previous = this.state.current?.id || "";
         if (enteredPassword) this.storeSecrets(config, material, password);
         const progress = this.setProgress.bind(this);
@@ -404,37 +428,21 @@ module.exports = class HomeboundPlugin extends Plugin {
                 if (current.initialReadLimit) config.initialReadLimit = current.initialReadLimit;
             }
             if (this.closed) throw Error("插件已关闭，请重新打开后继续。");
-            this.storeSecrets(config, material, password);
+            this.storeNewSecrets(config, material, password);
             this.activate(config, verified);
         } finally { this.setProgress(null); }
     }
     sharingFields() {
         const c = this.state.current;
-        return {...c, password:this.secret(c, "dav"), key:this.secret(c, "key")};
+        return {...c, password:this.secret(c, "dav"), key:this.savedKey(c)};
     }
 
     showTransfer(event) {
-        if (event && this.closed) return;
-        if (event && this.progress) {
-            this.progress.block = {...event};
-            this.foreground?.refresh();
-        }
-        if (event && this.state.pending && ["uploading","resumingFiles","readback"].includes(this.progress?.phase)) {
-            this.settingsTab?.refreshProgress();
-            return;
-        }
-        if (!event) {
-            this.transferNotice?.hide();
-            this.transferNotice = null;
-            return;
-        }
-        const action = event.direction === "upload" ? tr("Uploading","上传") : tr("Downloading","下载");
-        const complete = Math.min(event.size,event.done * blockSize);
-        let message = action + " " + event.path + "\n" + event.done + "/" + event.total + tr(" blocks"," 块") +
-            " · " + Math.floor(100 * complete / event.size) + "%";
-        if (event.retry) message += tr(" · retry "," · 重试 ") + event.retry + "/3";
-        if (!this.transferNotice) this.transferNotice = new Notice(message,0);
-        else this.transferNotice.setMessage(message);
+        if (this.closed || (!event && !this.transferBlock)) return;
+        const directionChanged = event?.direction !== this.transferBlock?.direction;
+        this.transferBlock = event ? {...event} : null;
+        if (directionChanged) this.foreground?.refresh();
+        if (this.state.pending) this.settingsTab?.refreshProgress();
     }
     onunload() {
         this.closed = true;
@@ -482,7 +490,7 @@ module.exports = class HomeboundPlugin extends Plugin {
             const review = await this.exclusive(async () => {
                 const c = this.state.current;
                 if (!c || this.state.pending) throw Error(tr("Finish vault setup first.","请先完成建库。"));
-                const {store} = await this.connect(c, this.secret(c,"dav"), this.secret(c,"key"));
+                const {store} = await this.connect(c, this.secret(c,"dav"), this.savedKey(c));
                 const history = await store.history(this.cache);
                 const heads = core.headsByPath(history).get(path) || [];
                 if (new Set(heads.map(r => r.hash)).size < 2) throw Error(tr("This conflict changed. Sync again.","冲突已变化，请重新同步。"));
@@ -535,7 +543,7 @@ module.exports = class HomeboundPlugin extends Plugin {
                 if (this.state.pending) throw Error("请先完成建库或换钥。");
                 if (!c) throw Error("请先创建或扫码加入笔记库。");
                 const window = concurrencyLevels.includes(c.initialReadLimit) ? this.initialWindow(c, "current") : new ReadWindow();
-                const {store} = await this.connect(c, this.secret(c,"dav"), this.secret(c,"key"), window);
+                const {store} = await this.connect(c, this.secret(c,"dav"), this.savedKey(c), window);
                 const local = this.local();
                 // Sample before listing commits. A post-sync marker could acknowledge
                 // a concurrent revision that was never part of this sync.

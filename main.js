@@ -608,8 +608,9 @@ var require_core = __commonJS({
     var encodePath = (path) => path.split("/").map(encodeURIComponent).join("/");
     var isRecovery = (path) => path.split("/")[0].toLowerCase() === conflictFolder.toLowerCase();
     var generateKey = () => hex(crypto.getRandomValues(new Uint8Array(32)));
+    var validKey = (material) => typeof material === "string" && hashPattern.test(material);
     async function importKey(material) {
-      if (typeof material !== "string" || !/^[a-f0-9]{64}$/.test(material)) throw Error("\u5E93\u5BC6\u94A5\u683C\u5F0F\u9519\u8BEF\u3002");
+      if (!validKey(material)) throw Error("\u5E93\u5BC6\u94A5\u683C\u5F0F\u9519\u8BEF\u3002");
       const bytes = Uint8Array.from(material.match(/../g), (part) => parseInt(part, 16));
       return crypto.subtle.importKey("raw", bytes, "AES-GCM", false, ["encrypt", "decrypt"]);
     }
@@ -1102,6 +1103,7 @@ var require_core = __commonJS({
       newHeader,
       unlock,
       importKey,
+      validKey,
       checkRevision,
       checkKnownIds,
       generateKey,
@@ -13104,7 +13106,7 @@ var require_transfer = __commonJS({
     "use strict";
     var { ReadWindow: ReadWindow2, limited } = require_parallel_reads();
     var core2 = require_core();
-    var blockSize2 = 512 * 1024;
+    var blockSize = 512 * 1024;
     var threshold = 4 * 1024 * 1024;
     var retention = 7 * 24 * 60 * 60 * 1e3;
     var encoder = new TextEncoder();
@@ -13234,7 +13236,7 @@ var require_transfer = __commonJS({
           };
           await this.cache.put(slot, pending);
         }
-        const { id, parts } = pending, total = Math.ceil(data.length / blockSize2);
+        const { id, parts } = pending, total = Math.ceil(data.length / blockSize);
         if (!validParts(parts) || parts.size !== data.length || !Number.isInteger(pending.done) || pending.done < 0 || pending.done > total) throw Error("\u5206\u5757\u4E0A\u4F20\u8BB0\u5F55\u635F\u574F\u3002");
         const key = await aes(raw);
         const info = { direction: "upload", path, total, size: data.length, done: pending.done };
@@ -13250,7 +13252,7 @@ var require_transfer = __commonJS({
           await this.cache.put(slot, pending);
           const attempted = /* @__PURE__ */ new Set();
           await window2.each(end - start, async (offset) => {
-            const i = start + offset, chunk = data.subarray(i * blockSize2, (i + 1) * blockSize2);
+            const i = start + offset, chunk = data.subarray(i * blockSize, (i + 1) * blockSize);
             const name = await chunkName(parts, i), aad = label(scope, id, parts, i);
             const uncertain = i < uncertainEnd || attempted.has(i);
             attempted.add(i);
@@ -13283,7 +13285,7 @@ var require_transfer = __commonJS({
       async download(objects, scope, rev, { audit = false, reads = new ReadWindow2() } = {}) {
         const { parts, id, path } = rev;
         if (!validParts(parts)) throw Error("\u65E0\u6CD5\u8BC6\u522B\u9644\u4EF6\u5206\u5757\u683C\u5F0F\u3002");
-        const total = Math.ceil(parts.size / blockSize2), key = await aes(from64(rev.key));
+        const total = Math.ceil(parts.size / blockSize), key = await aes(from64(rev.key));
         let output;
         const info = { direction: "download", path, total, size: parts.size, done: 0 };
         this.progress(info);
@@ -13304,10 +13306,10 @@ var require_transfer = __commonJS({
             clear = await core2.unseal(key, aad, packet);
             if (!audit) await this.cache.put(slot, packet);
           }
-          const expected = Math.min(blockSize2, parts.size - i * blockSize2);
+          const expected = Math.min(blockSize, parts.size - i * blockSize);
           if (clear.byteLength !== expected) throw Error("\u9644\u4EF6\u5206\u5757\u957F\u5EA6\u4E0D\u4E00\u81F4\u3002");
           if (!output) output = new Uint8Array(parts.size);
-          output.set(new Uint8Array(clear), i * blockSize2);
+          output.set(new Uint8Array(clear), i * blockSize);
           info.done++;
           this.progress(info);
         });
@@ -13319,7 +13321,7 @@ var require_transfer = __commonJS({
         return this.cache.remove([scope, "put", path]);
       }
     };
-    module2.exports = { ChunkTransfer: ChunkTransfer2, TransferCache: TransferCache2, blockSize: blockSize2, threshold, validParts, chunkName };
+    module2.exports = { ChunkTransfer: ChunkTransfer2, TransferCache: TransferCache2, blockSize, threshold, validParts, chunkName };
   }
 });
 
@@ -13948,6 +13950,12 @@ var require_foreground = __commonJS({
       files: ["Syncing files", "\u540C\u6B65\u6587\u4EF6"],
       finishing: ["Finishing sync\u2026", "\u6B63\u5728\u5B8C\u6210\u540C\u6B65\u2026"]
     };
+    var lightLabels = {
+      idle: ["Synced", "\u5DF2\u540C\u6B65"],
+      waiting: ["Waiting to sync", "\u7B49\u5F85\u540C\u6B65"],
+      active: ["Syncing", "\u540C\u6B65\u4E2D"],
+      issue: ["Needs attention", "\u9700\u5904\u7406"]
+    };
     function lastSyncLabel(time, locale, tr2) {
       if (!time) return "";
       const date = new Date(time), language = locale.replace(/_/g, "-");
@@ -13955,30 +13963,18 @@ var require_foreground = __commonJS({
       const when = date.toDateString() === (/* @__PURE__ */ new Date()).toDateString() ? clock : date.toLocaleDateString(language) + " " + clock;
       return tr2("Last synced ", "\u4E0A\u6B21\u540C\u6B65\u6210\u529F ") + when;
     }
-    function foregroundStatus(p, online, language, tr2) {
-      const step = p.progress;
-      if (!step && !p.state.current && !p.state.pending) return null;
-      if (!online) return { tone: "waiting", label: tr2("Offline \xB7 waiting for network", "\u79BB\u7EBF \xB7 \u7B49\u5F85\u7F51\u7EDC") };
-      if (step) {
-        const block = step.block;
-        if (block) {
-          const download = step.phase === "readback" ? tr2("Verifying blocks", "\u4E0B\u8F7D\u5206\u5757\u6821\u9A8C") : tr2("Downloading blocks", "\u4E0B\u8F7D\u5206\u5757");
-          const label = block.direction === "upload" ? tr2("Uploading blocks", "\u4E0A\u4F20\u5206\u5757") : download;
-          return { tone: "active", label, count: block.done + " / " + block.total };
-        }
-        return { tone: "active", label: tr2(...progressLabels[step.phase]), count: step.total > 0 ? step.done + " / " + step.total : "" };
-      }
-      if (p.state.pending) return { tone: "waiting", label: p.state.current ? tr2("Key rotation awaiting verification", "\u6362\u94A5\u5F85\u7EE7\u7EED\u6821\u9A8C") : tr2("Setup awaiting verification", "\u5EFA\u5E93\u5F85\u7EE7\u7EED\u6821\u9A8C") };
-      if (p.syncError || p.pollError) return { tone: "issue", label: tr2("Sync needs attention", "\u540C\u6B65\u9047\u5230\u95EE\u9898") };
-      if (p.conflicts.length) return { tone: "issue", label: tr2("Conflicts to review", "\u5F85\u5904\u7406\u51B2\u7A81"), count: String(p.conflicts.length) };
-      if (p.historyError) return { tone: "issue", label: tr2("Version history needs attention", "\u7248\u672C\u5386\u53F2\u9047\u5230\u95EE\u9898") };
-      if (p.editTimer || p.autoDue === "edit") return { tone: "waiting", label: tr2("Waiting to check changes", "\u7B49\u5F85\u6838\u5BF9\u4FEE\u6539") };
-      return { tone: "idle", label: lastSyncLabel(p.status.lastSuccess, language, tr2) || tr2("Waiting for first sync", "\u7B49\u5F85\u9996\u6B21\u540C\u6B65") };
+    function foregroundTone(p, online) {
+      const active = p.progress || p.transferBlock;
+      if (!active && !p.state.current && !p.state.pending) return null;
+      if (!online) return "waiting";
+      if (active) return "active";
+      if (p.state.pending || p.syncError || p.pollError || p.conflicts.length || p.historyError) return "issue";
+      if (p.editTimer || p.autoDue === "edit" || !p.status.lastSuccess) return "waiting";
+      return "idle";
     }
     var ForegroundStatus2 = class {
-      constructor(plugin, mobile, language, tr2) {
+      constructor(plugin, mobile, tr2) {
         this.plugin = plugin;
-        this.language = language;
         this.tr = tr2;
         const workspace = plugin.app.workspace;
         if (mobile) {
@@ -13994,8 +13990,8 @@ var require_foreground = __commonJS({
         } else this.el = plugin.addStatusBarItem();
         this.win = this.el.ownerDocument.defaultView;
         this.el.classList.add("homebound-foreground");
-        this.label = this.el.createSpan({ cls: "homebound-foreground-label", attr: { role: "status" } });
-        this.count = this.el.createSpan({ cls: "homebound-foreground-count" });
+        this.el.setAttribute("role", "img");
+        this.el.createSpan({ cls: "homebound-status-dot", attr: { "aria-hidden": "true" } });
         this.render();
       }
       refresh() {
@@ -14006,15 +14002,12 @@ var require_foreground = __commonJS({
         });
       }
       render() {
-        const status = foregroundStatus(this.plugin, this.win.navigator.onLine !== false, this.language(), this.tr);
-        this.el.hidden = !status;
-        if (!status) return;
-        const { tone, label, count = "" } = status;
+        const tone = foregroundTone(this.plugin, this.win.navigator.onLine !== false);
+        this.el.hidden = !tone;
+        if (!tone) return;
+        const label = "Homebound \xB7 " + this.tr(...lightLabels[tone]);
         if (this.el.dataset.tone !== tone) this.el.dataset.tone = tone;
-        if (this.label.textContent !== label) this.label.textContent = label;
-        if (this.count.textContent !== count) this.count.textContent = count;
-        const title = "Homebound \xB7 " + label + (count ? " " + count : "");
-        if (this.el.title !== title) this.el.title = title;
+        if (this.el.getAttribute("aria-label") !== label) this.el.setAttribute("aria-label", label);
       }
       close() {
         if (this.frame != null) this.win.cancelAnimationFrame(this.frame);
@@ -14030,7 +14023,7 @@ var require_history = __commonJS({
   "src/history.cjs"(exports2, module2) {
     "use strict";
     var { headsByPath, sha, safePath } = require_core();
-    var { validParts, blockSize: blockSize2, chunkName } = require_transfer();
+    var { validParts, blockSize, chunkName } = require_transfer();
     var day = 864e5;
     var periods = [30, 60, 90, 180, 0];
     var validTime = (time) => Number.isSafeInteger(time) && time > 0;
@@ -14111,7 +14104,7 @@ var require_history = __commonJS({
           if (!validParts(rev.parts)) throw Error("\u65E0\u6CD5\u8BC6\u522B\u5386\u53F2\u9644\u4EF6\u5206\u5757\u683C\u5F0F\u3002");
           remainingObjects ??= new Set(await store.dav.list("objects"));
           let n = 0;
-          const count = Math.ceil(rev.parts.size / blockSize2);
+          const count = Math.ceil(rev.parts.size / blockSize);
           for (; n < count && budget(); n++) {
             const name = await chunkName(rev.parts, n);
             if (remainingObjects.has("b-" + name)) await remove(name);
@@ -14364,7 +14357,7 @@ var require_settings = __commonJS({
         ) });
         modal.contentEl.createEl("p", { text: c.address + " \xB7 " + c.folder + " \xB7 " + c.username });
         const input = modal.contentEl.createEl("textarea", { cls: "homebound-backup" });
-        input.value = qr.backup(c.id, p.secret(c, "key"));
+        input.value = qr.backup(c.id, p.savedKey(c));
         input.readOnly = true;
         input.onfocus = () => input.select();
         modal.open();
@@ -14388,8 +14381,9 @@ var require_settings = __commonJS({
         const step = this.plugin.progress;
         if (this.pendingActions) this.pendingActions.hidden = Boolean(step);
         if (this.setupBlocks) {
-          const view = this.setupBlocks, block = step?.block;
-          view.el.hidden = !block;
+          const view = this.setupBlocks, block = this.plugin.transferBlock;
+          view.details.hidden = !block;
+          if (!block) view.details.open = false;
           if (block) {
             const direction = block.direction === "upload" ? tr2("Uploading blocks", "\u4E0A\u4F20\u5206\u5757") : tr2("Downloading blocks for verification", "\u4E0B\u8F7D\u5206\u5757\u6821\u9A8C");
             const label = direction + " \xB7 " + block.path + " \xB7 " + block.done + " / " + block.total + tr2(" blocks", " \u5757");
@@ -14593,7 +14587,10 @@ var require_settings = __commonJS({
         el.createEl("h2", { text: this.app.vault.getName() });
         el.createEl("p", { text: pending.address + "/" + pending.folder });
         this.panelProgress = progressView(el);
-        this.setupBlocks = progressView(el);
+        const details = el.createEl("details", { cls: "homebound-setup-transfer" });
+        details.createEl("summary", { text: tr2("Attachment details", "\u9644\u4EF6\u8BE6\u60C5") });
+        this.setupBlocks = { ...progressView(details), details };
+        this.setupBlocks.el.hidden = false;
         this.pendingActions = el.createDiv();
         this.refreshProgress();
         let password = "";
@@ -14638,7 +14635,7 @@ var require_settings = __commonJS({
         field(form, current ? tr2("WebDAV password (blank keeps current credentials for this account)", "WebDAV \u5BC6\u7801\uFF08\u540C\u5730\u5740\u3001\u540C\u8D26\u53F7\u53EF\u7559\u7A7A\u6CBF\u7528\uFF09") : tr2("WebDAV password", "WebDAV \u5BC6\u7801"), "", (v) => draft.password = v, true);
         if (mode === "update") {
           button(form, tr2("Verify and save", "\u9A8C\u8BC1\u5E76\u4FDD\u5B58"), async () => {
-            await this.perform(() => p.join(draft, p.secret(current, "key"), current.id));
+            await this.perform(() => p.join(draft, p.savedKey(current), current.id));
             modal.close();
           });
         } else if (mode === "recover") {
@@ -14958,7 +14955,7 @@ var { Plugin, Notice, Platform, getLanguage } = require("obsidian");
 var core = require_core();
 var sharing = require_pairing_invite();
 var { Dav, VaultFiles, credentials } = require_adapter();
-var { ChunkTransfer, TransferCache, blockSize } = require_transfer();
+var { ChunkTransfer, TransferCache } = require_transfer();
 var { ReadWindow, concurrencyLevels } = require_parallel_reads();
 var { seedSnapshot, checkJoin } = require_personal();
 var { PendingUploads } = require_pending();
@@ -14992,7 +14989,7 @@ module.exports = class HomeboundPlugin extends Plugin {
     const current = this.state.current;
     if (current || this.state.pending) this.setProgress("loadingLocal");
     this.app.workspace.onLayoutReady(() => {
-      if (!this.closed) this.foreground = new ForegroundStatus(this, Platform.isMobile, getLanguage, tr);
+      if (!this.closed) this.foreground = new ForegroundStatus(this, Platform.isMobile, tr);
     });
     if (current) this.cache = await this.revisions.load(current.id, this.secret(current, "key"));
     this.copies = new ConflictFiles(this.app, directory);
@@ -15178,9 +15175,38 @@ module.exports = class HomeboundPlugin extends Plugin {
   secret(config, kind) {
     return this.app.secretStorage.getSecret("homebound-personal-" + config.secretId + "-" + kind) || "";
   }
+  savedKey(config) {
+    const material = this.secret(config, "key");
+    if (core.validKey(material)) return material;
+    const reason = material ? tr("This device's saved vault key has an invalid format.", "\u672C\u673A\u4FDD\u5B58\u7684\u5E93\u5BC6\u94A5\u683C\u5F0F\u5F02\u5E38\u3002") : tr("The saved vault key could not be read on this device.", "\u5F53\u524D\u672A\u80FD\u8BFB\u53D6\u672C\u673A\u4FDD\u5B58\u7684\u5E93\u5BC6\u94A5\u3002");
+    if (this.state.pending?.secretId === config.secretId)
+      throw Error(reason + tr(
+        " Reopen this vault on the device that started setup and retry verification.",
+        "\u8BF7\u5728\u53D1\u8D77\u5EFA\u5E93\u6216\u6362\u94A5\u7684\u8BBE\u5907\u4E0A\u91CD\u65B0\u6253\u5F00\u6B64\u5E93\uFF0C\u518D\u7EE7\u7EED\u6821\u9A8C\u3002"
+      ));
+    throw Error(reason + tr(
+      " Reopen this vault and retry. If this continues, use Advanced settings to scan the same vault's QR code or enter its recovery key.",
+      "\u8BF7\u91CD\u65B0\u6253\u5F00\u6B64\u5E93\u540E\u91CD\u8BD5\u3002\u82E5\u4ECD\u63D0\u793A\uFF0C\u8BF7\u5728\u9AD8\u7EA7\u8BBE\u7F6E\u4E2D\u91CD\u65B0\u626B\u63CF\u540C\u4E00\u5E93\u7684\u5171\u4EAB\u7801\uFF0C\u6216\u4F7F\u7528\u8BE5\u5E93\u7684\u6062\u590D\u5BC6\u94A5\u52A0\u5165\u3002"
+    ));
+  }
   storeSecrets(config, key, password) {
     this.app.secretStorage.setSecret("homebound-personal-" + config.secretId + "-key", key);
     this.app.secretStorage.setSecret("homebound-personal-" + config.secretId + "-dav", password);
+  }
+  storeNewSecrets(config, key, password) {
+    try {
+      this.storeSecrets(config, key, password);
+      if (this.secret(config, "key") === key && this.secret(config, "dav") === password) return;
+    } catch {
+    }
+    try {
+      this.forgetSecrets(config);
+    } catch {
+    }
+    throw Error(tr(
+      "Could not save and read back the credentials on this device. Reopen the vault and retry.",
+      "\u672A\u80FD\u5728\u672C\u673A\u4FDD\u5B58\u5E76\u8BFB\u56DE\u5E93\u5BC6\u94A5\u548C WebDAV \u51ED\u636E\u3002\u8BF7\u91CD\u65B0\u6253\u5F00\u6B64\u5E93\u540E\u91CD\u8BD5\u3002"
+    ));
   }
   forgetSecrets(config) {
     this.storeSecrets(config, "", "");
@@ -15226,7 +15252,7 @@ module.exports = class HomeboundPlugin extends Plugin {
   async historyStore(id) {
     const c = this.state.current;
     if (this.closed || this.state.pending || !c || c.id !== id) throw Error(tr("Vault changed.", "\u5F53\u524D\u5E93\u5DF2\u53D8\u5316\u3002"));
-    return (await this.connect(c, this.secret(c, "dav"), this.secret(c, "key"))).store;
+    return (await this.connect(c, this.secret(c, "dav"), this.savedKey(c))).store;
   }
   async rebuildRevisionCache(id) {
     return this.exclusive(async () => {
@@ -15294,6 +15320,7 @@ module.exports = class HomeboundPlugin extends Plugin {
     }
   }
   setProgress(phase, done = 0, total = null) {
+    this.transferBlock = null;
     this.progress = phase && !this.closed ? { phase, done, total } : null;
     this.settingsTab?.refreshProgress?.();
     this.foreground?.refresh();
@@ -15323,7 +15350,7 @@ module.exports = class HomeboundPlugin extends Plugin {
     }
     const password = this.passwordFor(target, enteredPassword);
     const config = { ...target, id: core.randomId(), secretId: core.randomId(), auto: true };
-    this.storeSecrets(config, core.generateKey(), password);
+    this.storeNewSecrets(config, core.generateKey(), password);
     this.save({ ...this.state, pending: config });
     onPending?.();
     return this.resumeSetup();
@@ -15331,8 +15358,8 @@ module.exports = class HomeboundPlugin extends Plugin {
   async resumeSetup(enteredPassword = "") {
     const config = this.state.pending;
     if (!config) throw Error("\u6CA1\u6709\u5F85\u5B8C\u6210\u7684\u5EFA\u5E93\u3002");
-    const password = enteredPassword || this.secret(config, "dav"), material = this.secret(config, "key");
-    if (!password || !material) throw Error("\u7F3A\u5C11\u672C\u673A\u4FDD\u5B58\u7684\u5EFA\u5E93\u51ED\u636E\u3002");
+    const password = enteredPassword || this.secret(config, "dav"), material = this.savedKey(config);
+    if (!password) throw Error("\u7F3A\u5C11\u672C\u673A\u4FDD\u5B58\u7684\u5EFA\u5E93\u51ED\u636E\u3002");
     const previous = this.state.current?.id || "";
     if (enteredPassword) this.storeSecrets(config, material, password);
     const progress = this.setProgress.bind(this);
@@ -15386,7 +15413,7 @@ module.exports = class HomeboundPlugin extends Plugin {
         if (current.initialReadLimit) config.initialReadLimit = current.initialReadLimit;
       }
       if (this.closed) throw Error("\u63D2\u4EF6\u5DF2\u5173\u95ED\uFF0C\u8BF7\u91CD\u65B0\u6253\u5F00\u540E\u7EE7\u7EED\u3002");
-      this.storeSecrets(config, material, password);
+      this.storeNewSecrets(config, material, password);
       this.activate(config, verified);
     } finally {
       this.setProgress(null);
@@ -15394,29 +15421,14 @@ module.exports = class HomeboundPlugin extends Plugin {
   }
   sharingFields() {
     const c = this.state.current;
-    return { ...c, password: this.secret(c, "dav"), key: this.secret(c, "key") };
+    return { ...c, password: this.secret(c, "dav"), key: this.savedKey(c) };
   }
   showTransfer(event) {
-    if (event && this.closed) return;
-    if (event && this.progress) {
-      this.progress.block = { ...event };
-      this.foreground?.refresh();
-    }
-    if (event && this.state.pending && ["uploading", "resumingFiles", "readback"].includes(this.progress?.phase)) {
-      this.settingsTab?.refreshProgress();
-      return;
-    }
-    if (!event) {
-      this.transferNotice?.hide();
-      this.transferNotice = null;
-      return;
-    }
-    const action = event.direction === "upload" ? tr("Uploading", "\u4E0A\u4F20") : tr("Downloading", "\u4E0B\u8F7D");
-    const complete = Math.min(event.size, event.done * blockSize);
-    let message = action + " " + event.path + "\n" + event.done + "/" + event.total + tr(" blocks", " \u5757") + " \xB7 " + Math.floor(100 * complete / event.size) + "%";
-    if (event.retry) message += tr(" \xB7 retry ", " \xB7 \u91CD\u8BD5 ") + event.retry + "/3";
-    if (!this.transferNotice) this.transferNotice = new Notice(message, 0);
-    else this.transferNotice.setMessage(message);
+    if (this.closed || !event && !this.transferBlock) return;
+    const directionChanged = event?.direction !== this.transferBlock?.direction;
+    this.transferBlock = event ? { ...event } : null;
+    if (directionChanged) this.foreground?.refresh();
+    if (this.state.pending) this.settingsTab?.refreshProgress();
   }
   onunload() {
     this.closed = true;
@@ -15455,7 +15467,7 @@ module.exports = class HomeboundPlugin extends Plugin {
       const review = await this.exclusive(async () => {
         const c = this.state.current;
         if (!c || this.state.pending) throw Error(tr("Finish vault setup first.", "\u8BF7\u5148\u5B8C\u6210\u5EFA\u5E93\u3002"));
-        const { store } = await this.connect(c, this.secret(c, "dav"), this.secret(c, "key"));
+        const { store } = await this.connect(c, this.secret(c, "dav"), this.savedKey(c));
         const history = await store.history(this.cache);
         const heads = core.headsByPath(history).get(path) || [];
         if (new Set(heads.map((r) => r.hash)).size < 2) throw Error(tr("This conflict changed. Sync again.", "\u51B2\u7A81\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u540C\u6B65\u3002"));
@@ -15507,7 +15519,7 @@ module.exports = class HomeboundPlugin extends Plugin {
         if (this.state.pending) throw Error("\u8BF7\u5148\u5B8C\u6210\u5EFA\u5E93\u6216\u6362\u94A5\u3002");
         if (!c) throw Error("\u8BF7\u5148\u521B\u5EFA\u6216\u626B\u7801\u52A0\u5165\u7B14\u8BB0\u5E93\u3002");
         const window2 = concurrencyLevels.includes(c.initialReadLimit) ? this.initialWindow(c, "current") : new ReadWindow();
-        const { store } = await this.connect(c, this.secret(c, "dav"), this.secret(c, "key"), window2);
+        const { store } = await this.connect(c, this.secret(c, "dav"), this.savedKey(c), window2);
         const local = this.local();
         const watch = this.watch;
         const sample = probe?.sample ?? await window2.one(() => watch.read(store.dav)).catch(() => null);

@@ -110,11 +110,12 @@ test("confirming creation reveals live file and block progress, including after 
     plugin.startSetup=async(fields,password,onPending)=>{
         plugin.state.pending={address:"https://dav.example",folder:"Example"};
         onPending();
-        plugin.progress={phase:"uploading",done:2,total:10,
-            block:{direction:"upload",path:"sound.wav",done:3,total:9}};
+        plugin.progress={phase:"uploading",done:2,total:10};
+        plugin.transferBlock={direction:"upload",path:"sound.wav",done:3,total:9};
         tab.refreshProgress();
         await busy;
         plugin.progress=null;
+        plugin.transferBlock=null;
     };
     tab.connectionForm("create");
     await actions.get("Continue")();
@@ -128,19 +129,23 @@ test("confirming creation reveals live file and block progress, including after 
     }
     assert.deepEqual(dialogs.map(dialog=>dialog.visible),[false,false]);
     checkProgress();
+    assert.ok(!tab.setupBlocks.details.open);
     tab.hide(); tab.display(); checkProgress();
+    tab.setupBlocks.details.open=true;
     plugin.progress={phase:"versions",done:7,total:10};
+    plugin.transferBlock=null;
     tab.refreshProgress();
-    assert.equal(tab.setupBlocks.el.hidden,true);
-    plugin.progress={phase:"readback",done:1,total:10,
-        block:{direction:"download",path:"sound.wav",done:2,total:9}};
+    assert.equal(tab.setupBlocks.details.hidden,true);
+    assert.equal(tab.setupBlocks.details.open,false);
+    plugin.progress={phase:"readback",done:1,total:10};
+    plugin.transferBlock={direction:"download",path:"sound.wav",done:2,total:9};
     tab.refreshProgress();
     assert.equal(tab.panelProgress.label.textContent,"Downloading files from WebDAV for verification 1 / 10");
     assert.equal(tab.setupBlocks.label.textContent,"Downloading blocks for verification · sound.wav · 2 / 9 blocks");
-    assert.equal(tab.setupBlocks.el.hidden,false);
+    assert.equal(tab.setupBlocks.details.hidden,false);
     finish(); await running;
     assert.equal(tab.panelProgress.el.hidden,true);
-    assert.equal(tab.setupBlocks.el.hidden,true);
+    assert.equal(tab.setupBlocks.details.hidden,true);
     assert.equal(tab.pendingActions.hidden,false);
 });
 

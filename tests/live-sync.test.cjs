@@ -75,7 +75,8 @@ test("conflict dialogs open in order, can be dismissed, and reopen for a new ver
     p.app.loadLocalStorage=k=>disk.get(k);
     p.app.saveLocalStorage=(k,v)=>disk.set(k,v);
     p.copies={defer:async rev=>deferred.push(rev.path)};
-    p.exclusive=action=>action(); p.secret=()=>"fixture"; p.local=()=>({read:async()=>null});
+    const key=core.generateKey();
+    p.exclusive=action=>action(); p.secret=(_,kind)=>kind==="key" ? key : "fixture"; p.local=()=>({read:async()=>null});
     p.connect=async()=>({store:{history:async()=>history}});
     function add(path,hash) {
         const id=core.randomId(); history.set(id,{id,parents:[],path,hash});
@@ -183,6 +184,26 @@ test("steady remote polls only sample metadata; own changes do not start another
     document.visibilityState="visible";p.state.pending={};await p.pollRemote();assert.equal(probes,3);
 });
 
+test("block updates refresh setup details while the foreground follows transfer direction and file progress", () => {
+    const p=new compiled.exports();
+    let foreground=0, settings=0;
+    p.state={pending:{}};
+    p.foreground={refresh(){foreground++;}};
+    p.settingsTab={refreshProgress(){settings++;}};
+    p.setProgress("uploading",3,8);
+    for (const done of [0,1,25]) p.showTransfer({direction:"upload",done,total:25});
+    assert.equal(foreground,2);
+    assert.equal(settings,4);
+    assert.deepEqual(p.progress,{phase:"uploading",done:3,total:8});
+    assert.equal(p.transferBlock.done,25);
+    p.setProgress("uploading",4,8);
+    assert.equal(p.transferBlock,null);
+    assert.equal(foreground,3);
+    p.showTransfer({direction:"download",done:0,total:25});
+    p.showTransfer(null);
+    assert.equal(foreground,5);
+});
+
 test("vault event debounce coalesces writes, queues edits during sync, and ignores downloaded bytes", async t => {
     t.mock.timers.enable({apis:["setTimeout","setInterval"]});
     const oldWindow=global.window, oldDocument=global.document;
@@ -196,9 +217,9 @@ test("vault event debounce coalesces writes, queues edits during sync, and ignor
     p.manifest={dir:".obsidian/plugins/homebound-webdav"};
     p.app={appId:"test", secretStorage:{getSecret:()=>null}, vault:{adapter:{exists:async()=>false},on:(event,fn)=>{events[event]=fn;}},
         workspace:{onLayoutReady:fn=>onReady.push(fn)},loadLocalStorage:k=>k==="homebound-personal-v2"?{current}:null};
-    const label = {}, count = {};
-    const status = {dataset:{},classList:{add(){}},createSpan:({cls})=>cls.endsWith("-count") ? count : label,
-        ownerDocument:{defaultView:{navigator:{onLine:true},requestAnimationFrame:cb=>setTimeout(cb,16),
+    const status = {dataset:{},attributes:{},classList:{add(){}},createSpan(){},
+        setAttribute(name,value){this.attributes[name]=value;},getAttribute(name){return this.attributes[name];},
+        ownerDocument:{defaultView:{navigator:{onLine:true},crypto,requestAnimationFrame:cb=>setTimeout(cb,16),
             cancelAnimationFrame:clearTimeout}},remove(){this.removed=true;}};
     p.addStatusBarItem=()=>status;
     p.loadData=async()=>null;
@@ -221,7 +242,7 @@ test("vault event debounce coalesces writes, queues edits during sync, and ignor
     const f={path:"n.md"};
     files.set(f.path,data("edit"));events.create(f);
     t.mock.timers.tick(1000);
-    assert.equal(label.textContent,"Waiting to check changes");
+    assert.equal(status.dataset.tone,"waiting");
     events.modify(f);
     t.mock.timers.tick(1999);assert.equal(rounds,1);
     let done=nextRound();t.mock.timers.tick(1);await done;

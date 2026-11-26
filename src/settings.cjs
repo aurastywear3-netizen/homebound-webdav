@@ -154,7 +154,7 @@ class HomeboundSettings extends PluginSettingTab {
             "将此密钥、下方地址、目录和账号保存到密码管理器，同时保管好 WebDAV 密码。")});
         modal.contentEl.createEl("p",{text:c.address + " · " + c.folder + " · " + c.username});
         const input = modal.contentEl.createEl("textarea",{cls:"homebound-backup"});
-        input.value = qr.backup(c.id,p.secret(c,"key")); input.readOnly = true;
+        input.value = qr.backup(c.id,p.savedKey(c)); input.readOnly = true;
         input.onfocus = () => input.select();
         modal.open();
     }
@@ -173,8 +173,9 @@ class HomeboundSettings extends PluginSettingTab {
         const step=this.plugin.progress;
         if (this.pendingActions) this.pendingActions.hidden=Boolean(step);
         if (this.setupBlocks) {
-            const view=this.setupBlocks, block=step?.block;
-            view.el.hidden=!block;
+            const view=this.setupBlocks, block=this.plugin.transferBlock;
+            view.details.hidden=!block;
+            if (!block) view.details.open=false;
             if (block) {
                 const direction=block.direction==="upload" ? tr("Uploading blocks","上传分块") : tr("Downloading blocks for verification","下载分块校验");
                 const label=direction+" · "+block.path+" · "+block.done+" / "+block.total+tr(" blocks"," 块");
@@ -368,7 +369,10 @@ class HomeboundSettings extends PluginSettingTab {
         el.createEl("h2",{text:this.app.vault.getName()});
         el.createEl("p",{text:pending.address + "/" + pending.folder});
         this.panelProgress=progressView(el);
-        this.setupBlocks=progressView(el);
+        const details=el.createEl("details",{cls:"homebound-setup-transfer"});
+        details.createEl("summary",{text:tr("Attachment details","附件详情")});
+        this.setupBlocks={...progressView(details),details};
+        this.setupBlocks.el.hidden=false;
         this.pendingActions=el.createDiv();
         this.refreshProgress();
         let password = "";
@@ -401,7 +405,7 @@ class HomeboundSettings extends PluginSettingTab {
             : tr("WebDAV password","WebDAV 密码"),"",v => draft.password = v,true);
         if (mode==="update") {
             button(form,tr("Verify and save","验证并保存"),async()=>{
-                await this.perform(()=>p.join(draft,p.secret(current,"key"),current.id));
+                await this.perform(()=>p.join(draft,p.savedKey(current),current.id));
                 modal.close();
             });
         } else if (mode==="recover") {

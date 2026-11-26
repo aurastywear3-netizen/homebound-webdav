@@ -15,6 +15,13 @@ const progressLabels={
     finishing:["Finishing sync…","正在完成同步…"]
 };
 
+const lightLabels = {
+    idle:["Synced","已同步"],
+    waiting:["Waiting to sync","等待同步"],
+    active:["Syncing","同步中"],
+    issue:["Needs attention","需处理"]
+};
+
 function lastSyncLabel(time, locale, tr) {
     if (!time) return "";
     const date = new Date(time), language = locale.replace(/_/g,"-");
@@ -23,32 +30,19 @@ function lastSyncLabel(time, locale, tr) {
     return tr("Last synced ","上次同步成功 ")+when;
 }
 
-function foregroundStatus(p, online, language, tr) {
-    const step = p.progress;
-    if (!step && !p.state.current && !p.state.pending) return null;
-    if (!online) return {tone:"waiting", label:tr("Offline · waiting for network","离线 · 等待网络")};
-    if (step) {
-        const block = step.block;
-        if (block) {
-            const download = step.phase === "readback" ? tr("Verifying blocks","下载分块校验") : tr("Downloading blocks","下载分块");
-            const label = block.direction === "upload" ? tr("Uploading blocks","上传分块") : download;
-            return {tone:"active", label, count:block.done+" / "+block.total};
-        }
-        return {tone:"active", label:tr(...progressLabels[step.phase]), count:step.total>0 ? step.done+" / "+step.total : ""};
-    }
-    if (p.state.pending) return {tone:"waiting", label:p.state.current
-        ? tr("Key rotation awaiting verification","换钥待继续校验") : tr("Setup awaiting verification","建库待继续校验")};
-    if (p.syncError || p.pollError) return {tone:"issue", label:tr("Sync needs attention","同步遇到问题")};
-    if (p.conflicts.length) return {tone:"issue", label:tr("Conflicts to review","待处理冲突"), count:String(p.conflicts.length)};
-    if (p.historyError) return {tone:"issue", label:tr("Version history needs attention","版本历史遇到问题")};
-    if (p.editTimer || p.autoDue === "edit") return {tone:"waiting", label:tr("Waiting to check changes","等待核对修改")};
-    return {tone:"idle", label:lastSyncLabel(p.status.lastSuccess,language,tr) || tr("Waiting for first sync","等待首次同步")};
+function foregroundTone(p, online) {
+    const active = p.progress || p.transferBlock;
+    if (!active && !p.state.current && !p.state.pending) return null;
+    if (!online) return "waiting";
+    if (active) return "active";
+    if (p.state.pending || p.syncError || p.pollError || p.conflicts.length || p.historyError) return "issue";
+    if (p.editTimer || p.autoDue === "edit" || !p.status.lastSuccess) return "waiting";
+    return "idle";
 }
 
 class ForegroundStatus {
-    constructor(plugin, mobile, language, tr) {
+    constructor(plugin, mobile, tr) {
         this.plugin = plugin;
-        this.language = language;
         this.tr = tr;
         const workspace = plugin.app.workspace;
         if (mobile) {
@@ -64,8 +58,8 @@ class ForegroundStatus {
         } else this.el = plugin.addStatusBarItem();
         this.win = this.el.ownerDocument.defaultView;
         this.el.classList.add("homebound-foreground");
-        this.label = this.el.createSpan({cls:"homebound-foreground-label",attr:{role:"status"}});
-        this.count = this.el.createSpan({cls:"homebound-foreground-count"});
+        this.el.setAttribute("role","img");
+        this.el.createSpan({cls:"homebound-status-dot",attr:{"aria-hidden":"true"}});
         this.render();
     }
     refresh() {
@@ -76,15 +70,12 @@ class ForegroundStatus {
         });
     }
     render() {
-        const status = foregroundStatus(this.plugin, this.win.navigator.onLine !== false, this.language(), this.tr);
-        this.el.hidden = !status;
-        if (!status) return;
-        const {tone, label, count = ""} = status;
+        const tone = foregroundTone(this.plugin, this.win.navigator.onLine !== false);
+        this.el.hidden = !tone;
+        if (!tone) return;
+        const label = "Homebound · "+this.tr(...lightLabels[tone]);
         if (this.el.dataset.tone !== tone) this.el.dataset.tone = tone;
-        if (this.label.textContent !== label) this.label.textContent = label;
-        if (this.count.textContent !== count) this.count.textContent = count;
-        const title = "Homebound · "+label+(count ? " "+count : "");
-        if (this.el.title !== title) this.el.title = title;
+        if (this.el.getAttribute("aria-label") !== label) this.el.setAttribute("aria-label",label);
     }
     close() {
         if (this.frame != null) this.win.cancelAnimationFrame(this.frame);

@@ -205,32 +205,34 @@
 }
 
 .homebound-foreground {
-    display: flex;
-    align-items: center;
-    gap: .4em;
-    min-width: 0;
-    max-width: min(23rem, 40vw);
-    color: var(--text-muted);
+    display: grid;
+    place-items: center;
+    box-sizing: border-box;
+    flex: none;
+    inline-size: 18px;
+    block-size: 18px;
+    padding: 0;
     font-size: var(--font-ui-smaller);
 }
 .homebound-foreground[hidden] { display: none; }
-.homebound-foreground::before {
-    content: "";
-    flex: 0 0 .45em;
+.homebound-status-dot {
+    width: .45em;
     height: .45em;
     border-radius: 50%;
     background: var(--text-faint);
 }
-.homebound-foreground[data-tone="active"]::before { background: var(--interactive-accent); }
-.homebound-foreground[data-tone="waiting"]::before { background: var(--text-warning); }
-.homebound-foreground[data-tone="issue"]::before { background: var(--text-error); }
-.homebound-foreground-label { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.homebound-foreground-count { flex: none; white-space: nowrap; font-variant-numeric: tabular-nums; }
-.homebound-foreground-count:empty { display: none; }
+.homebound-foreground[data-tone="active"] > .homebound-status-dot { background: var(--interactive-accent); }
+.homebound-foreground[data-tone="waiting"] > .homebound-status-dot { background: var(--text-warning); }
+.homebound-foreground[data-tone="issue"] > .homebound-status-dot { background: var(--text-error); }
 .homebound-mobile-status {
-    flex: none;
-    max-width: 100%;
-    padding: .25rem var(--size-4-3);
-    border-top: 1px solid var(--background-modifier-border);
-    background: var(--background-primary);
+    position: absolute;
+    inset-inline-start: var(--size-4-3);
+    inset-block-end: 4px;
+    z-index: 1;
+    pointer-events: none;
 }
+.is-tablet .homebound-mobile-status {
+    inset-inline: 0;
+    margin-inline: auto;
+}
+.homebound-setup-transfer summary { width: fit-content; cursor: pointer; }

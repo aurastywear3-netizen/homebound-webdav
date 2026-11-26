@@ -162,6 +162,48 @@ test("built plugin creates independent vaults, shares one key, rotates after los
     } finally { Object.assign(global,prior); }
 });
 
+test("missing device keys allow same-vault recovery and a failed credential write keeps the old binding", async t => {
+    const previous={window:global.window,document:global.document};
+    global.window={setInterval:()=>0}; global.document={};
+    t.after(()=>Object.assign(global,previous));
+    const srv=server(), source=new Map([["note.md",bytes("original")]]), mac=await device(srv,source);
+    await mac.startSetup({address:"https://dav.example",folder:"same",username:"personal"},srv.password);
+    const invite=sharing.parse(sharing.create(mac.sharingFields()));
+    const files=new Map(), disk=new Map(), secrets=new Map();
+    let phone=await device(srv,files,disk,secrets);
+    await phone.join(invite,invite.key,invite.id);
+    assert.equal((await phone.run()).received,1);
+    const binding=structuredClone(phone.state.current), baseline=phone.baseline(invite.id);
+    const slot="homebound-personal-"+binding.secretId+"-key";
+    files.set("offline.md",bytes("edit before recovery"));
+    const writes=srv.writes;
+    for (const [invalid,message] of [[null,/未能读取本机/],["bad",/本机保存的库密钥格式异常/]]) {
+        if (invalid===null) secrets.delete(slot);
+        else secrets.set(slot,invalid);
+        phone=await device(srv,files,disk,secrets);
+        assert.equal(await phone.run(),undefined);
+        assert.match(phone.syncError,message);
+        assert.deepEqual(phone.state.current,binding);
+        assert.deepEqual(phone.baseline(invite.id),baseline);
+        assert.equal(srv.writes,writes);
+    }
+    const set=phone.app.secretStorage.setSecret;
+    phone.app.secretStorage.setSecret=(name,value)=>{
+        if (!name.endsWith("-key") || !value) set(name,value);
+    };
+    await assert.rejects(phone.join(invite,invite.key,invite.id),/保存并读回/);
+    assert.deepEqual(phone.state.current,binding);
+    assert.equal(secrets.get(slot),"bad");
+    assert.equal(srv.writes,writes);
+    phone.app.secretStorage.setSecret=set;
+    await phone.join(invite,invite.key,invite.id);
+    assert.equal(phone.state.current.id,invite.id);
+    assert.deepEqual(phone.baseline(invite.id),baseline);
+    assert.equal((await phone.run()).sent,1);
+    assert.equal((await mac.run()).received,1);
+    assert.deepEqual(source,files);
+});
+
 test("a failed sync and a restart preserve the last completed sync and conflict list for this vault", async () => {
     const prior = {window:global.window,document:global.document};
     global.window = {setInterval:()=>0};

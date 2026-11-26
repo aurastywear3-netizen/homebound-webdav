@@ -3,6 +3,7 @@ const {Modal, Notice, PluginSettingTab, Setting, getLanguage} = require("obsidia
 const qr = require("./pairing-invite.cjs");
 const core = require("./core.cjs");
 const {periods}=require("./history.cjs");
+const {progressLabels, lastSyncLabel}=require("./foreground.cjs");
 const tr = (en, zh) => getLanguage().startsWith("zh") ? zh : en;
 
 function button(el, label, action) {
@@ -48,17 +49,6 @@ function progressView(parent) {
     return {el, label:el.createDiv(), bar:el.createEl("progress")};
 }
 
-const progressLabels={
-    preparingVault:["Preparing the remote vault…","正在准备远端库…"],
-    uploading:["Uploading vault files","上传建库文件"],
-    readback:["Verifying uploaded files","读回校验文件"],
-    connecting:["Verifying connection and vault key…","正在验证连接和库密钥…"],
-    versions:["Checking remote versions","核对远端版本"],
-    local:["Checking local files","核对本地文件"],
-    reconciling:["Updating files after key rotation","更新换钥后的文件"],
-    files:["Syncing files","同步文件"],
-    finishing:["Finishing sync…","正在完成同步…"]
-};
 
 class DetailModal extends Modal {
     onClose() { this.contentEl.empty(); }
@@ -186,7 +176,8 @@ class HomeboundSettings extends PluginSettingTab {
             const view=this.setupBlocks, block=step?.block;
             view.el.hidden=!block;
             if (block) {
-                const label=block.path+" · "+block.done+" / "+block.total+tr(" blocks"," 块");
+                const direction=block.direction==="upload" ? tr("Uploading blocks","上传分块") : tr("Downloading blocks for verification","下载分块校验");
+                const label=direction+" · "+block.path+" · "+block.done+" / "+block.total+tr(" blocks"," 块");
                 updateText(view.label,label);
                 view.bar.setAttribute("aria-label",label);
                 view.bar.max=block.total;
@@ -210,15 +201,7 @@ class HomeboundSettings extends PluginSettingTab {
     refreshStatus() {
         if (!this.statusVisible()) return;
         const p = this.plugin;
-        const time = p.status.lastSuccess;
-        const date=new Date(time);
-        let last="";
-        if (time) {
-            const locale=getLanguage().replace(/_/g,"-");
-            const clock=date.toLocaleTimeString(locale,{hour:"2-digit",minute:"2-digit"});
-            last=tr("Last synced ","上次同步成功 ")+(date.toDateString()===new Date().toDateString()
-                ? clock : date.toLocaleDateString(locale)+" "+clock);
-        }
+        const last=lastSyncLabel(p.status.lastSuccess, getLanguage(), tr);
         const count=p.uploads.files.size;
         let queue="";
         if (p.uploads.failed) queue=tr("Upload count unavailable","暂时无法统计待上传文件");

@@ -13332,8 +13332,10 @@ var require_personal = __commonJS({
       if (!active()) throw Error("\u64CD\u4F5C\u5DF2\u505C\u6B62\uFF0C\u8BF7\u91CD\u65B0\u6253\u5F00\u63D2\u4EF6\u540E\u7EE7\u7EED\u3002");
     }
     async function seedSnapshot2(store, local, active, progress) {
-      const options = { active, progress };
-      const known = await store.history(/* @__PURE__ */ new Map(), void 0, options);
+      const known = await store.history(/* @__PURE__ */ new Map(), void 0, { active, progress: (_phase, done2, total) => {
+        if (total) progress?.("existingVersions", done2, total);
+      } });
+      const uploadPhase = known.size ? "resumingFiles" : "uploading";
       const { groups: heads, localPaths: paths } = await core2.syncScope(local, known);
       core2.checkAliases([...paths]);
       const targets = /* @__PURE__ */ new Set([...paths, ...heads.keys()]);
@@ -13344,20 +13346,20 @@ var require_personal = __commonJS({
       let done = 0, batch = [];
       const uploaded = (rev) => {
         known.set(rev.id, rev);
-        progress?.("uploading", ++done, targets.size);
+        progress?.(uploadPhase, ++done, targets.size);
       };
       const flushUploads = async () => {
         if (batch.length) await store.publishBatch(batch, store.reads, uploaded, active);
         batch = [];
       };
-      progress?.("uploading", 0, targets.size);
+      progress?.(uploadPhase, 0, targets.size);
       for (const path of targets) {
         checkActive(active);
         const bytes = await local.read(path);
         const hash = bytes === null ? null : await core2.sha(bytes);
         const current = heads.get(path) || [];
         if (hash === (current[0]?.hash ?? null)) {
-          progress?.("uploading", ++done, targets.size);
+          progress?.(uploadPhase, ++done, targets.size);
           continue;
         }
         const chunked = store.transfer?.shouldSplit(bytes);
@@ -13367,7 +13369,7 @@ var require_personal = __commonJS({
       }
       await flushUploads();
       progress?.("versions");
-      const history = await store.history(known, void 0, { ...options, refresh: true });
+      const history = await store.history(known, void 0, { active, progress, refresh: true });
       const { groups: published, localPaths: remaining } = await core2.syncScope(local, history);
       const baseline = /* @__PURE__ */ new Map();
       const verify = async ([path, versions]) => {
@@ -13928,6 +13930,101 @@ var require_review = __commonJS({
   }
 });
 
+// src/foreground.cjs
+var require_foreground = __commonJS({
+  "src/foreground.cjs"(exports2, module2) {
+    "use strict";
+    var progressLabels = {
+      loadingLocal: ["Loading local sync records\u2026", "\u6B63\u5728\u8BFB\u53D6\u672C\u673A\u540C\u6B65\u8BB0\u5F55\u2026"],
+      preparingVault: ["Preparing the remote vault\u2026", "\u6B63\u5728\u51C6\u5907\u8FDC\u7AEF\u5E93\u2026"],
+      existingVersions: ["Reading existing remote versions", "\u8BFB\u53D6\u8FDC\u7AEF\u5DF2\u6709\u7248\u672C"],
+      uploading: ["Uploading local files to WebDAV", "\u4E0A\u4F20\u672C\u5730\u6587\u4EF6\u5230 WebDAV"],
+      resumingFiles: ["Checking files and uploading changes", "\u6BD4\u5BF9\u6587\u4EF6\u5E76\u8865\u4F20\u5DEE\u5F02"],
+      readback: ["Downloading files from WebDAV for verification", "\u4ECE WebDAV \u4E0B\u8F7D\u5E76\u6821\u9A8C\u6587\u4EF6"],
+      connecting: ["Verifying connection and vault key\u2026", "\u6B63\u5728\u9A8C\u8BC1\u8FDE\u63A5\u548C\u5E93\u5BC6\u94A5\u2026"],
+      versions: ["Checking remote versions", "\u6838\u5BF9\u8FDC\u7AEF\u7248\u672C"],
+      local: ["Checking local files", "\u6838\u5BF9\u672C\u5730\u6587\u4EF6"],
+      reconciling: ["Updating files after key rotation", "\u66F4\u65B0\u6362\u94A5\u540E\u7684\u6587\u4EF6"],
+      files: ["Syncing files", "\u540C\u6B65\u6587\u4EF6"],
+      finishing: ["Finishing sync\u2026", "\u6B63\u5728\u5B8C\u6210\u540C\u6B65\u2026"]
+    };
+    function lastSyncLabel(time, locale, tr2) {
+      if (!time) return "";
+      const date = new Date(time), language = locale.replace(/_/g, "-");
+      const clock = date.toLocaleTimeString(language, { hour: "2-digit", minute: "2-digit" });
+      const when = date.toDateString() === (/* @__PURE__ */ new Date()).toDateString() ? clock : date.toLocaleDateString(language) + " " + clock;
+      return tr2("Last synced ", "\u4E0A\u6B21\u540C\u6B65\u6210\u529F ") + when;
+    }
+    function foregroundStatus(p, online, language, tr2) {
+      const step = p.progress;
+      if (!step && !p.state.current && !p.state.pending) return null;
+      if (!online) return { tone: "waiting", label: tr2("Offline \xB7 waiting for network", "\u79BB\u7EBF \xB7 \u7B49\u5F85\u7F51\u7EDC") };
+      if (step) {
+        const block = step.block;
+        if (block) {
+          const download = step.phase === "readback" ? tr2("Verifying blocks", "\u4E0B\u8F7D\u5206\u5757\u6821\u9A8C") : tr2("Downloading blocks", "\u4E0B\u8F7D\u5206\u5757");
+          const label = block.direction === "upload" ? tr2("Uploading blocks", "\u4E0A\u4F20\u5206\u5757") : download;
+          return { tone: "active", label, count: block.done + " / " + block.total };
+        }
+        return { tone: "active", label: tr2(...progressLabels[step.phase]), count: step.total > 0 ? step.done + " / " + step.total : "" };
+      }
+      if (p.state.pending) return { tone: "waiting", label: p.state.current ? tr2("Key rotation awaiting verification", "\u6362\u94A5\u5F85\u7EE7\u7EED\u6821\u9A8C") : tr2("Setup awaiting verification", "\u5EFA\u5E93\u5F85\u7EE7\u7EED\u6821\u9A8C") };
+      if (p.syncError || p.pollError) return { tone: "issue", label: tr2("Sync needs attention", "\u540C\u6B65\u9047\u5230\u95EE\u9898") };
+      if (p.conflicts.length) return { tone: "issue", label: tr2("Conflicts to review", "\u5F85\u5904\u7406\u51B2\u7A81"), count: String(p.conflicts.length) };
+      if (p.historyError) return { tone: "issue", label: tr2("Version history needs attention", "\u7248\u672C\u5386\u53F2\u9047\u5230\u95EE\u9898") };
+      if (p.editTimer || p.autoDue === "edit") return { tone: "waiting", label: tr2("Waiting to check changes", "\u7B49\u5F85\u6838\u5BF9\u4FEE\u6539") };
+      return { tone: "idle", label: lastSyncLabel(p.status.lastSuccess, language, tr2) || tr2("Waiting for first sync", "\u7B49\u5F85\u9996\u6B21\u540C\u6B65") };
+    }
+    var ForegroundStatus2 = class {
+      constructor(plugin, mobile, language, tr2) {
+        this.plugin = plugin;
+        this.language = language;
+        this.tr = tr2;
+        const workspace = plugin.app.workspace;
+        if (mobile) {
+          this.el = workspace.containerEl.ownerDocument.createElement("div");
+          this.el.classList.add("homebound-mobile-status");
+          const attach = () => {
+            const host = workspace.getMostRecentLeaf(workspace.rootSplit)?.view.containerEl;
+            if (host && this.el.parentElement !== host) host.append(this.el);
+          };
+          for (const event of ["active-leaf-change", "layout-change", "file-open"])
+            plugin.registerEvent(workspace.on(event, attach));
+          attach();
+        } else this.el = plugin.addStatusBarItem();
+        this.win = this.el.ownerDocument.defaultView;
+        this.el.classList.add("homebound-foreground");
+        this.label = this.el.createSpan({ cls: "homebound-foreground-label", attr: { role: "status" } });
+        this.count = this.el.createSpan({ cls: "homebound-foreground-count" });
+        this.render();
+      }
+      refresh() {
+        if (this.frame != null || this.plugin.closed) return;
+        this.frame = this.win.requestAnimationFrame(() => {
+          this.frame = null;
+          this.render();
+        });
+      }
+      render() {
+        const status = foregroundStatus(this.plugin, this.win.navigator.onLine !== false, this.language(), this.tr);
+        this.el.hidden = !status;
+        if (!status) return;
+        const { tone, label, count = "" } = status;
+        if (this.el.dataset.tone !== tone) this.el.dataset.tone = tone;
+        if (this.label.textContent !== label) this.label.textContent = label;
+        if (this.count.textContent !== count) this.count.textContent = count;
+        const title = "Homebound \xB7 " + label + (count ? " " + count : "");
+        if (this.el.title !== title) this.el.title = title;
+      }
+      close() {
+        if (this.frame != null) this.win.cancelAnimationFrame(this.frame);
+        this.el.remove();
+      }
+    };
+    module2.exports = { ForegroundStatus: ForegroundStatus2, progressLabels, lastSyncLabel };
+  }
+});
+
 // src/history.cjs
 var require_history = __commonJS({
   "src/history.cjs"(exports2, module2) {
@@ -14066,6 +14163,7 @@ var require_settings = __commonJS({
     var qr = require_pairing_invite();
     var core2 = require_core();
     var { periods } = require_history();
+    var { progressLabels, lastSyncLabel } = require_foreground();
     var tr2 = (en, zh) => getLanguage2().startsWith("zh") ? zh : en;
     function button(el, label, action) {
       return new Setting(el).addButton((b) => b.setButtonText(label).onClick(async () => {
@@ -14118,17 +14216,6 @@ var require_settings = __commonJS({
       el.hidden = true;
       return { el, label: el.createDiv(), bar: el.createEl("progress") };
     }
-    var progressLabels = {
-      preparingVault: ["Preparing the remote vault\u2026", "\u6B63\u5728\u51C6\u5907\u8FDC\u7AEF\u5E93\u2026"],
-      uploading: ["Uploading vault files", "\u4E0A\u4F20\u5EFA\u5E93\u6587\u4EF6"],
-      readback: ["Verifying uploaded files", "\u8BFB\u56DE\u6821\u9A8C\u6587\u4EF6"],
-      connecting: ["Verifying connection and vault key\u2026", "\u6B63\u5728\u9A8C\u8BC1\u8FDE\u63A5\u548C\u5E93\u5BC6\u94A5\u2026"],
-      versions: ["Checking remote versions", "\u6838\u5BF9\u8FDC\u7AEF\u7248\u672C"],
-      local: ["Checking local files", "\u6838\u5BF9\u672C\u5730\u6587\u4EF6"],
-      reconciling: ["Updating files after key rotation", "\u66F4\u65B0\u6362\u94A5\u540E\u7684\u6587\u4EF6"],
-      files: ["Syncing files", "\u540C\u6B65\u6587\u4EF6"],
-      finishing: ["Finishing sync\u2026", "\u6B63\u5728\u5B8C\u6210\u540C\u6B65\u2026"]
-    };
     var DetailModal = class extends Modal {
       onClose() {
         this.contentEl.empty();
@@ -14304,7 +14391,8 @@ var require_settings = __commonJS({
           const view = this.setupBlocks, block = step?.block;
           view.el.hidden = !block;
           if (block) {
-            const label = block.path + " \xB7 " + block.done + " / " + block.total + tr2(" blocks", " \u5757");
+            const direction = block.direction === "upload" ? tr2("Uploading blocks", "\u4E0A\u4F20\u5206\u5757") : tr2("Downloading blocks for verification", "\u4E0B\u8F7D\u5206\u5757\u6821\u9A8C");
+            const label = direction + " \xB7 " + block.path + " \xB7 " + block.done + " / " + block.total + tr2(" blocks", " \u5757");
             updateText(view.label, label);
             view.bar.setAttribute("aria-label", label);
             view.bar.max = block.total;
@@ -14328,14 +14416,7 @@ var require_settings = __commonJS({
       refreshStatus() {
         if (!this.statusVisible()) return;
         const p = this.plugin;
-        const time = p.status.lastSuccess;
-        const date = new Date(time);
-        let last = "";
-        if (time) {
-          const locale = getLanguage2().replace(/_/g, "-");
-          const clock = date.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" });
-          last = tr2("Last synced ", "\u4E0A\u6B21\u540C\u6B65\u6210\u529F ") + (date.toDateString() === (/* @__PURE__ */ new Date()).toDateString() ? clock : date.toLocaleDateString(locale) + " " + clock);
-        }
+        const last = lastSyncLabel(p.status.lastSuccess, getLanguage2(), tr2);
         const count = p.uploads.files.size;
         let queue = "";
         if (p.uploads.failed) queue = tr2("Upload count unavailable", "\u6682\u65F6\u65E0\u6CD5\u7EDF\u8BA1\u5F85\u4E0A\u4F20\u6587\u4EF6");
@@ -14873,7 +14954,7 @@ var require_history_view = __commonJS({
 });
 
 // src/plugin.cjs
-var { Plugin, Notice, getLanguage } = require("obsidian");
+var { Plugin, Notice, Platform, getLanguage } = require("obsidian");
 var core = require_core();
 var sharing = require_pairing_invite();
 var { Dav, VaultFiles, credentials } = require_adapter();
@@ -14884,6 +14965,7 @@ var { PendingUploads } = require_pending();
 var { ConflictFiles } = require_conflict_files();
 var { ConflictReview } = require_review();
 var { notePlan, isNote } = require_merge();
+var { ForegroundStatus } = require_foreground();
 var { HomeboundSettings } = require_settings();
 var { RevisionCache } = require_revision_cache();
 var { VersionWatch } = require_version();
@@ -14908,6 +14990,10 @@ module.exports = class HomeboundPlugin extends Plugin {
     const directory = this.manifest.dir || this.app.vault.configDir + "/plugins/homebound-webdav";
     this.revisions = new RevisionCache(this.app, directory);
     const current = this.state.current;
+    if (current || this.state.pending) this.setProgress("loadingLocal");
+    this.app.workspace.onLayoutReady(() => {
+      if (!this.closed) this.foreground = new ForegroundStatus(this, Platform.isMobile, getLanguage, tr);
+    });
     if (current) this.cache = await this.revisions.load(current.id, this.secret(current, "key"));
     this.copies = new ConflictFiles(this.app, directory);
     await this.copies.load();
@@ -14920,6 +15006,7 @@ module.exports = class HomeboundPlugin extends Plugin {
     });
     this.settingsTab = new HomeboundSettings(this.app, this);
     this.addSettingTab(this.settingsTab);
+    this.setProgress(null);
     this.addCommand({ id: "sync", name: tr("Sync now", "\u7ACB\u5373\u540C\u6B65"), callback: () => this.run() });
     this.addCommand({ id: "view-history", name: tr("View version history", "\u67E5\u770B\u5386\u53F2\u7248\u672C"), checkCallback: (checking) => {
       if (!this.state.current || this.state.pending) return false;
@@ -14932,7 +15019,10 @@ module.exports = class HomeboundPlugin extends Plugin {
       if (!checking) this.openConflict(path);
       return true;
     } });
-    const check = () => this.requestAuto(true);
+    const check = () => {
+      this.foreground?.refresh();
+      this.requestAuto(true);
+    };
     this.app.workspace.onLayoutReady(() => {
       if (this.closed) return;
       this.ready = true;
@@ -14945,6 +15035,7 @@ module.exports = class HomeboundPlugin extends Plugin {
     });
     this.registerDomEvent(document, "visibilitychange", check);
     this.registerDomEvent(window, "online", check);
+    this.registerDomEvent(window, "offline", () => this.foreground?.refresh());
     this.registerInterval(window.setInterval(check, 3e5));
     this.registerInterval(window.setInterval(() => {
       this.settingsTab.refreshHistoryPeriod?.();
@@ -14970,6 +15061,10 @@ module.exports = class HomeboundPlugin extends Plugin {
     clearTimeout(this.editTimer);
     this.editTimer = null;
   }
+  refreshStatus() {
+    this.settingsTab.refreshStatus();
+    this.foreground?.refresh();
+  }
   recordSuccess(conflicts) {
     this.syncError = "";
     this.conflicts = conflicts;
@@ -14979,7 +15074,7 @@ module.exports = class HomeboundPlugin extends Plugin {
     if (modal && modal.review.vaultId === this.state.current.id && !modal.submitting && !conflicts.includes(modal.review.path)) {
       modal.close();
     }
-    this.settingsTab.refreshStatus();
+    this.refreshStatus();
   }
   fileChanged(event, file, oldPath) {
     if (!this.state.current || this.closed) return;
@@ -15001,6 +15096,7 @@ module.exports = class HomeboundPlugin extends Plugin {
       this.autoDue = null;
       this.requestAuto(check);
     }, 2e3);
+    this.foreground?.refresh();
   }
   scheduleCount() {
     clearTimeout(this.countTimer);
@@ -15016,7 +15112,7 @@ module.exports = class HomeboundPlugin extends Plugin {
       } while ((uploads.full || uploads.candidates.size) && uploads === this.uploads && !this.closed && !this.busy);
     } catch {
     }
-    if (uploads === this.uploads && !this.closed) this.settingsTab.refreshStatus();
+    if (uploads === this.uploads && !this.closed) this.refreshStatus();
   }
   autoEnabled() {
     return !this.closed && this.ready && this.state.current && !this.state.pending && document.visibilityState === "visible";
@@ -15032,7 +15128,7 @@ module.exports = class HomeboundPlugin extends Plugin {
       if (!usable()) return;
       if (this.pollError) {
         this.pollError = "";
-        this.settingsTab.refreshStatus();
+        this.refreshStatus();
       }
       if (!watch.changed(sample)) return;
       const names = await dav.list("commits");
@@ -15046,7 +15142,7 @@ module.exports = class HomeboundPlugin extends Plugin {
     } catch (error) {
       if (usable()) {
         this.pollError = tr("Remote check failed: ", "\u8FDC\u7AEF\u68C0\u67E5\u5931\u8D25\uFF1A") + error.message;
-        this.settingsTab.refreshStatus();
+        this.refreshStatus();
       }
     } finally {
       this.probing = false;
@@ -15077,6 +15173,7 @@ module.exports = class HomeboundPlugin extends Plugin {
   save(state) {
     this.app.saveLocalStorage(stateKey, state);
     this.state = state;
+    this.foreground?.refresh();
   }
   secret(config, kind) {
     return this.app.secretStorage.getSecret("homebound-personal-" + config.secretId + "-" + kind) || "";
@@ -15199,6 +15296,7 @@ module.exports = class HomeboundPlugin extends Plugin {
   setProgress(phase, done = 0, total = null) {
     this.progress = phase && !this.closed ? { phase, done, total } : null;
     this.settingsTab?.refreshProgress?.();
+    this.foreground?.refresh();
   }
   activate(config, history = /* @__PURE__ */ new Map()) {
     if (this.closed) throw Error("\u63D2\u4EF6\u5DF2\u5173\u95ED\uFF0C\u8BF7\u91CD\u65B0\u6253\u5F00\u540E\u7EE7\u7EED\u3002");
@@ -15241,7 +15339,7 @@ module.exports = class HomeboundPlugin extends Plugin {
     const active = () => !this.closed && this.state.pending?.id === config.id;
     progress("preparingVault");
     try {
-      const window2 = previous ? new ReadWindow() : this.initialWindow(config, "pending");
+      const window2 = this.initialWindow(config, "pending");
       await core.createVault(this.dav(config, password), config.folder, material, config.id, previous, window2);
       const { store } = await this.connect(config, password, material, window2);
       const { baseline, history } = await new VersionWatch().trackWrites(
@@ -15300,8 +15398,11 @@ module.exports = class HomeboundPlugin extends Plugin {
   }
   showTransfer(event) {
     if (event && this.closed) return;
-    if (event && this.state.pending && ["uploading", "readback"].includes(this.progress?.phase)) {
+    if (event && this.progress) {
       this.progress.block = { ...event };
+      this.foreground?.refresh();
+    }
+    if (event && this.state.pending && ["uploading", "resumingFiles", "readback"].includes(this.progress?.phase)) {
       this.settingsTab?.refreshProgress();
       return;
     }
@@ -15319,6 +15420,8 @@ module.exports = class HomeboundPlugin extends Plugin {
   }
   onunload() {
     this.closed = true;
+    this.foreground?.close();
+    this.foreground = null;
     this.setProgress(null);
     this.historyModal?.close();
     this.reviewModal?.close();
@@ -15399,7 +15502,7 @@ module.exports = class HomeboundPlugin extends Plugin {
     try {
       const result = await this.exclusive(async () => {
         this.setProgress("connecting");
-        this.settingsTab.refreshStatus();
+        this.refreshStatus();
         const c = this.state.current;
         if (this.state.pending) throw Error("\u8BF7\u5148\u5B8C\u6210\u5EFA\u5E93\u6216\u6362\u94A5\u3002");
         if (!c) throw Error("\u8BF7\u5148\u521B\u5EFA\u6216\u626B\u7801\u52A0\u5165\u7B14\u8BB0\u5E93\u3002");
@@ -15486,7 +15589,7 @@ module.exports = class HomeboundPlugin extends Plugin {
         this.syncing = false;
         this.setProgress(null);
       }
-      this.settingsTab.refreshStatus();
+      this.refreshStatus();
     }
   }
 };

@@ -57,7 +57,7 @@ test("local upload count reconstructs offline edits, additions and deletions and
 
 const compiled = {exports:{}};
 new Function("module","require",fs.readFileSync(require.resolve("../main.js"),"utf8"))(compiled,()=>({
-    Plugin:class {}, PluginSettingTab:class {}, Notice:class {}, getLanguage:()=>"en",
+    Plugin:class {}, PluginSettingTab:class {}, Notice:class {}, Platform:{isMobile:false}, getLanguage:()=>"en",
     Modal:class {
         constructor(app) { this.app=app; this.contentEl={empty(){}}; }
         open() { this.app.emit("open",this); }
@@ -190,11 +190,17 @@ test("vault event debounce coalesces writes, queues edits during sync, and ignor
     t.after(()=>{global.window=oldWindow;global.document=oldDocument;});
     const events={}, dom={}, files=new Map(), baseline=new Map();
     const p=new compiled.exports();
-    let start, rounds=0;
+    const onReady=[];
+    let rounds=0;
     const current={id:"fixture",auto:false};
     p.manifest={dir:".obsidian/plugins/homebound-webdav"};
     p.app={appId:"test", secretStorage:{getSecret:()=>null}, vault:{adapter:{exists:async()=>false},on:(event,fn)=>{events[event]=fn;}},
-        workspace:{onLayoutReady:fn=>{start=fn;}},loadLocalStorage:k=>k==="homebound-personal-v2"?{current}:null};
+        workspace:{onLayoutReady:fn=>onReady.push(fn)},loadLocalStorage:k=>k==="homebound-personal-v2"?{current}:null};
+    const label = {}, count = {};
+    const status = {dataset:{},classList:{add(){}},createSpan:({cls})=>cls.endsWith("-count") ? count : label,
+        ownerDocument:{defaultView:{navigator:{onLine:true},requestAnimationFrame:cb=>setTimeout(cb,16),
+            cancelAnimationFrame:clearTimeout}},remove(){this.removed=true;}};
+    p.addStatusBarItem=()=>status;
     p.loadData=async()=>null;
     p.addSettingTab=p.addCommand=p.registerInterval=p.registerEvent=()=>{};
     p.registerDomEvent=(_,event,fn)=>{dom[event]=fn;};
@@ -209,12 +215,14 @@ test("vault event debounce coalesces writes, queues edits during sync, and ignor
         complete?.();
     });
     await p.onload();
-    start();
+    for (const start of onReady) start();
     assert.equal(rounds,1);
     await new Promise(setImmediate);
     const f={path:"n.md"};
     files.set(f.path,data("edit"));events.create(f);
-    t.mock.timers.tick(1000);events.modify(f);
+    t.mock.timers.tick(1000);
+    assert.equal(label.textContent,"Waiting to check changes");
+    events.modify(f);
     t.mock.timers.tick(1999);assert.equal(rounds,1);
     let done=nextRound();t.mock.timers.tick(1);await done;
     await new Promise(setImmediate);
@@ -245,4 +253,5 @@ test("vault event debounce coalesces writes, queues edits during sync, and ignor
     assert.deepEqual([...p.uploads.files].sort(),["n.md","renamed.md"]);
     assert.equal(rounds,6);
     events.modify(f);p.onunload();t.mock.timers.tick(2000);assert.equal(rounds,6);
+    assert(status.removed);
 });

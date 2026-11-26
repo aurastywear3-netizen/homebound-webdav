@@ -300,6 +300,9 @@ test("first creation uploads and audits twenty at a time, reporting only confirm
         assert.deepEqual(events.filter(s=>s?.phase===phase && s.total===24).map(s=>s.done),
             Array.from({length:25},(_,i)=>i));
     assert.equal(events[0].phase,"preparingVault");
+    const phases=events.filter(Boolean).map(step=>step.phase);
+    assert.deepEqual(phases.filter((phase,i)=>phase!==phases[i-1]),
+        ["preparingVault","uploading","versions","readback","finishing"]);
     assert.equal(events.at(-2).phase,"finishing");
     assert.equal(events.at(-1),null);
     assert.equal(mac.baseline(mac.state.current.id).size,24);
@@ -353,7 +356,10 @@ test("lost commit acknowledgement and interrupted creation audit resume without 
     srv.failRead=false;
     mac=await device(srv,source,disk,secrets);
     const resumed=measureReads(srv,{r:12,b:12});
+    const phases=new Set();
+    mac.settingsTab.refreshProgress=()=>{ if (mac.progress) phases.add(mac.progress.phase); };
     await mac.resumeSetup();
+    assert.deepEqual([...phases],["preparingVault","existingVersions","resumingFiles","versions","readback","finishing"]);
     assert.equal(resumed.r.peak,12); assert.equal(resumed.b.peak,12);
     assert.equal(mac.state.current.initialReadLimit,undefined);
     assert.equal(srv.writes,writes);
@@ -361,6 +367,49 @@ test("lost commit acknowledgement and interrupted creation audit resume without 
     assert.equal(mac.state.current.id,id);
     assert.equal(mac.baseline(id).size,25);
     assert.equal(mac.cache.size,25);
+});
+
+test("key rotation shares the setup window and resumes readback at its saved limit without uploading again", async t => {
+    const prior = {window:global.window, document:global.document};
+    global.window = {setInterval:()=>0}; global.document = {};
+    t.after(()=>Object.assign(global,prior));
+    const srv = server(), source = new Map(), disk = new Map(), secrets = new Map();
+    for (let i=0; i<32; i++) source.set(i+".md", bytes("rotation "+i));
+    const loc = {address:"https://dav.example", folder:"old", username:"owner"};
+    let mac = await device(srv,source,disk,secrets);
+    await mac.startSetup(loc,srv.password);
+    const old = mac.sharingFields();
+    const throttles = new Map([[20,429],[12,503]]);
+    const writes = [];
+    srv.onPut = name => { if (name.startsWith("objects/b-")) writes.push(name); };
+    srv.onRead = name => {
+        const limit = mac.state.pending.initialReadLimit ?? 20;
+        if (name.startsWith("objects/r-") && throttles.has(limit)) {
+            const status = throttles.get(limit);
+            throttles.delete(limit);
+            throw Object.assign(Error("busy"),{status});
+        }
+    };
+    srv.failRead = true;
+    await assert.rejects(mac.startSetup({...loc,folder:"new"},srv.password),/readback/);
+    assert.equal(mac.state.pending.initialReadLimit,8);
+    assert.equal(mac.state.current.id,old.id);
+    assert.equal(throttles.size,0);
+    assert.equal(writes.length,source.size);
+    const pendingId = mac.state.pending.id;
+
+    mac = await device(srv,source,disk,secrets);
+    assert.equal(mac.state.pending.initialReadLimit,8);
+    const reads = measureReads(srv,{r:8,b:8});
+    srv.failRead = false;
+    const beforeResume = srv.writes;
+    await mac.resumeSetup();
+    assert.equal(srv.writes,beforeResume);
+    assert.equal(reads.r.peak,8);
+    assert.deepEqual(reads.b,{calls:source.size,peak:8});
+    assert.equal(mac.state.current.id,pendingId);
+    assert.notEqual(mac.sharingFields().key,old.key);
+    assert.equal(mac.state.current.initialReadLimit,undefined);
 });
 
 async function cacheFixture(t, count) {

@@ -9,8 +9,10 @@ function checkActive(active) {
 // The only writer during setup is the device holding the unpublished sharing key.
 // Retrying always takes the trusted local files as the source, never the partial remote copy.
 async function seedSnapshot(store, local, active, progress) {
-    const options = {active, progress};
-    const known = await store.history(new Map(), undefined, options);
+    const known = await store.history(new Map(), undefined, {active, progress:(_phase, done, total) => {
+        if (total) progress?.("existingVersions", done, total);
+    }});
+    const uploadPhase = known.size ? "resumingFiles" : "uploading";
     const {groups:heads, localPaths:paths} = await core.syncScope(local,known);
     core.checkAliases([...paths]);
     const targets = new Set([...paths, ...heads.keys()]);
@@ -21,20 +23,20 @@ async function seedSnapshot(store, local, active, progress) {
     let done = 0, batch = [];
     const uploaded = rev => {
         known.set(rev.id, rev);
-        progress?.("uploading", ++done, targets.size);
+        progress?.(uploadPhase, ++done, targets.size);
     };
     const flushUploads = async () => {
         if (batch.length) await store.publishBatch(batch, store.reads, uploaded, active);
         batch = [];
     };
-    progress?.("uploading", 0, targets.size);
+    progress?.(uploadPhase, 0, targets.size);
     for (const path of targets) {
         checkActive(active);
         const bytes = await local.read(path);
         const hash = bytes === null ? null : await core.sha(bytes);
         const current = heads.get(path) || [];
         if (hash === (current[0]?.hash ?? null)) {
-            progress?.("uploading", ++done, targets.size);
+            progress?.(uploadPhase, ++done, targets.size);
             continue;
         }
         const chunked = store.transfer?.shouldSplit(bytes);
@@ -46,7 +48,7 @@ async function seedSnapshot(store, local, active, progress) {
 
     // Re-read the published metadata and ciphertext from storage, including chunked files.
     progress?.("versions");
-    const history = await store.history(known, undefined, {...options, refresh:true});
+    const history = await store.history(known, undefined, {active, progress, refresh:true});
     const {groups:published,localPaths:remaining} = await core.syncScope(local,history);
     const baseline = new Map();
     const verify = async ([path, versions]) => {

@@ -1,4 +1,4 @@
-# Homebound WebDAV 0.3.9
+# Homebound WebDAV 0.3.10
 
 Homebound WebDAV syncs encrypted notes and attachments between your Obsidian devices using an HTTPS WebDAV server you control. Each vault has its own folder and encryption key.
 
@@ -14,7 +14,9 @@ Open **Settings → Community plugins → Browse** in Obsidian 1.11.4 or later. 
 
 ## Usage
 
-Initial vault creation and first join start with up to 20 concurrent WebDAV requests. A batch that receives HTTP 429 or 503 lowers the limit one step (20 → 12 → 8 → 4 → 1). Successful requests are retained. Verification and file transfers share the reduced limit. Later syncs use up to four requests. Verified revisions are cached in an encrypted file on this device. **Advanced settings → Rebuild local version cache** verifies every remote revision again and replaces the cache when verification succeeds.
+While editing, the desktop status bar or the strip below the active view on mobile shows the sync stage and progress. At rest it shows the last successful sync.
+
+Initial vault creation, first join, and key rotation start with up to 20 concurrent WebDAV requests. A batch that receives HTTP 429 or 503 lowers the limit one step (20 → 12 → 8 → 4 → 1). Successful requests are retained. Verification and file transfers share the reduced limit. Resuming an interrupted creation or rotation on the same device keeps the last limit. Later syncs use up to four requests. Verified revisions are cached in an encrypted file on this device. **Advanced settings → Rebuild local version cache** verifies every remote revision again and replaces the cache when verification succeeds.
 
 1. On your first device, choose **Settings → Homebound WebDAV → Create new vault**, enter the WebDAV address, account and password, and choose a new, empty remote folder. Select **Continue**, confirm the upload and follow its progress in settings. The first device uploads files, verifies revision records and reads back the contents. Large attachments use the same request slots for their blocks. After an interruption, choose **Resume upload and verify** on that device.
 2. Select **Back up vault key** and save the recovery key in your password manager. Keep the WebDAV credentials and folder name available for recovery.
@@ -37,7 +39,9 @@ The default retention is **30 days**. Choose 30, 60, 90, 180 days or **Forever**
 3. 在另一台设备打开准备同步的本地库，启用插件并点「扫码加入」。扫描首台设备在「在另一台设备上使用此库」中显示的二维码，或在插件内读取二维码图片。确认本地库、远端地址和库标识后，窗口显示已核对的远端版本数；验证通过后，设置页显示已处理的文件数和总数。首次同步会重新列出提交，只下载新增版本的记录，并校验下载的正文和附件。没有摄像头时，也可填写 WebDAV 配置、粘贴恢复密钥并连接。建议首次加入使用空本地库；若已有文件与远端冲突，插件会提示先备份。
 4. 在其他 Obsidian 库中重复建库，选用另一个远端子目录。库绑定后自动同步。文件编辑、创建、删除或改名后，停顿 2 秒即同步。应用在前台时每 5 秒轻量检查远端版本标记，有新提交就拉取。每 5 分钟、返回前台及恢复联网时还会完整检查。移动系统可能挂起后台应用。
 
-首次建库和首次加入均从最多 20 路并发开始。某一批请求收到 HTTP 429 或 503 时，按 20 → 12 → 8 → 4 → 1 降一档，保留该批已成功的请求。后续版本核对和文件传输沿用降后的档位。日常同步最多 4 路。插件在本机插件目录加密保存已验证的版本记录。重新打开库时会核对远端提交清单，仅获取缺少的记录。可在「高级设置 → 重建本机版本缓存」重新核对，成功后替换旧缓存。
+编辑笔记时，Mac 底部状态栏和 iPad 当前页面下方会显示同步阶段和进度，空闲时显示上次成功同步的时间。
+
+首次建库、首次加入和换钥均从最多 20 路并发开始。某一批请求收到 HTTP 429 或 503 时，按 20 → 12 → 8 → 4 → 1 降一档，保留该批已成功的请求。后续版本核对和文件传输沿用降后的档位。建库或换钥中断后，在同一设备继续会沿用上次的档位。日常同步最多 4 路。插件在本机插件目录加密保存已验证的版本记录。重新打开库时会核对远端提交清单，仅获取缺少的记录。可在「高级设置 → 重建本机版本缓存」重新核对，成功后替换旧缓存。
 
 共享码包含 WebDAV 地址、账号、密码、远端目录、库标识及库密钥。它可以重复使用，请仅当面展示给自己的设备。每张码只含一把库密钥；该账号可列举、写入或删除哪些目录取决于服务器权限。恢复密钥独立于 WebDAV 密码，更新账号密码时可在已连接设备的「高级设置 → 修改 WebDAV 连接」中验证并保存。
 

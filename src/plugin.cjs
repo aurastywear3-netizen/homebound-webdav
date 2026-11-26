@@ -1,6 +1,6 @@
 "use strict";
 
-const {Plugin, Notice, getLanguage} = require("obsidian");
+const {Plugin, Notice, Platform, getLanguage} = require("obsidian");
 const core = require("./core.cjs");
 const sharing = require("./pairing-invite.cjs");
 const {Dav, VaultFiles, credentials} = require("./adapter.cjs");
@@ -11,6 +11,7 @@ const {PendingUploads} = require("./pending.cjs");
 const {ConflictFiles} = require("./conflict-files.cjs");
 const {ConflictReview} = require("./review.cjs");
 const {notePlan,isNote} = require("./merge.cjs");
+const {ForegroundStatus} = require("./foreground.cjs");
 const {HomeboundSettings} = require("./settings.cjs");
 const {RevisionCache} = require("./revision-cache.cjs");
 const {VersionWatch} = require("./version.cjs");
@@ -38,6 +39,10 @@ module.exports = class HomeboundPlugin extends Plugin {
         const directory = this.manifest.dir || this.app.vault.configDir + "/plugins/homebound-webdav";
         this.revisions = new RevisionCache(this.app, directory);
         const current = this.state.current;
+        if (current || this.state.pending) this.setProgress("loadingLocal");
+        this.app.workspace.onLayoutReady(() => {
+            if (!this.closed) this.foreground = new ForegroundStatus(this, Platform.isMobile, getLanguage, tr);
+        });
         if (current) this.cache = await this.revisions.load(current.id, this.secret(current, "key"));
         this.copies = new ConflictFiles(this.app, directory);
         await this.copies.load();
@@ -49,6 +54,7 @@ module.exports = class HomeboundPlugin extends Plugin {
         });
         this.settingsTab = new HomeboundSettings(this.app, this);
         this.addSettingTab(this.settingsTab);
+        this.setProgress(null);
         this.addCommand({id:"sync", name:tr("Sync now","立即同步"), callback:() => this.run()});
         this.addCommand({id:"view-history",name:tr("View version history","查看历史版本"),checkCallback:checking=>{
             if (!this.state.current || this.state.pending) return false;
@@ -61,7 +67,7 @@ module.exports = class HomeboundPlugin extends Plugin {
             if (!checking) this.openConflict(path);
             return true;
         }});
-        const check = () => this.requestAuto(true);
+        const check = () => { this.foreground?.refresh(); this.requestAuto(true); };
         this.app.workspace.onLayoutReady(() => {
             if (this.closed) return;
             this.ready = true;
@@ -74,6 +80,7 @@ module.exports = class HomeboundPlugin extends Plugin {
         });
         this.registerDomEvent(document, "visibilitychange", check);
         this.registerDomEvent(window, "online", check);
+        this.registerDomEvent(window, "offline", () => this.foreground?.refresh());
         this.registerInterval(window.setInterval(check, 300000));
         this.registerInterval(window.setInterval(() => {
             this.settingsTab.refreshHistoryPeriod?.();
@@ -100,6 +107,10 @@ module.exports = class HomeboundPlugin extends Plugin {
         clearTimeout(this.editTimer);
         this.editTimer = null;
     }
+    refreshStatus() {
+        this.settingsTab.refreshStatus();
+        this.foreground?.refresh();
+    }
     recordSuccess(conflicts) {
         this.syncError = "";
         this.conflicts = conflicts;
@@ -110,7 +121,7 @@ module.exports = class HomeboundPlugin extends Plugin {
             !modal.submitting && !conflicts.includes(modal.review.path)) {
             modal.close();
         }
-        this.settingsTab.refreshStatus();
+        this.refreshStatus();
     }
     fileChanged(event, file, oldPath) {
         if (!this.state.current || this.closed) return;
@@ -132,6 +143,7 @@ module.exports = class HomeboundPlugin extends Plugin {
             this.autoDue = null;
             this.requestAuto(check);
         }, 2000);
+        this.foreground?.refresh();
     }
     scheduleCount() {
         clearTimeout(this.countTimer);
@@ -148,7 +160,7 @@ module.exports = class HomeboundPlugin extends Plugin {
         } catch {
             // A file may have moved during the read. The next event/check retries.
         }
-        if (uploads === this.uploads && !this.closed) this.settingsTab.refreshStatus();
+        if (uploads === this.uploads && !this.closed) this.refreshStatus();
     }
     autoEnabled() {
         return !this.closed && this.ready && this.state.current && !this.state.pending &&
@@ -165,7 +177,7 @@ module.exports = class HomeboundPlugin extends Plugin {
             if (!usable()) return;
             if (this.pollError) {
                 this.pollError = "";
-                this.settingsTab.refreshStatus();
+                this.refreshStatus();
             }
             if (!watch.changed(sample)) return;
             const names = await dav.list("commits");
@@ -179,7 +191,7 @@ module.exports = class HomeboundPlugin extends Plugin {
         } catch (error) {
             if (usable()) {
                 this.pollError = tr("Remote check failed: ","远端检查失败：") + error.message;
-                this.settingsTab.refreshStatus();
+                this.refreshStatus();
             }
         } finally { this.probing = false; }
     }
@@ -202,6 +214,7 @@ module.exports = class HomeboundPlugin extends Plugin {
     save(state) {
         this.app.saveLocalStorage(stateKey, state);
         this.state = state;
+        this.foreground?.refresh();
     }
     secret(config, kind) {
         return this.app.secretStorage.getSecret("homebound-personal-" + config.secretId + "-" + kind) || "";
@@ -304,6 +317,7 @@ module.exports = class HomeboundPlugin extends Plugin {
     setProgress(phase, done = 0, total = null) {
         this.progress = phase && !this.closed ? {phase, done, total} : null;
         this.settingsTab?.refreshProgress?.();
+        this.foreground?.refresh();
     }
     activate(config, history = new Map()) {
         if (this.closed) throw Error("插件已关闭，请重新打开后继续。");
@@ -347,7 +361,7 @@ module.exports = class HomeboundPlugin extends Plugin {
         const active = () => !this.closed && this.state.pending?.id === config.id;
         progress("preparingVault");
         try {
-            const window = previous ? new ReadWindow() : this.initialWindow(config, "pending");
+            const window = this.initialWindow(config, "pending");
             await core.createVault(this.dav(config,password), config.folder, material, config.id, previous, window);
             const {store} = await this.connect(config,password,material,window);
             const {baseline,history} = await new VersionWatch().trackWrites(store,
@@ -401,8 +415,11 @@ module.exports = class HomeboundPlugin extends Plugin {
 
     showTransfer(event) {
         if (event && this.closed) return;
-        if (event && this.state.pending && ["uploading","readback"].includes(this.progress?.phase)) {
+        if (event && this.progress) {
             this.progress.block = {...event};
+            this.foreground?.refresh();
+        }
+        if (event && this.state.pending && ["uploading","resumingFiles","readback"].includes(this.progress?.phase)) {
             this.settingsTab?.refreshProgress();
             return;
         }
@@ -421,6 +438,8 @@ module.exports = class HomeboundPlugin extends Plugin {
     }
     onunload() {
         this.closed = true;
+        this.foreground?.close();
+        this.foreground = null;
         this.setProgress(null);
         this.historyModal?.close();
         this.reviewModal?.close();
@@ -511,7 +530,7 @@ module.exports = class HomeboundPlugin extends Plugin {
         try {
             const result = await this.exclusive(async () => {
                 this.setProgress("connecting");
-                this.settingsTab.refreshStatus();
+                this.refreshStatus();
                 const c = this.state.current;
                 if (this.state.pending) throw Error("请先完成建库或换钥。");
                 if (!c) throw Error("请先创建或扫码加入笔记库。");
@@ -593,7 +612,7 @@ module.exports = class HomeboundPlugin extends Plugin {
                 this.syncing = false;
                 this.setProgress(null);
             }
-            this.settingsTab.refreshStatus();
+            this.refreshStatus();
         }
     }
 };
